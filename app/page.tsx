@@ -1,5 +1,4 @@
 import TickerSearch from "./components/TickerSearch";
-import ApiStatus from "./components/ApiStatus";
 
 const features = [
   {
@@ -22,43 +21,24 @@ const features = [
 
 export default function Home() {
   return (
-    <div className="page">
-      <header className="header">
-        <div className="brand">
-          <span className="logo">◆</span> StockScan
-        </div>
-        <nav className="nav">
-          <a href="#">Dashboard</a>
-          <a href="#">Watchlist</a>
-          <a href="/docs">API</a>
-        </nav>
-      </header>
+    <>
+      <section className="hero">
+        <h1>Analyze any stock</h1>
+        <p className="subtitle">
+          Enter a ticker symbol to load its price history and view analysis.
+        </p>
+        <TickerSearch />
+      </section>
 
-      <main className="main">
-        <section className="hero">
-          <h1>Analyze any stock</h1>
-          <p className="subtitle">
-            Enter a ticker symbol to view prices, fundamentals, and technical
-            signals.
-          </p>
-          <TickerSearch />
-        </section>
-
-        <section className="grid">
-          {features.map((f) => (
-            <div key={f.title} className="card">
-              <h2>{f.title}</h2>
-              <p>{f.body}</p>
-              <span className="badge">Coming soon</span>
-            </div>
-          ))}
-        </section>
-      </main>
-
-      <footer className="footer">
-        <ApiStatus />
-        <span>For informational purposes only. Not investment advice.</span>
-      </footer>
-    </div>
+      <section className="grid">
+        {features.map((f) => (
+          <div key={f.title} className="card">
+            <h2>{f.title}</h2>
+            <p>{f.body}</p>
+            <span className="badge">Coming soon</span>
+          </div>
+        ))}
+      </section>
+    </>
   );
 }

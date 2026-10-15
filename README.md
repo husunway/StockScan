@@ -1,17 +1,67 @@
 # StockScan
 
 Stock analysis website: **Next.js** frontend + **Python (FastAPI)** backend, deployed on **Vercel**.
+Price history is pulled from Yahoo Finance and stored in **Azure SQL**.
 
 ## Structure
 
 ```
 app/                 Next.js App Router (frontend)
-  page.tsx           Homepage
-  components/        Client components (ticker search, API status)
+  layout.tsx         Shell with side menu
+  page.tsx           Dashboard
+  prices/page.tsx    Load Prices page (symbol -> Yahoo Finance -> Azure SQL)
+  components/        Sidebar, PriceLoader, TickerSearch, ApiStatus
 api/index.py         FastAPI app -> Vercel Python serverless function
 requirements.txt     Python dependencies (installed by Vercel at deploy)
 next.config.mjs      Rewrites /api/py/* to FastAPI (local) or the function (Vercel)
+.env.example         Environment variables the backend needs (copy to .env.local)
 ```
+
+## API
+
+| Method | Path                   | Description                                                         |
+| ------ | ---------------------- | ------------------------------------------------------------------- |
+| GET    | `/api/py/health`       | Liveness check                                                      |
+| POST   | `/api/py/prices/load`  | `{ "symbol": "AAPL" }` → downloads 2 years of daily prices and saves |
+
+Prices are saved to `dbo.stock_prices` (created automatically on first load):
+
+| column     | type           |
+| ---------- | -------------- |
+| symbol     | NVARCHAR(20)   |
+| trade_date | DATE           |
+| open/high/low/close/adj_close | DECIMAL(18,4) |
+| volume     | BIGINT         |
+| loaded_at  | DATETIME2 (UTC)|
+
+Primary key is `(symbol, trade_date)`. Reloading a symbol replaces its rows for the fetched range.
+
+## Configuration
+
+The backend reads these environment variables (see `.env.example`):
+
+```
+AZURE_SQL_SERVER=your-server.database.windows.net
+AZURE_SQL_DATABASE=your-database
+AZURE_SQL_USER=
+AZURE_SQL_PASSWORD=
+```
+
+- Locally: copy `.env.example` to `.env.local` and fill in values. `.env.local` is git-ignored.
+- On Vercel: Project → Settings → Environment Variables.
+- Never put these values in code or commit them.
+
+The connection uses a SQL login (`pymssql`, TDS 7.4, encrypted). Entra ID authentication
+is not wired up.
+
+### Azure SQL firewall
+
+Azure SQL blocks all inbound connections by default:
+
+- Local dev: add your client IP under the server's **Networking** blade.
+- Vercel: serverless functions have no fixed outbound IP by default. Options are a Vercel
+  static-IP / Secure Compute add-on, or an Azure private connectivity option. Do **not**
+  open the firewall to all IPs.
 
 ## Local development
 
@@ -21,6 +71,7 @@ Requires Node 18+ and Python 3.12+.
 npm install
 python -m venv .venv && .venv\Scripts\activate   # Windows
 pip install -r requirements.txt
+copy .env.example .env.local                      # then fill in values
 npm run dev
 ```
 
@@ -29,7 +80,13 @@ npm run dev
 
 ## Deploy to Vercel
 
-1. Push this folder to a Git repo and import it in Vercel (framework preset: Next.js), or
+1. Import `husunway/StockScan` in Vercel (framework preset: Next.js) and add the environment
+   variables above, or
 2. Run `npx vercel` from this folder.
 
 Vercel builds the Next.js app and deploys `api/index.py` as a Python function automatically.
+
+## Data source note
+
+Price data comes from Yahoo Finance through the `yfinance` library. Yahoo's terms limit this
+data to personal, non-commercial use; confirm this is acceptable for your intended use.
