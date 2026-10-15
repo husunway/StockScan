@@ -7,6 +7,7 @@ const items = [
   { href: "/", label: "Dashboard", icon: "▦" },
   { href: "/prices", label: "Load Prices", icon: "↓" },
   { href: "/analysis", label: "Analysis", icon: "📈" },
+  { href: "/diagnosis", label: "Diagnosis", icon: "⚙" },
 ];
 
 export default function Sidebar() {

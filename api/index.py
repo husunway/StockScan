@@ -182,6 +182,36 @@ def health():
     return {"status": "ok"}
 
 
+SECRET_VARS = {"AZURE_SQL_PASSWORD"}
+CONFIG_VARS = ("AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD")
+
+
+@app.get("/api/py/diagnosis")
+def diagnosis():
+    import platform
+    import sys
+
+    variables = []
+    for name in CONFIG_VARS:
+        value = os.environ.get(name)
+        if not value:
+            shown = None
+        elif name in SECRET_VARS:
+            shown = f"set ({len(value)} characters, hidden)"  # never return secrets
+        else:
+            shown = value
+        variables.append({"name": name, "set": bool(value), "value": shown})
+
+    return {
+        "variables": variables,
+        "env_local_present": os.path.isfile(".env.local"),
+        "working_directory": os.getcwd(),
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "vercel": bool(os.environ.get("VERCEL")),
+    }
+
+
 @app.post("/api/py/prices/load", response_model=LoadResponse)
 def load_prices(req: LoadRequest):
     symbol = normalize_symbol(req.symbol)
