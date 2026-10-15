@@ -23,6 +23,25 @@ next.config.mjs      Rewrites /api/py/* to FastAPI (local) or the function (Verc
 | ------ | ---------------------- | ------------------------------------------------------------------- |
 | GET    | `/api/py/health`       | Liveness check                                                      |
 | POST   | `/api/py/prices/load`  | `{ "symbol": "AAPL" }` → downloads 2 years of daily prices and saves |
+| GET    | `/api/py/symbols`      | Symbols currently stored, with row counts and date ranges           |
+| GET    | `/api/py/analysis/single?symbol=AAPL&index=SPY&sector=XLK` | Candles plus indicators (see below) |
+| GET    | `/api/py/diagnosis`    | Configuration status (secret values are never returned)             |
+
+### Single stock analysis (`/analysis/single`)
+
+Computed in Python (pandas) from the stored daily prices:
+
+- Moving averages 5/10/20/30/50/200 with crossover events for MA5/20, MA20/50, MA50/200
+- RSI (14, Wilder smoothing) with 70/30 overbought/oversold bands
+- MACD (12, 26, 9) with histogram
+- Bollinger Bands (20, 2σ), %B and bandwidth (squeeze flag when bandwidth is at a 6-month low)
+- Volume vs. its 20-day average, trend, and confirmation of ±2% moves (≥1.5× volume = confirmed, <0.8× = weak)
+- Support and resistance from clustered pivot highs/lows over the last year (strongest three each side)
+- Relative strength vs. an index and a sector benchmark: stock/benchmark ratio rebased to 100, its
+  50-day average, and excess return over 1m/3m/6m/1y. Benchmarks are any symbols already loaded,
+  so load e.g. `SPY` and `XLK` on the Load Prices page first.
+
+The chart is drawn with [lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache 2.0).
 
 Prices are saved to `dbo.stock_prices` (created automatically on first load):
 
