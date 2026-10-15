@@ -1,4 +1,4 @@
-import TickerSearch from "./components/TickerSearch";
+import TickerSearch from "@/app/components/TickerSearch";
 
 const features = [
   {

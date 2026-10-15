@@ -2,7 +2,14 @@ import os
 from datetime import date
 from decimal import Decimal
 
-from fastapi import FastAPI, HTTPException
+import base64
+import hashlib
+import hmac
+import json
+import time
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 try:
@@ -17,6 +24,44 @@ app = FastAPI(
     docs_url="/api/py/docs",
     openapi_url="/api/py/openapi.json",
 )
+
+# ---------------------------------------------------------------------------
+# Session check - verifies the cookie issued by app/api/auth/login (see lib/session.ts)
+# so the Python function is protected even if reached without going through Next.js.
+# ---------------------------------------------------------------------------
+SESSION_COOKIE = "stockscan_session"
+PUBLIC_PATHS = {"/api/py/health"}
+
+
+def verify_session(token: str | None, secret: str | None) -> str | None:
+    if not token or not secret or "." not in token:
+        return None
+    payload, sig = token.split(".", 1)
+    expected = (
+        base64.urlsafe_b64encode(hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (ValueError, TypeError):
+        return None
+    exp = data.get("exp")
+    if not isinstance(exp, (int, float)) or exp < time.time():
+        return None
+    return str(data.get("u", ""))
+
+
+@app.middleware("http")
+async def require_session(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/py/") and path not in PUBLIC_PATHS:
+        if not verify_session(request.cookies.get(SESSION_COOKIE), os.environ.get("AUTH_SECRET")):
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    return await call_next(request)
+
 
 TABLE = "dbo.stock_prices"
 HISTORY_PERIOD = "2y"
@@ -524,8 +569,11 @@ def single_stock_analysis(symbol: str, index: str | None = None, sector: str | N
     return compute_analysis(symbol, df, benchmarks)
 
 
-SECRET_VARS = {"AZURE_SQL_PASSWORD"}
-CONFIG_VARS = ("AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD")
+SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET"}
+CONFIG_VARS = (
+    "AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD",
+    "AUTH_USERNAME", "AUTH_PASSWORD", "AUTH_SECRET",
+)
 
 
 @app.get("/api/py/diagnosis")

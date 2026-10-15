@@ -55,16 +55,35 @@ Prices are saved to `dbo.stock_prices` (created automatically on first load):
 
 Primary key is `(symbol, trade_date)`. Reloading a symbol replaces its rows for the fetched range.
 
+## Login
+
+The site is behind a single-user login. The username, password and a cookie-signing secret come
+from environment variables; nothing is stored in code or in the database.
+
+- `proxy.ts` (Next.js middleware) redirects unauthenticated page requests to `/login` and
+  returns 401 for `/api/*`, `/docs` and `/openapi.json`.
+- `app/api/auth/login` checks the credentials (constant-time compare) and sets an HttpOnly,
+  SameSite=Lax, 7-day session cookie signed with HMAC-SHA256 (`lib/session.ts`).
+- `api/index.py` verifies the same cookie on every `/api/py/*` route except `/api/py/health`,
+  so the Python function is protected even when reached directly.
+- "Sign out" in the sidebar clears the cookie.
+
 ## Configuration
 
-The backend reads these environment variables (see `.env.example`):
+The app reads these environment variables (see `.env.example`):
 
 ```
 AZURE_SQL_SERVER=your-server.database.windows.net
 AZURE_SQL_DATABASE=your-database
 AZURE_SQL_USER=
 AZURE_SQL_PASSWORD=
+AUTH_USERNAME=
+AUTH_PASSWORD=
+AUTH_SECRET=        # random, e.g. node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
+
+Changing `AUTH_SECRET` signs everyone out. Changing the username or password takes effect on the
+next login attempt (existing sessions stay valid until they expire or `AUTH_SECRET` changes).
 
 - Locally: copy `.env.example` to `.env.local` and fill in values. `.env.local` is git-ignored.
 - On Vercel: Project → Settings → Environment Variables.

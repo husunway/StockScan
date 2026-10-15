@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import SingleStockPanel from "../../components/SingleStockPanel";
+import SingleStockPanel from "@/app/components/SingleStockPanel";
 
 export const metadata = { title: "Single stock · StockScan" };
 

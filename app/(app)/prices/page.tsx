@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import PriceLoader from "../components/PriceLoader";
+import PriceLoader from "@/app/components/PriceLoader";
 
 export const metadata = { title: "Load Prices · StockScan" };
 

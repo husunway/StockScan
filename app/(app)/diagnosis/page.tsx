@@ -1,4 +1,4 @@
-import DiagnosisPanel from "../components/DiagnosisPanel";
+import DiagnosisPanel from "@/app/components/DiagnosisPanel";
 
 export const metadata = { title: "Diagnosis · StockScan" };
 

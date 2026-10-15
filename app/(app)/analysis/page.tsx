@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import AnalysisPanel from "../components/AnalysisPanel";
+import AnalysisPanel from "@/app/components/AnalysisPanel";
 
 export const metadata = { title: "Analysis · StockScan" };
 

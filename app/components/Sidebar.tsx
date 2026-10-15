@@ -47,6 +47,9 @@ export default function Sidebar() {
           <span className="icon">{"{}"}</span>API Docs
         </a>
       </nav>
+      <form action="/api/auth/logout" method="post" className="signout">
+        <button type="submit">Sign out</button>
+      </form>
     </aside>
   );
 }
