@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import time
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -569,10 +570,324 @@ def single_stock_analysis(symbol: str, index: str | None = None, sector: str | N
     return compute_analysis(symbol, df, benchmarks)
 
 
-SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET"}
+# ---------------------------------------------------------------------------
+# AI: Warren Buffett-style analysis (Claude)
+# ---------------------------------------------------------------------------
+DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
+
+BUFFETT_SYSTEM_PROMPT = """You are an equity analyst who applies Warren Buffett's investment approach exactly as he has described it in Berkshire Hathaway shareholder letters and public remarks. You produce a disciplined, evidence-based assessment of one company and return it in the required JSON structure.
+
+# The approach you apply
+
+1. Circle of competence. Is the business simple and understandable? Can its economics be forecast with reasonable confidence ten years out? If not, that alone argues against buying.
+2. Durable competitive advantage (moat). Look for pricing power, low-cost production, switching costs, network effects, or trusted brands. Evidence of a moat shows up as consistently high return on equity (ideally above 15% without heavy leverage), high and stable gross and operating margins, and earnings that grow steadily rather than erratically.
+3. Management quality. Rational capital allocation (buybacks only below intrinsic value, acquisitions that earn their cost of capital, dividends when there is nothing better to do), candour with shareholders, and resistance to the institutional imperative. Judge from the numbers provided: trend in shares outstanding, debt, return on retained earnings, dividends and repurchases.
+4. Financial strength. Low debt relative to equity and earnings, strong and consistent free cash flow ("owner earnings": net income plus depreciation and amortization minus maintenance capital expenditure), ample interest coverage, little need for outside capital.
+5. Valuation and margin of safety. Estimate intrinsic value as the discounted value of owner earnings over a ten-year horizon plus a conservative terminal value. Use a discount rate of roughly 9-10% (long government bond yield plus an equity premium; never below the bond yield) and growth assumptions that are no higher than the demonstrated historical record and taper toward 2-3% terminal growth. Produce a low, base and high estimate. Demand a margin of safety of at least 25% (more for lower-quality or cyclical businesses) before recommending a purchase.
+6. Temperament. Price is what you pay; value is what you get. Ignore short-term price movements and macro forecasts; technical indicators are provided only as context on where the price sits, not as inputs to the decision.
+
+# Decision rules
+
+- BUY: a good business, inside the circle of competence, with a moat and sound finances, trading at or below buy_below_price (intrinsic value base estimate less the required margin of safety). Conviction must be medium or high.
+- HOLD: a good business trading between buy_below_price and a level well above intrinsic value, or a borderline case where key data is missing. HOLD is also the correct answer when evidence is insufficient to act.
+- SELL: the thesis is broken (moat eroding, returns falling, leverage rising, management misallocating capital), or the price is far above even the high intrinsic value estimate so that expected forward returns are poor, or capital is clearly better deployed elsewhere.
+
+# Price targets (mandatory)
+
+- buy_below_price: always set. The maximum price at which a purchase meets the margin of safety.
+- target_price: REQUIRED when recommendation is BUY (may also be given for HOLD). The price at which the position should be reviewed for sale because it would be fully valued - normally at or modestly above the base intrinsic value estimate, and never below the current price for a BUY.
+- stop_price: REQUIRED when recommendation is BUY. Buffett does not use mechanical stop-losses; treat this as the risk-control level at which the investor should stop and re-examine whether the thesis is broken rather than average down blindly. Set it at a level that would signal permanent capital impairment is becoming likely (typically 15-25% below the current price or below a clearly identified support level, whichever is more meaningful), and say plainly in stop_rationale that this is a risk-control convention, not a Buffett principle.
+- For SELL, target_price is the price at or below which the shares would become interesting again (may be null if the thesis is broken regardless of price); stop_price should be null.
+- All prices are in the stock's trading currency and must be consistent: for BUY, stop_price < current_price <= buy_below_price < target_price.
+
+# Evidence and honesty rules
+
+- Use ONLY the data supplied in the user message. Do not invent figures, ratios, quotes, or events. If a metric is missing, list it under data_gaps and lower conviction accordingly; do not estimate it as if it were known.
+- Every item in key_metrics must name its source field from the supplied data (for example "fundamentals.returnOnEquity" or "price.ma200").
+- List every judgment call that is not directly supported by the data under assumptions, including every valuation input (growth rates, discount rate, terminal growth, owner-earnings adjustments).
+- Write in clear, professional Canadian English. Be direct; avoid hedging language that does not change the conclusion. The summary should read as a short investment memo.
+- This output is informational analysis for a reader who makes their own decisions; do not address the reader as if executing trades for them.
+"""
+
+BUFFETT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "recommendation": {"type": "string", "enum": ["BUY", "HOLD", "SELL"]},
+        "conviction": {"type": "string", "enum": ["high", "medium", "low"]},
+        "headline": {"type": "string", "description": "One-sentence conclusion stating the recommendation and the main reason."},
+        "currency": {"type": "string"},
+        "current_price": {"type": "number"},
+        "intrinsic_value_low": {"type": "number"},
+        "intrinsic_value_base": {"type": "number"},
+        "intrinsic_value_high": {"type": "number"},
+        "margin_of_safety_pct": {"type": "number", "description": "(intrinsic_value_base - current_price) / intrinsic_value_base * 100"},
+        "required_margin_of_safety_pct": {"type": "number"},
+        "buy_below_price": {"type": "number"},
+        "target_price": {"type": ["number", "null"]},
+        "stop_price": {"type": ["number", "null"]},
+        "target_rationale": {"type": "string"},
+        "stop_rationale": {"type": "string"},
+        "time_horizon": {"type": "string"},
+        "summary": {"type": "string", "description": "Two to four paragraphs supporting the decision."},
+        "checklist": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "criterion": {"type": "string"},
+                    "verdict": {"type": "string", "enum": ["pass", "fail", "unclear"]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["criterion", "verdict", "evidence"],
+            },
+        },
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"title": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["title", "content"],
+            },
+        },
+        "key_metrics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                    "assessment": {"type": "string"},
+                    "source": {"type": "string"},
+                },
+                "required": ["name", "value", "assessment", "source"],
+            },
+        },
+        "valuation": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "method": {"type": "string"},
+                "owner_earnings": {"type": "string"},
+                "growth_rate_pct_years_1_5": {"type": "number"},
+                "growth_rate_pct_years_6_10": {"type": "number"},
+                "discount_rate_pct": {"type": "number"},
+                "terminal_growth_pct": {"type": "number"},
+                "notes": {"type": "string"},
+            },
+            "required": [
+                "method", "owner_earnings", "growth_rate_pct_years_1_5", "growth_rate_pct_years_6_10",
+                "discount_rate_pct", "terminal_growth_pct", "notes",
+            ],
+        },
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "data_gaps": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "recommendation", "conviction", "headline", "currency", "current_price",
+        "intrinsic_value_low", "intrinsic_value_base", "intrinsic_value_high",
+        "margin_of_safety_pct", "required_margin_of_safety_pct", "buy_below_price",
+        "target_price", "stop_price", "target_rationale", "stop_rationale", "time_horizon",
+        "summary", "checklist", "sections", "key_metrics", "valuation", "risks", "assumptions", "data_gaps",
+    ],
+}
+
+INFO_FIELDS = (
+    "longName", "sector", "industry", "country", "currency", "financialCurrency", "marketCap",
+    "enterpriseValue", "currentPrice", "trailingPE", "forwardPE", "priceToBook", "enterpriseToEbitda",
+    "trailingEps", "forwardEps", "returnOnEquity", "returnOnAssets", "debtToEquity", "currentRatio",
+    "totalDebt", "totalCash", "freeCashflow", "operatingCashflow", "totalRevenue", "revenueGrowth",
+    "earningsGrowth", "grossMargins", "operatingMargins", "profitMargins", "dividendYield", "payoutRatio",
+    "sharesOutstanding", "bookValue", "beta", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+    "heldPercentInsiders", "longBusinessSummary",
+)
+STATEMENT_ROWS = {
+    "income": ("Total Revenue", "Gross Profit", "Operating Income", "Net Income", "Diluted EPS", "Interest Expense"),
+    "balance": ("Total Debt", "Long Term Debt", "Stockholders Equity", "Cash And Cash Equivalents",
+                "Total Assets", "Ordinary Shares Number"),
+    "cashflow": ("Operating Cash Flow", "Capital Expenditure", "Free Cash Flow", "Depreciation And Amortization",
+                 "Repurchase Of Capital Stock", "Cash Dividends Paid"),
+}
+
+
+def _statement_rows(df, rows):
+    """Pick selected rows from a yfinance annual statement; columns are fiscal year-ends."""
+    out = {}
+    if df is None or getattr(df, "empty", True):
+        return out
+    for row in rows:
+        if row in df.index:
+            series = df.loc[row]
+            out[row] = {str(getattr(col, "year", col)): num(v, 2) for col, v in series.items()}
+    return out
+
+
+def gather_fundamentals(symbol: str) -> dict:
+    """Fundamentals and annual statements from Yahoo Finance (via yfinance). Missing data is omitted, never guessed."""
+    import yfinance as yf
+
+    t = yf.Ticker(symbol)
+    try:
+        info = t.info or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    fundamentals = {k: info[k] for k in INFO_FIELDS if info.get(k) is not None}
+    statements = {}
+    for key, attr in (("income", "income_stmt"), ("balance", "balance_sheet"), ("cashflow", "cashflow")):
+        try:
+            statements[key] = _statement_rows(getattr(t, attr), STATEMENT_ROWS[key])
+        except Exception:  # noqa: BLE001
+            statements[key] = {}
+    return {"fundamentals": fundamentals, "annual_statements": statements}
+
+
+def price_snapshot(df) -> dict:
+    close = df["close"]
+    last = float(close.iloc[-1])
+    year = df.tail(252)
+    ma200 = close.rolling(200).mean().iloc[-1]
+    returns = close.pct_change().dropna()
+    peak = year["close"].cummax()
+    return {
+        "as_of": df["date"].iloc[-1],
+        "last_close": num(last, 2),
+        "high_52w": num(year["high"].max(), 2),
+        "low_52w": num(year["low"].min(), 2),
+        "ma200": num(ma200, 2),
+        "pct_vs_ma200": num((last / ma200 - 1) * 100, 1) if ma200 == ma200 else None,
+        "return_1y_pct": num((last / float(year["close"].iloc[0]) - 1) * 100, 1) if len(year) > 1 else None,
+        "annualized_volatility_pct": num(returns.tail(252).std() * (252 ** 0.5) * 100, 1) if len(returns) > 20 else None,
+        "max_drawdown_1y_pct": num(((year["close"] / peak) - 1).min() * 100, 1),
+        "source": "Azure SQL dbo.stock_prices (loaded from Yahoo Finance)",
+    }
+
+
+def load_price_history_any(symbol: str):
+    """Stored prices if present; otherwise a direct Yahoo Finance download."""
+    import pandas as pd
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        if table_exists(cur):
+            try:
+                return load_prices_df(cur, symbol), "database"
+            except HTTPException:
+                pass
+    finally:
+        conn.close()
+    rows = fetch_history(symbol)
+    df = pd.DataFrame([r.model_dump() for r in rows])
+    df["date"] = df["trade_date"].astype(str)
+    return df, "yahoo"
+
+
+class BuffettRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+
+
+def validate_buffett_output(a: dict) -> list[str]:
+    """Hard rule: a BUY must carry target and stop prices. Soft checks become warnings."""
+    rec = a.get("recommendation")
+    if rec == "BUY" and (a.get("target_price") is None or a.get("stop_price") is None):
+        raise HTTPException(status_code=502, detail="The model returned a BUY without both a target price and a stop price.")
+    warnings = []
+    price = a.get("current_price")
+    if rec == "BUY" and price is not None:
+        if a["stop_price"] >= price:
+            warnings.append("Stop price is not below the current price.")
+        if a["target_price"] <= price:
+            warnings.append("Target price is not above the current price.")
+        if a.get("buy_below_price") is not None and price > a["buy_below_price"]:
+            warnings.append("Current price is above the buy-below price, which is inconsistent with a BUY.")
+    if rec == "SELL" and a.get("stop_price") is not None:
+        warnings.append("A stop price was given for a SELL recommendation.")
+    return warnings
+
+
+@app.post("/api/py/ai/buffett")
+def buffett_analysis(req: BuffettRequest):
+    import anthropic
+    from datetime import date as _date
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
+    symbol = normalize_symbol(req.symbol)
+
+    df, price_source = load_price_history_any(symbol)
+    data = {
+        "symbol": symbol,
+        "analysis_date": _date.today().isoformat(),
+        "price": {**price_snapshot(df), "source": price_source},
+        **gather_fundamentals(symbol),
+        "source_note": "fundamentals and annual_statements: Yahoo Finance via yfinance; values as reported by Yahoo, "
+                       "statement figures in the company's financial currency.",
+    }
+    if not data["fundamentals"]:
+        raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no fundamentals for {symbol}.")
+
+    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    client = anthropic.Anthropic(timeout=240.0, max_retries=1)
+    try:
+        response = client.beta.messages.create(
+            model=model,
+            max_tokens=16000,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            system=[{"type": "text", "text": BUFFETT_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            output_config={"effort": "high", "format": {"type": "json_schema", "schema": BUFFETT_SCHEMA}},
+            messages=[{
+                "role": "user",
+                "content": "Analyze this company using the approach in your instructions and return the JSON.\n\n"
+                           + json.dumps(data, default=str, sort_keys=True),
+            }],
+        )
+    except anthropic.AuthenticationError as e:
+        raise HTTPException(status_code=502, detail="Anthropic API key was rejected.") from e
+    except anthropic.RateLimitError as e:
+        raise HTTPException(status_code=503, detail="Anthropic API rate limit reached; try again shortly.") from e
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic API error {e.status_code}: {e.message}") from e
+    except anthropic.APIConnectionError as e:
+        raise HTTPException(status_code=502, detail="Could not reach the Anthropic API.") from e
+
+    if response.stop_reason == "refusal":
+        why = getattr(response.stop_details, "explanation", None) or "The model declined to analyze this request."
+        raise HTTPException(status_code=502, detail=why)
+    if response.stop_reason == "max_tokens":
+        raise HTTPException(status_code=502, detail="The analysis was cut off (max_tokens); please retry.")
+    text = next((b.text for b in response.content if b.type == "text"), "")
+    try:
+        analysis = json.loads(text)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail="The model did not return valid JSON.") from e
+
+    warnings = validate_buffett_output(analysis)
+    usage = response.usage
+    return {
+        "symbol": symbol,
+        "analysis": analysis,
+        "warnings": warnings,
+        "data_used": data,
+        "model": response.model,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
+        },
+    }
+
+
+SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY"}
 CONFIG_VARS = (
     "AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD",
     "AUTH_USERNAME", "AUTH_PASSWORD", "AUTH_SECRET",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
 )
 
 

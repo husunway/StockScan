@@ -43,6 +43,30 @@ Computed in Python (pandas) from the stored daily prices:
 
 The chart is drawn with [lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache 2.0).
 
+### AI: Warren Buffett analysis (`/ai/buffett`)
+
+`POST /api/py/ai/buffett` with `{ "symbol": "KO" }`:
+
+1. Gathers data - fundamentals and three years of annual statements from Yahoo Finance (yfinance),
+   plus a price snapshot (52-week range, 200-day average, 1-year return, volatility, drawdown)
+   from the stored prices, or from Yahoo if the symbol is not loaded.
+2. Sends the data to Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`) with a
+   system prompt that encodes Buffett's framework - circle of competence, moat, management, financial
+   strength, owner-earnings intrinsic value, margin of safety - and strict decision rules.
+3. Claude must return a fixed JSON structure (structured outputs): recommendation BUY/HOLD/SELL,
+   conviction, intrinsic value low/base/high, buy-below price, target price, stop price, checklist,
+   supporting sections, key metrics with their source fields, valuation inputs, risks, assumptions
+   and data gaps. A BUY without both a target and a stop price is rejected server-side.
+
+The page shows the conclusion first (recommendation, prices, margin of safety), then the detail.
+Everything the model saw is viewable on the page ("Show data sent to the model"). The model is told
+to use only supplied data and to list assumptions separately; treat the output as analysis to verify,
+not advice. A refusal fallback (`fallbacks: "default"`) is enabled so a safety decline is retried on a
+fallback model in the same call.
+
+Requires `ANTHROPIC_API_KEY`. Each run uses roughly 10-20K input and 3-6K output tokens.
+`vercel.json` raises the Python function's `maxDuration` to 120 s because the call takes 30-90 s.
+
 Prices are saved to `dbo.stock_prices` (created automatically on first load):
 
 | column     | type           |
@@ -80,6 +104,8 @@ AZURE_SQL_PASSWORD=
 AUTH_USERNAME=
 AUTH_PASSWORD=
 AUTH_SECRET=        # random, e.g. node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+ANTHROPIC_API_KEY=  # for the AI pages
+ANTHROPIC_MODEL=    # optional, default claude-opus-5-5
 ```
 
 Changing `AUTH_SECRET` signs everyone out. Changing the username or password takes effect on the

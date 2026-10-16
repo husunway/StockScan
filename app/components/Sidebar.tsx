@@ -14,6 +14,12 @@ const items: Item[] = [
     icon: "📈",
     children: [{ href: "/analysis/single", label: "Single stock" }],
   },
+  {
+    href: "/ai",
+    label: "AI",
+    icon: "✦",
+    children: [{ href: "/ai/buffett", label: "Warren Buffett" }],
+  },
   { href: "/diagnosis", label: "Diagnosis", icon: "⚙" },
 ];
 

@@ -221,6 +221,53 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 
 .details { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
 
+/* AI / Buffett */
+.card-link { display: block; }
+.card-link:hover { border-color: var(--accent); }
+.buffett-form { max-width: 560px; }
+.working { display: flex; align-items: center; gap: 10px; margin: 16px 0; color: var(--muted); }
+.spinner {
+  width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border);
+  border-top-color: var(--accent); animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.verdict {
+  background: var(--surface); border: 1px solid var(--border); border-left: 6px solid var(--border);
+  border-radius: 12px; padding: 20px; margin: 16px 0 8px;
+}
+.verdict.rec-buy { border-left-color: #0ca30c; }
+.verdict.rec-hold { border-left-color: #c98500; }
+.verdict.rec-sell { border-left-color: #d03b3b; }
+.verdict-head { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
+.verdict-head h2 { font-size: 1.25rem; line-height: 1.35; }
+.verdict-meta { color: var(--muted); font-size: 0.9rem; margin-top: 4px; text-transform: none; }
+.verdict-meta strong { color: var(--text); text-transform: capitalize; }
+.rec-badge {
+  flex-shrink: 0; padding: 8px 14px; border-radius: 8px; font-weight: 800; letter-spacing: 0.04em;
+  color: #fff; background: var(--muted); font-size: 1.1rem;
+}
+.rec-buy .rec-badge { background: #0ca30c; }
+.rec-hold .rec-badge { background: #c98500; }
+.rec-sell .rec-badge { background: #d03b3b; }
+.price-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.stat.emph { border-color: var(--accent); }
+.rationale { margin-top: 14px; font-size: 0.9rem; color: var(--muted); display: flex; flex-direction: column; gap: 6px; }
+.rationale strong { color: var(--text); }
+.warnings { margin: 12px 0 0; padding-left: 0; list-style: none; color: #c98500; font-size: 0.9rem; }
+.prose { max-width: 820px; margin-bottom: 12px; line-height: 1.6; }
+.table td.wrap { white-space: normal; min-width: 240px; }
+.verdict-pass { color: #0ca30c; font-weight: 600; }
+.verdict-fail { color: #d03b3b; font-weight: 600; }
+.verdict-unclear { color: var(--muted); font-weight: 600; }
+.list { padding-left: 20px; line-height: 1.6; max-width: 820px; }
+.linklike { background: none; border: 0; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
+.data-dump {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+  font-size: 0.75rem; overflow: auto; max-height: 420px;
+}
+.disclaimer { font-size: 0.8rem; }
+
 /* Footer */
 .footer {
   display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px;

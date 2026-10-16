@@ -5,3 +5,4 @@ python-dotenv>=1.0
 yfinance>=0.2.65
 pandas>=2.3
 pymssql>=2.3.4
+anthropic>=1.0
