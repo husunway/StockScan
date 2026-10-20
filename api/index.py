@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 try:
@@ -886,7 +886,10 @@ def run_skill_with_claude(skill: dict, data: dict):
             output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
             messages=[{
                 "role": "user",
-                "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON.\n\n"
+                "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON. "
+                           "In key_metrics.source and within sections, cite the specific statement and period each "
+                           "figure came from (for example 'annual_statements.cashflow.Free Cash Flow 2025', "
+                           "'fundamentals.returnOnEquity' or 'price.ma200').\n\n"
                            + json.dumps(data, default=str, sort_keys=True),
             }],
         )
@@ -996,10 +999,16 @@ CREATE TABLE {DECISIONS_TABLE} (
     error                NVARCHAR(1000) NULL,
     started_at           DATETIME2      NULL,
     finished_at          DATETIME2      NULL,
+    references_json      NVARCHAR(MAX)  NULL,
+    report_pathname      NVARCHAR(400)  NULL,
+    report_url           NVARCHAR(1000) NULL,
     CONSTRAINT UQ_agent_decisions UNIQUE (backtest_id, as_of_date)
 );
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_symbol')
 CREATE INDEX IX_agent_decisions_symbol ON {DECISIONS_TABLE} (symbol, skill_id, as_of_date);
+IF COL_LENGTH('{DECISIONS_TABLE}', 'references_json') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD references_json NVARCHAR(MAX) NULL;
+IF COL_LENGTH('{DECISIONS_TABLE}', 'report_pathname') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_pathname NVARCHAR(400) NULL;
+IF COL_LENGTH('{DECISIONS_TABLE}', 'report_url') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_url NVARCHAR(1000) NULL;
 """
 
 DECISION_COLUMNS = (
@@ -1007,7 +1016,13 @@ DECISION_COLUMNS = (
     "current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low", "intrinsic_value_base",
     "intrinsic_value_high", "margin_of_safety_pct", "headline", "summary", "warnings_json", "model",
     "input_tokens", "output_tokens", "error", "started_at", "finished_at",
+    "references_json", "report_pathname", "report_url",
 )
+STATEMENT_NAMES = {"income": "Income statement", "balance": "Balance sheet", "cashflow": "Cash flow statement"}
+
+
+def ensure_backtest_tables(cur) -> None:
+    cur.execute(ENSURE_BACKTEST_TABLES_SQL)
 
 
 def mondays(year: int, until: date) -> list[date]:
@@ -1184,7 +1199,52 @@ def derive_fundamentals(raw: dict, annual: dict, quarterly: dict, price: float |
     return f, note
 
 
+def build_references(raw: dict, hist, annual: dict, quarterly: dict) -> list[dict]:
+    """Every report and data set the agent was given for this date, with provenance."""
+    refs = [{
+        "type": "prices",
+        "title": "Daily price history",
+        "detail": f"{hist['date'].iloc[0]} to {hist['date'].iloc[-1]} ({len(hist)} trading days) from dbo.stock_prices, "
+                  f"originally Yahoo Finance",
+        "used_for": "current price, 52-week range, 200-day average, volatility, drawdown",
+    }]
+    for period_type, label, src in (("A", "Annual", annual), ("Q", "Quarterly", quarterly)):
+        periods = sorted({pe for s in src.values() for ser in s.values() for pe in ser}, reverse=True)
+        for pe in periods:
+            stmts = [STATEMENT_NAMES[s] for s in ("income", "balance", "cashflow")
+                     if any(pe in ser for ser in src.get(s, {}).values())]
+            items = sum(1 for s in src.values() for ser in s.values() if pe in ser)
+            reported = available_from(date.fromisoformat(pe), period_type, raw.get("earnings_dates", [])).isoformat()
+            refs.append({
+                "type": "statement",
+                "title": f"{label} financial report, period ending {pe}",
+                "detail": f"{', '.join(stmts)}; {items} line items; reported {reported}; Yahoo Finance",
+                "used_for": "trailing-twelve-month figures and trend" if period_type == "Q" else "annual statement rows and multi-year trend",
+            })
+    if raw.get("profile"):
+        refs.append({
+            "type": "profile",
+            "title": "Company profile",
+            "detail": f"Name, sector, industry, country, currencies and business description from the Yahoo Finance "
+                      f"quote summary (fetched {raw.get('fetched_at', '')[:10]}); descriptive text only",
+            "used_for": "circle of competence, moat and competitive position",
+        })
+    refs.append({
+        "type": "derived",
+        "title": "Derived fundamentals",
+        "detail": "Market cap, EPS, P/E, book value, ROE, margins, debt/equity, current ratio, cash flows and payout "
+                  "computed from the statements above and the last price before the analysis date",
+        "used_for": "valuation and financial-strength tests",
+    })
+    return refs
+
+
 def point_in_time_payload(raw: dict, prices_df, as_of: date, skill: dict) -> dict:
+    return point_in_time_bundle(raw, prices_df, as_of, skill)[0]
+
+
+def point_in_time_bundle(raw: dict, prices_df, as_of: date, skill: dict) -> tuple[dict, list[dict]]:
+    """(payload for the model, references list) built only from data available before as_of."""
     info_fields, statement_rows = skill_data_requirements(skill)
     hist = prices_df[prices_df["date"] < as_of.isoformat()]
     if len(hist) < 30:
@@ -1192,6 +1252,7 @@ def point_in_time_payload(raw: dict, prices_df, as_of: date, skill: dict) -> dic
     price = float(hist["close"].iloc[-1])
     annual = visible_statements(raw, as_of, "A")
     quarterly = visible_statements(raw, as_of, "Q")
+    references = build_references(raw, hist, annual, quarterly)
     fundamentals, note = derive_fundamentals(raw, annual, quarterly, price)
     fundamentals = {k: v for k, v in fundamentals.items() if k in info_fields}
     annual_rows = {
@@ -1203,7 +1264,7 @@ def point_in_time_payload(raw: dict, prices_df, as_of: date, skill: dict) -> dic
     }
     years = sorted({pe[:4] for s in annual.values() for ser in s.values() for pe in ser})
     quarters = sorted({pe for s in quarterly.values() for ser in s.values() for pe in ser})
-    return {
+    return ({
         "symbol": raw["symbol"],
         "analysis_date": as_of.isoformat(),
         "price": {**price_snapshot(hist), "source": "database"},
@@ -1216,13 +1277,195 @@ def point_in_time_payload(raw: dict, prices_df, as_of: date, skill: dict) -> dic
             f"dates where known, otherwise {ANNUAL_LAG_DAYS}-day annual / {QUARTERLY_LAG_DAYS}-day quarterly lags). {note} "
             f"You have no knowledge of anything after {as_of.isoformat()}; do not use it."
         ),
-    }
+    }, references)
+
+
+# ---------------------------------------------------------------------------
+# Decision report PDF (fpdf2, core Helvetica -> Latin-1 text) and Vercel Blob storage
+# ---------------------------------------------------------------------------
+_LATIN1_MAP = {
+    "–": "-", "—": "-", "−": "-", "‘": "'", "’": "'", "“": '"', "”": '"',
+    "…": "...", "→": "->", "←": "<-", "•": "-", " ": " ", "≤": "<=", "≥": ">=",
+    "≈": "~", "✓": "yes", "✗": "no", "σ": "sigma", "‰": " per mille",
+}
+
+
+def _latin1(text) -> str:
+    s = "" if text is None else str(text)
+    s = "".join(_LATIN1_MAP.get(ch, ch) for ch in s)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def build_decision_pdf(skill: dict, symbol: str, as_of: str, analysis: dict, references: list[dict], meta: dict) -> bytes:
+    """Key conclusion first, then the full analysis, then the data and reports referenced."""
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    W = pdf.epw
+    ccy = analysis.get("currency", "")
+
+    def money(v):
+        return "-" if v is None else f"{v:,.2f} {ccy}"
+
+    def pct(v):
+        return "-" if v is None else f"{v:+.1f}%"
+
+    def heading(text, size=12, top=3):
+        pdf.ln(top)
+        pdf.set_font("Helvetica", "B", size)
+        pdf.multi_cell(W, 6, _latin1(text))
+        pdf.ln(1)
+
+    def para(text, size=10):
+        pdf.set_font("Helvetica", "", size)
+        for chunk in str(text or "").split("\n\n"):
+            if chunk.strip():
+                pdf.multi_cell(W, 5, _latin1(chunk.strip()))
+                pdf.ln(1.5)
+
+    def bullets(items):
+        pdf.set_font("Helvetica", "", 10)
+        for it in items or []:
+            pdf.multi_cell(W, 5, _latin1(f"- {it}"))
+        pdf.ln(1)
+
+    def table(headers, rows, widths):
+        if not rows:
+            return
+        pdf.set_font("Helvetica", "", 9)
+        with pdf.table(col_widths=widths, text_align="LEFT", line_height=4.5) as tbl:
+            hdr = tbl.row()
+            for h in headers:
+                hdr.cell(_latin1(h))
+            for r in rows:
+                row = tbl.row()
+                for c in r:
+                    row.cell(_latin1(c))
+        pdf.ln(2)
+
+    # Title block
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.multi_cell(W, 8, _latin1(f"{skill['name']} analysis: {symbol} as of {as_of}"))
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(90)
+    pdf.multi_cell(W, 5, _latin1(
+        f"Point-in-time backtest. Skill {skill['id']} v{skill.get('version') or '-'}; model {meta.get('model', '')}; "
+        f"generated {meta.get('generated_at', '')} UTC."))
+    pdf.set_text_color(0)
+    pdf.ln(3)
+
+    # Key conclusion
+    rec = analysis.get("recommendation", "")
+    fill = {"BUY": (222, 245, 222), "SELL": (250, 225, 225)}.get(rec, (240, 240, 240))
+    pdf.set_fill_color(*fill)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.multi_cell(W, 8, _latin1(f"{rec}: {analysis.get('headline', '')}"), fill=True,
+                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+    key_rows = [
+        ("Current price", money(analysis.get("current_price"))),
+        ("Buy below", money(analysis.get("buy_below_price"))),
+        ("Target price", money(analysis.get("target_price"))),
+        ("Stop price", money(analysis.get("stop_price"))),
+        ("Intrinsic value (low / base / high)",
+         f"{money(analysis.get('intrinsic_value_low'))} / {money(analysis.get('intrinsic_value_base'))} / {money(analysis.get('intrinsic_value_high'))}"),
+        ("Margin of safety", f"{pct(analysis.get('margin_of_safety_pct'))} (required {analysis.get('required_margin_of_safety_pct', '-')}%)"),
+        ("Conviction", str(analysis.get("conviction", "-"))),
+        ("Time horizon", str(analysis.get("time_horizon", "-"))),
+    ]
+    table(("Key figure", "Value"), key_rows, (45, 55))
+    if analysis.get("target_rationale"):
+        para(f"Target: {analysis['target_rationale']}", 9)
+    if analysis.get("stop_rationale"):
+        para(f"Stop: {analysis['stop_rationale']}", 9)
+    if meta.get("warnings"):
+        bullets([f"Warning: {w}" for w in meta["warnings"]])
+
+    heading("Summary and justification")
+    para(analysis.get("summary", ""))
+
+    if analysis.get("balance_sheet"):
+        bs = analysis["balance_sheet"]
+        heading(f"Balance sheet: {bs.get('grade', '')}")
+        table(("Aspect", "Assessment"), [(k.replace("_", " "), v) for k, v in bs.items() if k != "grade"], (30, 70))
+    if analysis.get("stress_test"):
+        heading("Stress test")
+        table(("Scenario", "Assumptions", "Earnings", "Price", "Survives"),
+              [(s.get("scenario", ""), s.get("assumptions", ""), pct(s.get("earnings_impact_pct")),
+                pct(s.get("price_impact_pct")), "yes" if s.get("survives_without_capital_raise") else "no")
+               for s in analysis["stress_test"]], (16, 52, 12, 10, 10))
+
+    heading("Checklist")
+    table(("Criterion", "Verdict", "Evidence"),
+          [(c.get("criterion", ""), c.get("verdict", ""), c.get("evidence", "")) for c in analysis.get("checklist", [])],
+          (28, 14, 58))
+
+    for s in analysis.get("sections", []):
+        heading(s.get("title", ""))
+        para(s.get("content", ""))
+
+    heading("Valuation inputs")
+    val = analysis.get("valuation", {}) or {}
+    table(("Input", "Value"), [(k.replace("_", " "), "-" if v is None else str(v)) for k, v in val.items()], (35, 65))
+
+    heading("Key metrics")
+    table(("Metric", "Value", "Assessment", "Source"),
+          [(m.get("name", ""), m.get("value", ""), m.get("assessment", ""), m.get("source", ""))
+           for m in analysis.get("key_metrics", [])], (22, 16, 38, 24))
+
+    for title, key in (("Risks", "risks"), ("Assumptions (model judgment, not data)", "assumptions"), ("Data gaps", "data_gaps")):
+        if analysis.get(key):
+            heading(title)
+            bullets(analysis[key])
+
+    heading("Data and reports referenced")
+    table(("Source", "Detail", "Used for"),
+          [(r.get("title", ""), r.get("detail", ""), r.get("used_for", "")) for r in references], (28, 48, 24))
+
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(90)
+    pdf.multi_cell(W, 4, _latin1(
+        "Model-generated analysis from third-party data reconstructed as of the analysis date. The model's training "
+        "knowledge cannot be rewound to that date. Informational only; not investment advice. Verify before use."))
+    pdf.set_text_color(0)
+    return bytes(pdf.output())
+
+
+def blob_access() -> str:
+    return os.environ.get("BLOB_ACCESS", "private").strip().lower() or "private"
+
+
+def blob_configured() -> bool:
+    return bool(os.environ.get("BLOB_READ_WRITE_TOKEN") or os.environ.get("VERCEL_BLOB_READ_WRITE_TOKEN"))
+
+
+def upload_report(pathname: str, pdf_bytes: bytes) -> dict:
+    from vercel.blob.sync import put_blob
+
+    r = put_blob(pathname, pdf_bytes, access=blob_access(), content_type="application/pdf", allow_overwrite=True)
+    return {"pathname": r.pathname, "url": r.url}
+
+
+def download_report(pathname: str) -> bytes:
+    from vercel.blob.sync import get_blob
+
+    return get_blob(pathname, access=blob_access()).body
+
+
+def report_pathname(skill_id: str, symbol: str, as_of: str, decision_id: int) -> str:
+    safe_symbol = re.sub(r"[^A-Za-z0-9.-]", "_", symbol)
+    return f"reports/{skill_id}/{safe_symbol}/{as_of[:4]}/{as_of}-{decision_id}.pdf"
 
 
 class BacktestRequest(BaseModel):
     skill: str = Field(..., min_length=1, max_length=60)
     symbol: str = Field(..., min_length=1, max_length=20)
     year: int = Field(2026, ge=2000, le=2100)
+    weeks: int = Field(10, ge=1, le=52, description="How many Mondays to run, counting from January 1")
 
 
 def _decision_dict(row) -> dict:
@@ -1233,6 +1476,8 @@ def _decision_dict(row) -> dict:
     for k in ("as_of_date", "started_at", "finished_at"):
         d[k] = d[k].isoformat() if d[k] is not None else None
     d["warnings"] = json.loads(d.pop("warnings_json") or "[]")
+    d["references"] = json.loads(d.pop("references_json") or "[]")
+    d["report_stored"] = bool(d.get("report_pathname"))
     return d
 
 
@@ -1270,7 +1515,7 @@ def list_backtests(symbol: str | None = None, skill: str | None = None):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute(ENSURE_BACKTEST_TABLES_SQL)
+        ensure_backtest_tables(cur)
         conn.commit()
         where, params = [], []
         if symbol:
@@ -1300,7 +1545,7 @@ def create_backtest(req: BacktestRequest):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
-    dates = mondays(req.year, date.today())
+    dates = mondays(req.year, date.today())[: req.weeks]
     if not dates:
         raise HTTPException(status_code=422, detail=f"No Mondays in {req.year} on or before today.")
 
@@ -1322,7 +1567,7 @@ def create_backtest(req: BacktestRequest):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute(ENSURE_BACKTEST_TABLES_SQL)
+        ensure_backtest_tables(cur)
         cur.execute(
             f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data) "
             f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s)",
@@ -1344,9 +1589,48 @@ def get_backtest(backtest_id: int):
     conn = db_connect()
     try:
         cur = conn.cursor()
+        ensure_backtest_tables(cur)
+        conn.commit()
         return {**_backtest_meta(cur, backtest_id), "decisions": _decisions(cur, backtest_id)}
     finally:
         conn.close()
+
+
+@app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}/report.pdf")
+def decision_report(backtest_id: int, decision_id: int):
+    """The stored PDF from Vercel Blob; regenerated from the stored output if the blob is missing."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT skill_id, symbol, as_of_date, output_json, references_json, warnings_json, model, finished_at, "
+            f"report_pathname FROM {DECISIONS_TABLE} WHERE backtest_id = %s AND decision_id = %s",
+            (backtest_id, decision_id),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    skill_id, symbol, as_of, output_json, references_json, warnings_json, model, finished_at, pathname = row
+    if not output_json:
+        raise HTTPException(status_code=404, detail="This decision has no completed analysis.")
+
+    pdf_bytes = None
+    if pathname and blob_configured():
+        try:
+            pdf_bytes = download_report(pathname)
+        except Exception:  # noqa: BLE001 - fall back to regenerating
+            pdf_bytes = None
+    if pdf_bytes is None:
+        pdf_bytes = build_decision_pdf(
+            get_skill(skill_id), symbol, as_of.isoformat(), json.loads(output_json),
+            json.loads(references_json or "[]"),
+            {"model": model, "generated_at": finished_at.isoformat() if finished_at else "", "warnings": json.loads(warnings_json or "[]")},
+        )
+    filename = f"{symbol}-{as_of.isoformat()}-{skill_id}.pdf"
+    return Response(content=pdf_bytes, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{filename}"', "Cache-Control": "private, max-age=300"})
 
 
 @app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}")
@@ -1377,6 +1661,7 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     conn = db_connect()
     try:
         cur = conn.cursor()
+        ensure_backtest_tables(cur)
         cur.execute(f"SELECT skill_id, symbol, raw_data FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
         row = cur.fetchone()
         if not row:
@@ -1406,12 +1691,25 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     result: dict = {}
     error: str | None = None
     payload = None
+    references: list[dict] = []
+    report: dict = {}
     try:
-        payload = point_in_time_payload(raw, prices_df, as_of, skill)
+        payload, references = point_in_time_bundle(raw, prices_df, as_of, skill)
         analysis, response = run_skill_with_claude(skill, payload)
         warnings = validate_verdict(analysis)
         result = {"analysis": analysis, "warnings": warnings, "model": response.model,
                   "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        # Build the PDF now and store it in Vercel Blob; a storage failure is a warning, not a failed decision.
+        generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        pdf_bytes = build_decision_pdf(skill, symbol, as_of.isoformat(), analysis, references,
+                                       {"model": response.model, "generated_at": generated_at, "warnings": warnings})
+        if blob_configured():
+            try:
+                report = upload_report(report_pathname(skill_id, symbol, as_of.isoformat(), decision_id), pdf_bytes)
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"Report PDF could not be stored in Vercel Blob ({type(e).__name__}: {str(e)[:200]}); it will be generated on demand.")
+        else:
+            warnings.append("BLOB_READ_WRITE_TOKEN is not configured; the report PDF is generated on demand instead of stored.")
     except HTTPException as e:
         error = str(e.detail)[:1000]
 
@@ -1421,9 +1719,9 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         cur = conn.cursor()
         if error:
             cur.execute(
-                f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = %s, input_json = %s, finished_at = SYSUTCDATETIME() "
-                f"WHERE decision_id = %s",
-                (error, json.dumps(payload) if payload else None, decision_id),
+                f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = %s, input_json = %s, references_json = %s, "
+                f"finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
+                (error, json.dumps(payload) if payload else None, json.dumps(references), decision_id),
             )
         else:
             a = result["analysis"]
@@ -1432,12 +1730,14 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
                 f"buy_below_price = %s, target_price = %s, stop_price = %s, intrinsic_value_low = %s, intrinsic_value_base = %s, "
                 f"intrinsic_value_high = %s, margin_of_safety_pct = %s, headline = %s, summary = %s, input_json = %s, "
                 f"output_json = %s, warnings_json = %s, model = %s, input_tokens = %s, output_tokens = %s, "
+                f"references_json = %s, report_pathname = %s, report_url = %s, "
                 f"finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
                 (a["recommendation"], a["conviction"], a.get("current_price"), a.get("buy_below_price"),
                  a.get("target_price"), a.get("stop_price"), a.get("intrinsic_value_low"), a.get("intrinsic_value_base"),
                  a.get("intrinsic_value_high"), a.get("margin_of_safety_pct"), (a.get("headline") or "")[:500],
                  a.get("summary"), json.dumps(payload), json.dumps(a), json.dumps(result["warnings"]),
-                 result["model"], result["input_tokens"], result["output_tokens"], decision_id),
+                 result["model"], result["input_tokens"], result["output_tokens"],
+                 json.dumps(references), report.get("pathname"), report.get("url"), decision_id),
             )
         conn.commit()
         cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
@@ -1448,11 +1748,12 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     return {"done": counts["pending"] == 0 and counts["running"] == 0, "decision": decision, "counts": counts}
 
 
-SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY"}
+SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "BLOB_READ_WRITE_TOKEN"}
 CONFIG_VARS = (
     "AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD",
     "AUTH_USERNAME", "AUTH_PASSWORD", "AUTH_SECRET",
     "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+    "BLOB_READ_WRITE_TOKEN", "BLOB_ACCESS",
 )
 
 

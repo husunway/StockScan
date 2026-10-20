@@ -6,3 +6,5 @@ yfinance>=0.2.65
 pandas>=2.3
 pymssql>=2.3.4
 anthropic>=1.0
+fpdf2>=2.8
+vercel-blob>=0.5

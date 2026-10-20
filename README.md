@@ -101,8 +101,24 @@ Requires `ANTHROPIC_API_KEY`. Each run uses roughly 10-20K input and 3-6K output
 
 ### Weekly backtest (`/agent/backtest`)
 
-Runs a skill as of **every Monday of a year** (default 2026, up to today) and stores each decision.
-The AI agent › Warren Buffett menu item opens this page with the Buffett skill selected.
+Runs a skill as of the **first N Mondays of a year** (N = 1-52, default 10; year default 2026, never
+past today) and stores each decision. The AI agent › Warren Buffett menu item opens this page with the
+Buffett skill selected.
+
+The page shows a calendar of the year: every day grey, scheduled Mondays outlined, the running one
+pulsing blue, completed ones green, failed ones red. It refreshes live (polls every 4 s while anything
+is pending). Clicking a completed day opens the decision page: run date, key conclusion (verdict,
+conviction, price, buy-below, target, stop, intrinsic value, margin of safety), the summary, the list of
+**reports and data referenced** (each financial report by period and publication date, the price
+history range, the company profile, and the derived fundamentals), and the **PDF report** embedded,
+with open/download links.
+
+The PDF (key conclusion first, then the full analysis, then the references) is built with fpdf2 after
+each Monday completes and stored in **Vercel Blob** at `reports/<skill>/<symbol>/<year>/<date>-<id>.pdf`
+(`BLOB_READ_WRITE_TOKEN`; `BLOB_ACCESS` = `private` by default, must match the store). The browser never
+reads the blob directly: `/api/py/agent/backtest/{id}/decision/{did}/report.pdf` fetches it server-side
+behind the login, and regenerates the PDF from the stored output if the blob is missing or no store is
+configured.
 
 Point-in-time rules for each Monday `D`:
 
@@ -119,7 +135,8 @@ Point-in-time rules for each Monday `D`:
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| POST | `/api/py/agent/backtest` | `{skill, symbol, year}` → ensures prices are loaded, fetches statements once, creates one pending row per Monday |
+| POST | `/api/py/agent/backtest` | `{skill, symbol, year, weeks}` → ensures prices are loaded, fetches statements once, creates one pending row per Monday |
+| GET  | `/api/py/agent/backtest/{id}/decision/{decision_id}/report.pdf` | the stored (or regenerated) PDF report |
 | POST | `/api/py/agent/backtest/{id}/step` | runs the next pending Monday (one model call); `?retry_failed=true` also picks failed rows |
 | GET  | `/api/py/agent/backtest/{id}` | status, counts and all decisions |
 | GET  | `/api/py/agent/backtest/{id}/decision/{decision_id}` | one decision with the full input and output JSON |
@@ -170,6 +187,8 @@ AUTH_PASSWORD=
 AUTH_SECRET=        # random, e.g. node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ANTHROPIC_API_KEY=  # for the AI pages
 ANTHROPIC_MODEL=    # optional, default claude-opus-5-5
+BLOB_READ_WRITE_TOKEN=  # Vercel Blob store for backtest PDFs (set automatically when the store is connected on Vercel)
+BLOB_ACCESS=private     # or public; must match the store
 ```
 
 Changing `AUTH_SECRET` signs everyone out. Changing the username or password takes effect on the

@@ -289,6 +289,33 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .row-running td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .row-failed td { opacity: 0.8; }
 .row-pending td { color: var(--muted); }
+
+/* Year calendar */
+.cal-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.8rem; color: var(--muted); margin: 6px 0 10px; }
+.cal-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.cal-key { width: 14px; height: 14px; border-radius: 4px; background: var(--border); display: inline-block; }
+.cal-key.sched { background: var(--bg); outline: 1px dashed var(--muted); outline-offset: -1px; }
+.cal-key.running { background: var(--accent); }
+.cal-key.done { background: #0ca30c; }
+.cal-key.failed { background: #d03b3b; }
+.calendar { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.cal-month { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+.cal-month h3 { font-size: 0.85rem; margin-bottom: 6px; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }
+.cal-dow { font-size: 0.62rem; color: var(--muted); text-align: center; }
+.cal-day {
+  aspect-ratio: 1; display: flex; align-items: center; justify-content: center;
+  font-size: 0.72rem; border-radius: 5px; background: var(--border); color: var(--muted);
+}
+.cal-day.empty { background: transparent; }
+.cal-day.sched { background: var(--bg); color: var(--text); outline: 1px dashed var(--muted); outline-offset: -1px; }
+.cal-day.running { background: var(--accent); color: #fff; animation: pulse 0.9s ease-in-out infinite alternate; }
+.cal-day.done { background: #0ca30c; color: #fff; font-weight: 700; }
+.cal-day.failed { background: #d03b3b; color: #fff; font-weight: 700; }
+.cal-day a { color: inherit; display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; border-radius: 5px; }
+.cal-day a:hover { filter: brightness(1.15); }
+@keyframes pulse { from { opacity: 0.55; } to { opacity: 1; } }
+.pdf-frame { width: 100%; height: 860px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
 .agent-form { align-items: flex-end; margin-bottom: 4px; }
 .agent-form input {
   min-width: 200px; padding: 8px 10px; font-size: 0.95rem;
