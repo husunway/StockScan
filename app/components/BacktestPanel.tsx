@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 type Skill = { id: string; name: string; description: string; version: string };
-type Counts = { pending: number; running: number; done: number; failed: number; total: number };
+type Counts = { pending: number; running: number; done: number; failed: number; cancelled: number; total: number };
 type LogEntry = { t: string; elapsed_s: number; level: "info" | "warn" | "error"; message: string };
 type Diagnostics = {
   claude: { provider: string; endpoint: string | null; model: string | null; credentials: string | null; variables: string[] };
@@ -22,7 +22,7 @@ type Diagnostics = {
 type Decision = {
   decision_id: number;
   as_of_date: string;
-  status: "pending" | "running" | "done" | "failed";
+  status: "pending" | "running" | "done" | "failed" | "cancelled";
   log: LogEntry[];
   recommendation: "BUY" | "HOLD" | "SELL" | null;
   conviction: string | null;
@@ -42,6 +42,7 @@ type Backtest = {
   symbol: string;
   year: number;
   created_at: string;
+  status: "active" | "stopped";
   counts: Counts;
   log: LogEntry[];
   decisions: Decision[];
@@ -184,6 +185,7 @@ function YearCalendar({ bt }: { bt: Backtest }) {
         <span><i className="cal-key running" /> running</span>
         <span><i className="cal-key done" /> completed — click for the report</span>
         <span><i className="cal-key failed" /> failed</span>
+        <span><i className="cal-key cancelled" /> cancelled</span>
       </div>
       <div className="calendar">
         {MONTHS.map((name, m) => (
@@ -237,6 +239,8 @@ export default function BacktestPanel() {
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const [preparing, setPreparing] = useState(false);
   const stopRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const [stopping, setStopping] = useState(false);
 
   const loadDataStatus = useCallback(async (sym: string) => {
     if (!sym) return setDataStatus(null);
@@ -328,10 +332,14 @@ export default function BacktestPanel() {
     try {
       for (;;) {
         if (stopRef.current) break;
-        const r = await api<{ done: boolean; decision: Decision | null; counts: Counts }>(
+        const ctrl = new AbortController();
+        abortRef.current = ctrl;
+        const r = await api<{ done: boolean; stopped?: boolean; decision: Decision | null; counts: Counts }>(
           `/api/py/agent/backtest/${id}/step${retryFailed ? "?retry_failed=true" : ""}`,
-          { method: "POST" }
+          { method: "POST", signal: ctrl.signal }
         );
+        abortRef.current = null;
+        if (r.stopped) stopRef.current = true;
         setBt((prev) =>
           prev && prev.backtest_id === id
             ? {
@@ -347,11 +355,41 @@ export default function BacktestPanel() {
         retryFailed = false;
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Step failed");
+      if (!(e instanceof DOMException && e.name === "AbortError")) {
+        setError(e instanceof Error ? e.message : "Step failed");
+      }
     } finally {
+      abortRef.current = null;
       setRunning(false);
     }
   }, []);
+
+  async function stopRun() {
+    if (!bt) return;
+    setStopping(true);
+    stopRef.current = true;
+    abortRef.current?.abort(); // drop the browser's wait on the current step
+    try {
+      const d = await api<Backtest>(`/api/py/agent/backtest/${bt.backtest_id}/stop`, { method: "POST" });
+      setBt(d);
+      note(`Run stopped: ${d.counts.cancelled} Monday(s) cancelled`, "warn");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not stop the run");
+    } finally {
+      setStopping(false);
+    }
+  }
+
+  async function resumeRun(retryFailed = false) {
+    if (!bt) return;
+    try {
+      const d = await api<Backtest>(`/api/py/agent/backtest/${bt.backtest_id}/resume`, { method: "POST" });
+      setBt(d);
+      await runSteps(d.backtest_id, retryFailed);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not resume the run");
+    }
+  }
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
@@ -492,16 +530,24 @@ export default function BacktestPanel() {
           <div className="progress-row">
             <div className="progress"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
             <span className="progress-text">
-              #{bt.backtest_id} {bt.symbol} · {c.done} done · {c.failed} failed · {c.pending + c.running} remaining of {c.total}
-              {(running || active) && <span className="spinner inline" aria-hidden />}
+              #{bt.backtest_id} {bt.symbol} · {c.done} done · {c.failed} failed · {c.pending + c.running} remaining
+              {c.cancelled > 0 && <> · {c.cancelled} cancelled</>} of {c.total}
+              {bt.status === "stopped" && <span className="stopped-chip">stopped</span>}
+              {(running || active) && bt.status !== "stopped" && <span className="spinner inline" aria-hidden />}
             </span>
-            {running ? (
+            {bt.status !== "stopped" && (running || active) && (
+              <button type="button" className="btn small danger" disabled={stopping} onClick={stopRun}>
+                {stopping ? "Stopping…" : "Stop run"}
+              </button>
+            )}
+            {running && (
               <button type="button" className="btn small ghost" onClick={() => { stopRef.current = true; }}>Stop after current</button>
-            ) : (
-              <>
-                {c.pending > 0 && <button type="button" className="btn small" onClick={() => runSteps(bt.backtest_id)}>Resume</button>}
-                {c.failed > 0 && <button type="button" className="btn small ghost" onClick={() => runSteps(bt.backtest_id, true)}>Retry failed</button>}
-              </>
+            )}
+            {!running && (bt.status === "stopped" || c.pending > 0) && (c.pending + c.cancelled > 0) && (
+              <button type="button" className="btn small" onClick={() => resumeRun()}>Resume</button>
+            )}
+            {!running && c.failed > 0 && (
+              <button type="button" className="btn small ghost" onClick={() => resumeRun(true)}>Retry failed</button>
             )}
           </div>
 

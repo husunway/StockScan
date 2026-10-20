@@ -151,7 +151,9 @@ Point-in-time rules for each Monday `D`:
 | ------ | ---- | ----------- |
 | POST | `/api/py/agent/backtest` | `{skill, symbol, year, weeks}` → ensures prices are loaded, fetches statements once, creates one pending row per Monday |
 | GET  | `/api/py/agent/backtest/{id}/decision/{decision_id}/report.pdf` | the stored (or regenerated) PDF report |
-| POST | `/api/py/agent/backtest/{id}/step` | runs the next pending Monday (one model call); `?retry_failed=true` also picks failed rows |
+| POST | `/api/py/agent/backtest/{id}/step` | runs the next pending Monday (one model call); `?retry_failed=true` also picks failed rows; returns `stopped: true` and does nothing if the backtest was stopped |
+| POST | `/api/py/agent/backtest/{id}/stop` | **Stop run**: marks the backtest stopped, cancels pending Mondays, fails a Monday stuck running > 3 min |
+| POST | `/api/py/agent/backtest/{id}/resume` | reactivates a stopped backtest (cancelled → pending) |
 | GET  | `/api/py/agent/backtest/{id}` | status, counts and all decisions |
 | GET  | `/api/py/agent/backtest/{id}/decision/{decision_id}` | one decision with the full input and output JSON |
 | GET  | `/api/py/agent/backtests?symbol=&skill=` | previous backtests |

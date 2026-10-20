@@ -1075,7 +1075,9 @@ IF COL_LENGTH('{DECISIONS_TABLE}', 'report_pathname') IS NULL ALTER TABLE {DECIS
 IF COL_LENGTH('{DECISIONS_TABLE}', 'report_url') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_url NVARCHAR(1000) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'log_json') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'log_json') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
+IF COL_LENGTH('{BACKTESTS_TABLE}', 'status') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD status NVARCHAR(10) NOT NULL CONSTRAINT DF_agent_backtests_status DEFAULT 'active';
 """
+DECISION_STATUSES = ("pending", "running", "done", "failed", "cancelled")
 
 DECISION_COLUMNS = (
     "decision_id", "backtest_id", "skill_id", "symbol", "as_of_date", "status", "recommendation", "conviction",
@@ -1840,7 +1842,7 @@ def _decision_dict(row) -> dict:
 
 def _decision_counts(cur, backtest_id: int) -> dict:
     cur.execute(f"SELECT status, COUNT(*) FROM {DECISIONS_TABLE} WHERE backtest_id = %s GROUP BY status", (backtest_id,))
-    counts = {"pending": 0, "running": 0, "done": 0, "failed": 0}
+    counts = {s: 0 for s in DECISION_STATUSES}
     for status, n in cur.fetchall():
         counts[status] = n
     counts["total"] = sum(counts.values())
@@ -1849,7 +1851,7 @@ def _decision_counts(cur, backtest_id: int) -> dict:
 
 def _backtest_meta(cur, backtest_id: int) -> dict:
     cur.execute(
-        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at, log_json FROM {BACKTESTS_TABLE} "
+        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at, log_json, status FROM {BACKTESTS_TABLE} "
         f"WHERE backtest_id = %s",
         (backtest_id,),
     )
@@ -1857,7 +1859,16 @@ def _backtest_meta(cur, backtest_id: int) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Backtest not found")
     return {"backtest_id": row[0], "skill_id": row[1], "skill_version": row[2], "symbol": row[3], "year": row[4],
-            "created_at": row[5].isoformat(), "log": json.loads(row[6] or "[]"), "counts": _decision_counts(cur, backtest_id)}
+            "created_at": row[5].isoformat(), "log": json.loads(row[6] or "[]"), "status": row[7] or "active",
+            "counts": _decision_counts(cur, backtest_id)}
+
+
+def _backtest_status(cur, backtest_id: int) -> str:
+    cur.execute(f"SELECT status FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Backtest not found")
+    return row[0] or "active"
 
 
 def _decisions(cur, backtest_id: int) -> list[dict]:
@@ -1979,6 +1990,63 @@ def get_backtest(backtest_id: int):
         conn.close()
 
 
+@app.post("/api/py/agent/backtest/{backtest_id}/stop")
+def stop_backtest(backtest_id: int):
+    """Stop completely: no further Monday is claimed (by any tab), pending Mondays are cancelled, and a Monday
+    stuck in 'running' for over 3 minutes (e.g. its request was cut off) is marked failed."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        ensure_backtest_tables(cur)
+        _backtest_status(cur, backtest_id)
+        cur.execute(f"UPDATE {BACKTESTS_TABLE} SET status = 'stopped' WHERE backtest_id = %s", (backtest_id,))
+        cur.execute(
+            f"UPDATE {DECISIONS_TABLE} SET status = 'cancelled', error = 'Stopped by user' "
+            f"WHERE backtest_id = %s AND status = 'pending'",
+            (backtest_id,),
+        )
+        cancelled = cur.rowcount
+        cur.execute(
+            f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = 'Stopped by user while running', finished_at = SYSUTCDATETIME() "
+            f"WHERE backtest_id = %s AND status = 'running' AND started_at < DATEADD(minute, -3, SYSUTCDATETIME())",
+            (backtest_id,),
+        )
+        conn.commit()
+        meta = _backtest_meta(cur, backtest_id)
+        log = RunLog(BACKTESTS_TABLE, "backtest_id", backtest_id)
+        log.entries = meta["log"]
+        log.step(f"Stopped by user: {cancelled} pending Monday(s) cancelled", "warn", cur=cur)
+        conn.commit()
+        return {**_backtest_meta(cur, backtest_id), "decisions": _decisions(cur, backtest_id)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/agent/backtest/{backtest_id}/resume")
+def resume_backtest(backtest_id: int):
+    """Reactivate a stopped backtest: cancelled Mondays become pending again."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        ensure_backtest_tables(cur)
+        _backtest_status(cur, backtest_id)
+        cur.execute(f"UPDATE {BACKTESTS_TABLE} SET status = 'active' WHERE backtest_id = %s", (backtest_id,))
+        cur.execute(
+            f"UPDATE {DECISIONS_TABLE} SET status = 'pending', error = NULL WHERE backtest_id = %s AND status = 'cancelled'",
+            (backtest_id,),
+        )
+        restored = cur.rowcount
+        conn.commit()
+        meta = _backtest_meta(cur, backtest_id)
+        log = RunLog(BACKTESTS_TABLE, "backtest_id", backtest_id)
+        log.entries = meta["log"]
+        log.step(f"Resumed by user: {restored} Monday(s) back to pending", cur=cur)
+        conn.commit()
+        return {**_backtest_meta(cur, backtest_id), "decisions": _decisions(cur, backtest_id)}
+    finally:
+        conn.close()
+
+
 @app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}/report.pdf")
 def decision_report(backtest_id: int, decision_id: int):
     """The stored PDF from Vercel Blob; regenerated from the stored output if the blob is missing."""
@@ -2055,6 +2123,8 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         if not row:
             raise HTTPException(status_code=404, detail="Backtest not found")
         skill_id, symbol, raw_json = row
+        if _backtest_status(cur, backtest_id) == "stopped":
+            return {"done": True, "stopped": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
         statuses = "('pending', 'failed')" if retry_failed else "('pending')"
         cur.execute(
             f"SELECT TOP 1 decision_id, as_of_date FROM {DECISIONS_TABLE} "
@@ -2162,9 +2232,11 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
         decision = _decision_dict(cur.fetchone())
         counts = _decision_counts(cur, backtest_id)
+        stopped = _backtest_status(cur, backtest_id) == "stopped"
     finally:
         conn.close()
-    return {"done": counts["pending"] == 0 and counts["running"] == 0, "decision": decision, "counts": counts}
+    return {"done": stopped or (counts["pending"] == 0 and counts["running"] == 0), "stopped": stopped,
+            "decision": decision, "counts": counts}
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",

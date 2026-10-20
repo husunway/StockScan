@@ -298,6 +298,15 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .cal-key.running { background: var(--accent); }
 .cal-key.done { background: #0ca30c; }
 .cal-key.failed { background: #d03b3b; }
+.cal-key.cancelled { background: var(--bg); outline: 1px solid var(--border); outline-offset: -1px; }
+.cal-day.cancelled { background: var(--bg); color: var(--muted); text-decoration: line-through; }
+.btn.danger { background: #d03b3b; color: #fff; }
+.btn.danger:hover:not(:disabled) { background: #b32f2f; }
+.stopped-chip {
+  display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px;
+  background: #d03b3b; color: #fff; font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+}
+.row-cancelled td { color: var(--muted); text-decoration: line-through; }
 .calendar { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 12px; margin-bottom: 20px; }
 .cal-month { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
 .cal-month h3 { font-size: 0.85rem; margin-bottom: 6px; }
