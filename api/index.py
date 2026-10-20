@@ -1,4 +1,5 @@
 import os
+import platform
 from datetime import date
 from decimal import Decimal
 
@@ -937,7 +938,12 @@ def run_skill_with_claude(skill: dict, data: dict):
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error {e.status_code}: {e.message}") from e
     except anthropic.APIConnectionError as e:
-        raise HTTPException(status_code=502, detail="Could not reach the Anthropic API.") from e
+        cause = f"{type(e.__cause__).__name__}: {e.__cause__}" if e.__cause__ else str(e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not connect to Claude via {provider} at {client.base_url} ({cause[:300]}). "
+                   "Check the resource name / base URL, DNS and any corporate proxy or firewall.",
+        ) from e
 
     if response.stop_reason == "refusal":
         why = getattr(response.stop_details, "explanation", None) or "The model declined to analyze this request."
@@ -1005,6 +1011,7 @@ CREATE TABLE {BACKTESTS_TABLE} (
     symbol        NVARCHAR(20)  NOT NULL,
     [year]        INT           NOT NULL,
     raw_data      NVARCHAR(MAX) NOT NULL,
+    log_json      NVARCHAR(MAX) NULL,
     created_at    DATETIME2     NOT NULL CONSTRAINT DF_agent_backtests_created DEFAULT SYSUTCDATETIME()
 );
 IF OBJECT_ID('{DECISIONS_TABLE}', 'U') IS NULL
@@ -1039,6 +1046,7 @@ CREATE TABLE {DECISIONS_TABLE} (
     references_json      NVARCHAR(MAX)  NULL,
     report_pathname      NVARCHAR(400)  NULL,
     report_url           NVARCHAR(1000) NULL,
+    log_json             NVARCHAR(MAX)  NULL,
     CONSTRAINT UQ_agent_decisions UNIQUE (backtest_id, as_of_date)
 );
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_symbol')
@@ -1046,6 +1054,8 @@ CREATE INDEX IX_agent_decisions_symbol ON {DECISIONS_TABLE} (symbol, skill_id, a
 IF COL_LENGTH('{DECISIONS_TABLE}', 'references_json') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD references_json NVARCHAR(MAX) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'report_pathname') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_pathname NVARCHAR(400) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'report_url') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_url NVARCHAR(1000) NULL;
+IF COL_LENGTH('{DECISIONS_TABLE}', 'log_json') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
+IF COL_LENGTH('{BACKTESTS_TABLE}', 'log_json') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
 """
 
 DECISION_COLUMNS = (
@@ -1053,13 +1063,98 @@ DECISION_COLUMNS = (
     "current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low", "intrinsic_value_base",
     "intrinsic_value_high", "margin_of_safety_pct", "headline", "summary", "warnings_json", "model",
     "input_tokens", "output_tokens", "error", "started_at", "finished_at",
-    "references_json", "report_pathname", "report_url",
+    "references_json", "report_pathname", "report_url", "log_json",
 )
 STATEMENT_NAMES = {"income": "Income statement", "balance": "Balance sheet", "cashflow": "Cash flow statement"}
 
 
 def ensure_backtest_tables(cur) -> None:
     cur.execute(ENSURE_BACKTEST_TABLES_SQL)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: what the server is configured with (never secret values), and a per-run log
+# that is written to the database at each phase so the page can show progress live.
+# ---------------------------------------------------------------------------
+def _set(name: str) -> str:
+    v = os.environ.get(name)
+    return f"{name} (set, {len(v)} chars)" if v else f"{name} (missing)"
+
+
+def env_diagnostics() -> dict:
+    provider = claude_provider()
+    if provider == "foundry":
+        base = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL") or \
+            f"https://{os.environ.get('ANTHROPIC_FOUNDRY_RESOURCE')}.services.ai.azure.com/anthropic/"
+        claude = {"provider": "Microsoft Foundry", "endpoint": base, "model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
+                  "credentials": _set("ANTHROPIC_FOUNDRY_API_KEY"),
+                  "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"),
+                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("ANTHROPIC_MODEL")]}
+    elif provider == "anthropic":
+        claude = {"provider": "Anthropic API", "endpoint": "https://api.anthropic.com/", "model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
+                  "credentials": _set("ANTHROPIC_API_KEY"), "variables": [_set("ANTHROPIC_API_KEY"), _set("ANTHROPIC_MODEL")]}
+    else:
+        claude = {"provider": "not configured", "endpoint": None, "model": None, "credentials": None,
+                  "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"), _set("ANTHROPIC_API_KEY")]}
+    return {
+        "claude": claude,
+        "database": {
+            "server": os.environ.get("AZURE_SQL_SERVER") or None,
+            "database": os.environ.get("AZURE_SQL_DATABASE") or None,
+            "user": os.environ.get("AZURE_SQL_USER") or None,
+            "variables": [_set("AZURE_SQL_SERVER"), _set("AZURE_SQL_DATABASE"), _set("AZURE_SQL_USER"), _set("AZURE_SQL_PASSWORD")],
+        },
+        "blob": {"configured": blob_configured(), "access": blob_access(),
+                 "variables": [_set("BLOB_READ_WRITE_TOKEN"), _set("BLOB_ACCESS")]},
+        "skills_dir": str(SKILLS_DIR),
+        "vercel": bool(os.environ.get("VERCEL")),
+        "python": platform.python_version(),
+    }
+
+
+class RunLog:
+    """Timestamped entries persisted to <table>.log_json so a polling page can show progress during a run."""
+
+    def __init__(self, table: str, id_column: str, row_id: int | None = None):
+        self.table, self.id_column, self.row_id = table, id_column, row_id
+        self.entries: list[dict] = []
+        self._t0 = time.monotonic()
+
+    def add(self, message: str, level: str = "info") -> None:
+        self.entries.append({"t": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                             "elapsed_s": round(time.monotonic() - self._t0, 2), "level": level, "message": message})
+
+    def save(self, cur=None) -> None:
+        """Write the log; opens a short connection when no cursor is supplied (e.g. around the model call)."""
+        if self.row_id is None:
+            return
+        sql = f"UPDATE {self.table} SET log_json = %s WHERE {self.id_column} = %s"
+        params = (json.dumps(self.entries), self.row_id)
+        if cur is not None:
+            cur.execute(sql, params)
+            return
+        try:
+            conn = db_connect()
+            try:
+                conn.cursor().execute(sql, params)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - logging must never break the run
+            pass
+
+    def step(self, message: str, level: str = "info", cur=None) -> None:
+        self.add(message, level)
+        self.save(cur)
+
+
+def describe_db() -> str:
+    return f"{os.environ.get('AZURE_SQL_SERVER')}/{os.environ.get('AZURE_SQL_DATABASE')} as {os.environ.get('AZURE_SQL_USER')}"
+
+
+def describe_claude() -> str:
+    c = env_diagnostics()["claude"]
+    return f"{c['provider']} at {c['endpoint']} with model '{c['model']}' using {c['credentials']}"
 
 
 def mondays(year: int, until: date) -> list[date]:
@@ -1514,6 +1609,7 @@ def _decision_dict(row) -> dict:
         d[k] = d[k].isoformat() if d[k] is not None else None
     d["warnings"] = json.loads(d.pop("warnings_json") or "[]")
     d["references"] = json.loads(d.pop("references_json") or "[]")
+    d["log"] = json.loads(d.pop("log_json") or "[]")
     d["report_stored"] = bool(d.get("report_pathname"))
     return d
 
@@ -1529,14 +1625,15 @@ def _decision_counts(cur, backtest_id: int) -> dict:
 
 def _backtest_meta(cur, backtest_id: int) -> dict:
     cur.execute(
-        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at FROM {BACKTESTS_TABLE} WHERE backtest_id = %s",
+        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at, log_json FROM {BACKTESTS_TABLE} "
+        f"WHERE backtest_id = %s",
         (backtest_id,),
     )
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Backtest not found")
     return {"backtest_id": row[0], "skill_id": row[1], "skill_version": row[2], "symbol": row[3], "year": row[4],
-            "created_at": row[5].isoformat(), "counts": _decision_counts(cur, backtest_id)}
+            "created_at": row[5].isoformat(), "log": json.loads(row[6] or "[]"), "counts": _decision_counts(cur, backtest_id)}
 
 
 def _decisions(cur, backtest_id: int) -> list[dict]:
@@ -1576,29 +1673,71 @@ def list_backtests(symbol: str | None = None, skill: str | None = None):
         conn.close()
 
 
+@app.get("/api/py/agent/diagnostics")
+def agent_diagnostics():
+    """Configuration the backtest will use (no secret values) plus a live database connectivity check."""
+    info = env_diagnostics()
+    try:
+        t0 = time.monotonic()
+        conn = db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT @@VERSION")
+            version = str(cur.fetchone()[0]).split("\n")[0]
+            cur.execute(f"SELECT COUNT(DISTINCT symbol), COUNT(*) FROM {TABLE}") if table_exists(cur) else None
+            symbols, rows = cur.fetchone() if table_exists(cur) else (0, 0)
+        finally:
+            conn.close()
+        info["database"].update({"connected": True, "latency_ms": round((time.monotonic() - t0) * 1000),
+                                 "version": version, "symbols_loaded": symbols, "price_rows": rows})
+    except HTTPException as e:
+        info["database"].update({"connected": False, "error": str(e.detail)})
+    info["skills"] = [s["id"] for s in list_skills()]
+    return info
+
+
 @app.post("/api/py/agent/backtest")
 def create_backtest(req: BacktestRequest):
     require_claude()
+    log = RunLog(BACKTESTS_TABLE, "backtest_id")
+    log.add(f"Claude: {describe_claude()}")
+    log.add(f"Database: {describe_db()} ({_set('AZURE_SQL_PASSWORD')})")
+    log.add(f"Blob storage: {'configured, access=' + blob_access() if blob_configured() else 'not configured - PDFs will be generated on demand'}")
     skill = get_skill(req.skill.strip().lower())
+    log.add(f"Skill loaded: {skill['path']} v{skill.get('version') or '-'} ({len(skill['instructions'])} chars)")
     symbol = normalize_symbol(req.symbol)
     dates = mondays(req.year, date.today())[: req.weeks]
     if not dates:
         raise HTTPException(status_code=422, detail=f"No Mondays in {req.year} on or before today.")
+    log.add(f"Schedule: {len(dates)} Mondays from {dates[0]} to {dates[-1]}")
 
     # Make sure two years of prices are stored, then pull the statements once.
+    t0 = time.monotonic()
     conn = db_connect()
     try:
         cur = conn.cursor()
+        log.add(f"Database connected in {round((time.monotonic() - t0) * 1000)} ms")
         cur.execute(ENSURE_TABLE_SQL)
         cur.execute(f"SELECT COUNT(*), MIN(trade_date) FROM {TABLE} WHERE symbol = %s", (symbol,))
         count, first = cur.fetchone()
     finally:
         conn.close()
     if count < 250 or (first and first > date(req.year - 1, 1, 1)):
-        save_prices(symbol, fetch_history(symbol))
+        log.add(f"Only {count} price rows stored for {symbol}; downloading two years from Yahoo Finance")
+        rows = fetch_history(symbol)
+        save_prices(symbol, rows)
+        log.add(f"Saved {len(rows)} price rows ({rows[0].trade_date} to {rows[-1].trade_date})")
+    else:
+        log.add(f"Prices already stored: {count} rows from {first}")
+    t0 = time.monotonic()
     raw = fetch_backtest_raw(symbol)
     if not raw["statements"]["A"].get("income"):
         raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no financial statements for {symbol}.")
+    a_periods = {pe for s in raw["statements"]["A"].values() for ser in s.values() for pe in ser}
+    q_periods = {pe for s in raw["statements"]["Q"].values() for ser in s.values() for pe in ser}
+    log.add(f"Yahoo Finance statements fetched in {time.monotonic() - t0:.1f} s: {len(a_periods)} annual periods, "
+            f"{len(q_periods)} quarterly periods, {len(raw['earnings_dates'])} earnings dates, profile "
+            f"{'found' if raw['profile'] else 'missing'}")
 
     conn = db_connect()
     try:
@@ -1610,6 +1749,9 @@ def create_backtest(req: BacktestRequest):
             (skill["id"], skill["version"], symbol, req.year, json.dumps(raw)),
         )
         backtest_id = cur.fetchone()[0]
+        log.row_id = backtest_id
+        log.add(f"Backtest #{backtest_id} created with {len(dates)} pending decisions")
+        log.save(cur)
         cur.executemany(
             f"INSERT INTO {DECISIONS_TABLE} (backtest_id, skill_id, symbol, as_of_date, status) VALUES (%s, %s, %s, %s, 'pending')",
             [(backtest_id, skill["id"], symbol, d) for d in dates],
@@ -1693,10 +1835,15 @@ def get_decision(backtest_id: int, decision_id: int):
 @app.post("/api/py/agent/backtest/{backtest_id}/step")
 def backtest_step(backtest_id: int, retry_failed: bool = False):
     """Run the next pending Monday (one Claude call per request so it fits a serverless time limit)."""
+    log = RunLog(DECISIONS_TABLE, "decision_id")
+    log.add(f"Claude: {describe_claude()}")
+    log.add(f"Database: connecting to {describe_db()}")
     # Phase 1: claim a decision and load what it needs, then release the connection for the model call.
+    t0 = time.monotonic()
     conn = db_connect()
     try:
         cur = conn.cursor()
+        log.add(f"Database connected in {round((time.monotonic() - t0) * 1000)} ms")
         ensure_backtest_tables(cur)
         cur.execute(f"SELECT skill_id, symbol, raw_data FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
         row = cur.fetchone()
@@ -1713,17 +1860,24 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         if not row:
             return {"done": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
         decision_id, as_of = row
+        log.row_id = decision_id
+        log.add(f"Claimed Monday {as_of} (decision #{decision_id}) for {symbol}")
         cur.execute(
-            f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, started_at = SYSUTCDATETIME() WHERE decision_id = %s",
-            (decision_id,),
+            f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, started_at = SYSUTCDATETIME(), log_json = %s "
+            f"WHERE decision_id = %s",
+            (json.dumps(log.entries), decision_id),
         )
         conn.commit()
         prices_df = load_prices_df(cur, symbol)
+        log.step(f"Loaded {len(prices_df)} stored price rows ({prices_df['date'].iloc[0]} to {prices_df['date'].iloc[-1]})", cur=cur)
+        conn.commit()
     finally:
         conn.close()
 
     skill = get_skill(skill_id)
     raw = json.loads(raw_json)
+    log.add(f"Skill: {skill['path']} v{skill.get('version') or '-'}; statements from backtest #{backtest_id} "
+            f"(fetched {raw.get('fetched_at', '')[:19]})")
     result: dict = {}
     error: str | None = None
     payload = None
@@ -1731,33 +1885,52 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     report: dict = {}
     try:
         payload, references = point_in_time_bundle(raw, prices_df, as_of, skill)
+        n_stmt = sum(1 for r in references if r["type"] == "statement")
+        log.step(f"Point-in-time data as of {as_of}: price through {payload['price']['as_of']}, {n_stmt} statement "
+                 f"periods visible, {len(payload['fundamentals'])} derived fundamentals")
+        log.step(f"Querying Claude ({env_diagnostics()['claude']['provider']}, model '{os.environ.get('ANTHROPIC_MODEL', DEFAULT_CLAUDE_MODEL)}') ...")
+        t0 = time.monotonic()
         analysis, response = run_skill_with_claude(skill, payload)
+        log.step(f"Claude responded in {time.monotonic() - t0:.1f} s: model {response.model}, stop_reason {response.stop_reason}, "
+                 f"{response.usage.input_tokens:,} input / {response.usage.output_tokens:,} output tokens")
         warnings = validate_verdict(analysis)
+        log.add(f"Verdict {analysis['recommendation']} ({analysis.get('conviction')}): target {analysis.get('target_price')}, "
+                f"stop {analysis.get('stop_price')}; {len(warnings)} warning(s)")
         result = {"analysis": analysis, "warnings": warnings, "model": response.model,
                   "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
         # Build the PDF now and store it in Vercel Blob; a storage failure is a warning, not a failed decision.
+        log.step("Generating PDF report ...")
         generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         pdf_bytes = build_decision_pdf(skill, symbol, as_of.isoformat(), analysis, references,
                                        {"model": response.model, "generated_at": generated_at, "warnings": warnings})
+        log.add(f"PDF generated: {len(pdf_bytes) / 1024:.1f} KB")
         if blob_configured():
+            pathname = report_pathname(skill_id, symbol, as_of.isoformat(), decision_id)
+            log.step(f"Uploading PDF to Vercel Blob ({blob_access()}): {pathname}")
             try:
-                report = upload_report(report_pathname(skill_id, symbol, as_of.isoformat(), decision_id), pdf_bytes)
+                t0 = time.monotonic()
+                report = upload_report(pathname, pdf_bytes)
+                log.add(f"Stored in Vercel Blob in {time.monotonic() - t0:.1f} s")
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"Report PDF could not be stored in Vercel Blob ({type(e).__name__}: {str(e)[:200]}); it will be generated on demand.")
+                log.add(f"Blob upload failed: {type(e).__name__}: {str(e)[:200]}", "warn")
         else:
             warnings.append("BLOB_READ_WRITE_TOKEN is not configured; the report PDF is generated on demand instead of stored.")
+            log.add("Blob storage not configured; PDF will be generated on demand", "warn")
     except HTTPException as e:
         error = str(e.detail)[:1000]
+        log.add(f"Failed: {error}", "error")
 
     # Phase 2: persist the outcome.
+    log.add("Saving decision to dbo.agent_decisions")
     conn = db_connect()
     try:
         cur = conn.cursor()
         if error:
             cur.execute(
                 f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = %s, input_json = %s, references_json = %s, "
-                f"finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
-                (error, json.dumps(payload) if payload else None, json.dumps(references), decision_id),
+                f"log_json = %s, finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
+                (error, json.dumps(payload) if payload else None, json.dumps(references), json.dumps(log.entries), decision_id),
             )
         else:
             a = result["analysis"]
@@ -1766,14 +1939,18 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
                 f"buy_below_price = %s, target_price = %s, stop_price = %s, intrinsic_value_low = %s, intrinsic_value_base = %s, "
                 f"intrinsic_value_high = %s, margin_of_safety_pct = %s, headline = %s, summary = %s, input_json = %s, "
                 f"output_json = %s, warnings_json = %s, model = %s, input_tokens = %s, output_tokens = %s, "
-                f"references_json = %s, report_pathname = %s, report_url = %s, "
+                f"references_json = %s, report_pathname = %s, report_url = %s, log_json = %s, "
                 f"finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
                 (a["recommendation"], a["conviction"], a.get("current_price"), a.get("buy_below_price"),
                  a.get("target_price"), a.get("stop_price"), a.get("intrinsic_value_low"), a.get("intrinsic_value_base"),
                  a.get("intrinsic_value_high"), a.get("margin_of_safety_pct"), (a.get("headline") or "")[:500],
                  a.get("summary"), json.dumps(payload), json.dumps(a), json.dumps(result["warnings"]),
                  result["model"], result["input_tokens"], result["output_tokens"],
-                 json.dumps(references), report.get("pathname"), report.get("url"), decision_id),
+                 json.dumps(references), report.get("pathname"), report.get("url"),
+                 json.dumps(log.entries + [{"t": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                                            "elapsed_s": round(time.monotonic() - log._t0, 2), "level": "info",
+                                            "message": "Decision saved"}]),
+                 decision_id),
             )
         conn.commit()
         cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
@@ -1797,7 +1974,6 @@ CONFIG_VARS = (
 
 @app.get("/api/py/diagnosis")
 def diagnosis():
-    import platform
     import sys
 
     variables = []

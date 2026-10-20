@@ -6,10 +6,24 @@ import { useSearchParams } from "next/navigation";
 
 type Skill = { id: string; name: string; description: string; version: string };
 type Counts = { pending: number; running: number; done: number; failed: number; total: number };
+type LogEntry = { t: string; elapsed_s: number; level: "info" | "warn" | "error"; message: string };
+type Diagnostics = {
+  claude: { provider: string; endpoint: string | null; model: string | null; credentials: string | null; variables: string[] };
+  database: {
+    server: string | null; database: string | null; user: string | null; variables: string[];
+    connected?: boolean; latency_ms?: number; version?: string; symbols_loaded?: number; price_rows?: number; error?: string;
+  };
+  blob: { configured: boolean; access: string; variables: string[] };
+  skills_dir: string;
+  skills: string[];
+  vercel: boolean;
+  python: string;
+};
 type Decision = {
   decision_id: number;
   as_of_date: string;
   status: "pending" | "running" | "done" | "failed";
+  log: LogEntry[];
   recommendation: "BUY" | "HOLD" | "SELL" | null;
   conviction: string | null;
   current_price: number | null;
@@ -29,6 +43,7 @@ type Backtest = {
   year: number;
   created_at: string;
   counts: Counts;
+  log: LogEntry[];
   decisions: Decision[];
 };
 type Previous = { backtest_id: number; skill_id: string; symbol: string; year: number; created_at: string; done: number; failed: number; total: number };
@@ -47,6 +62,92 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${res.status})`);
   return data as T;
+}
+
+function DiagnosticsPanel({ diag, error }: { diag: Diagnostics | null; error: string | null }) {
+  const [open, setOpen] = useState(true);
+  if (error) return <p className="msg error">Diagnostics unavailable: {error}</p>;
+  if (!diag) return <p className="msg">Checking configuration…</p>;
+  const db = diag.database;
+  const dot = (ok: boolean | undefined) => <span className={`dot ${ok === undefined ? "" : ok ? "ok" : "down"}`} />;
+  return (
+    <div className="diag">
+      <button type="button" className="linklike diag-toggle" onClick={() => setOpen((v) => !v)}>
+        {open ? "▾" : "▸"} Configuration used for this run
+      </button>
+      {open && (
+        <div className="diag-grid">
+          <div className="diag-item">
+            <span className="stat-label">{dot(diag.claude.provider !== "not configured")} Claude</span>
+            <strong>{diag.claude.provider}</strong>
+            <span>{diag.claude.endpoint ?? "—"}</span>
+            <span>model <code>{diag.claude.model ?? "—"}</code></span>
+            <span className="tile-note">{diag.claude.variables.join(" · ")}</span>
+          </div>
+          <div className="diag-item">
+            <span className="stat-label">{dot(db.connected)} Azure SQL</span>
+            <strong>{db.connected ? `connected in ${db.latency_ms} ms` : db.connected === false ? "connection failed" : "—"}</strong>
+            <span>{db.server ?? "—"} / {db.database ?? "—"} as {db.user ?? "—"}</span>
+            <span>{db.connected ? `${db.symbols_loaded} symbols, ${db.price_rows?.toLocaleString()} price rows` : db.error ?? ""}</span>
+            <span className="tile-note">{db.variables.join(" · ")}</span>
+          </div>
+          <div className="diag-item">
+            <span className="stat-label">{dot(diag.blob.configured)} Vercel Blob</span>
+            <strong>{diag.blob.configured ? `configured (${diag.blob.access})` : "not configured"}</strong>
+            <span>{diag.blob.configured ? "PDF reports will be stored" : "PDFs generated on demand"}</span>
+            <span className="tile-note">{diag.blob.variables.join(" · ")}</span>
+          </div>
+          <div className="diag-item">
+            <span className="stat-label">{dot(diag.skills.length > 0)} Runtime</span>
+            <strong>{diag.vercel ? "Vercel function" : "local"} · Python {diag.python}</strong>
+            <span>skills: {diag.skills.join(", ") || "none found"}</span>
+            <span className="tile-note">{diag.skills_dir}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LiveLog({ title, entries, running }: { title: string; entries: LogEntry[]; running: boolean }) {
+  const endRef = useRef<HTMLDivElement>(null);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "nearest" });
+  }, [entries.length]);
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [running]);
+  const last = entries[entries.length - 1];
+  const waiting = running && last ? Math.max(0, Math.round((now - new Date(last.t).getTime()) / 1000)) : 0;
+  return (
+    <div className="console">
+      <div className="console-title">
+        {title}
+        {running && <span className="spinner inline" aria-hidden />}
+      </div>
+      <div className="console-body">
+        {entries.length === 0 && <div className="console-line muted">No log yet.</div>}
+        {entries.map((e, i) => (
+          <div key={i} className={`console-line ${e.level}`}>
+            <span className="console-time">{e.t.slice(11, 19)}</span>
+            <span className="console-elapsed">+{e.elapsed_s.toFixed(1)}s</span>
+            <span>{e.message}</span>
+          </div>
+        ))}
+        {running && last && (
+          <div className="console-line muted">
+            <span className="console-time">…</span>
+            <span className="console-elapsed">{waiting}s</span>
+            <span>waiting for the next update (the log refreshes every few seconds; a model call takes 30–90 s)</span>
+          </div>
+        )}
+        <div ref={endRef} />
+      </div>
+    </div>
+  );
 }
 
 /** Month grid starting on Monday; null cells pad the first week. */
@@ -113,9 +214,17 @@ export default function BacktestPanel() {
   const [running, setRunning] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [diag, setDiag] = useState<Diagnostics | null>(null);
+  const [diagError, setDiagError] = useState<string | null>(null);
+  const [clientLog, setClientLog] = useState<LogEntry[]>([]);
   const stopRef = useRef(false);
 
+  const note = useCallback((message: string, level: LogEntry["level"] = "info") => {
+    setClientLog((prev) => [...prev, { t: new Date().toISOString(), elapsed_s: 0, level, message }]);
+  }, []);
+
   useEffect(() => {
+    api<Diagnostics>("/api/py/agent/diagnostics").then(setDiag).catch((e: Error) => setDiagError(e.message));
     api<{ skills: Skill[] }>("/api/py/agent/skills")
       .then((d) => {
         setSkills(d.skills);
@@ -195,6 +304,8 @@ export default function BacktestPanel() {
     setCreating(true);
     setError(null);
     setBt(null);
+    setClientLog([]);
+    note(`Preparing backtest: ${skillId} on ${s}, first ${weeks} Monday(s) of ${year} - checking stored prices and fetching statements from Yahoo Finance ...`);
     try {
       const created = await api<Backtest>("/api/py/agent/backtest", {
         method: "POST",
@@ -203,10 +314,13 @@ export default function BacktestPanel() {
       });
       setBt(created);
       setCreating(false);
+      note(`Backtest #${created.backtest_id} created; starting the first Monday`);
       loadPrevious(s, skillId);
       await runSteps(created.backtest_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not create backtest");
+      const msg = err instanceof Error ? err.message : "Could not create backtest";
+      setError(msg);
+      note(msg, "error");
       setCreating(false);
     }
   }
@@ -230,9 +344,14 @@ export default function BacktestPanel() {
   const tally = { BUY: 0, HOLD: 0, SELL: 0 };
   for (const d of done) if (d.recommendation) tally[d.recommendation]++;
   const progress = c && c.total ? ((c.done + c.failed) / c.total) * 100 : 0;
+  // The live log follows the Monday in progress, else the most recently finished one.
+  const current =
+    bt?.decisions.find((d) => d.status === "running") ??
+    [...(bt?.decisions ?? [])].reverse().find((d) => d.status === "done" || d.status === "failed");
 
   return (
     <div className="single">
+      <DiagnosticsPanel diag={diag} error={diagError} />
       <form className="filters agent-form" onSubmit={create}>
         <label>
           Skill
@@ -282,8 +401,17 @@ export default function BacktestPanel() {
 
       {error && <p className="msg error">{error}</p>}
 
+      {(creating || clientLog.length > 0) && !bt && (
+        <LiveLog title="Preparing" entries={clientLog} running={creating} />
+      )}
+
       {bt && c && (
         <div className="buffett">
+          <LiveLog
+            title={current ? `Run log - Monday ${current.as_of_date} (${current.status})` : "Run log"}
+            entries={[...(bt.log ?? []), ...(current?.log ?? [])]}
+            running={running || active}
+          />
           <div className="progress-row">
             <div className="progress"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
             <span className="progress-text">

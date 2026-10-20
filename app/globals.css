@@ -316,6 +316,31 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .cal-day a:hover { filter: brightness(1.15); }
 @keyframes pulse { from { opacity: 0.55; } to { opacity: 1; } }
 .pdf-frame { width: 100%; height: 860px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
+
+/* Diagnostics and live log */
+.diag { margin-bottom: 14px; }
+.diag-toggle { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
+.diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.diag-item {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 2px; font-size: 0.82rem; word-break: break-word;
+}
+.diag-item .stat-label { display: inline-flex; align-items: center; gap: 6px; }
+.diag-item strong { font-size: 0.9rem; }
+.console {
+  background: #0f1420; color: #d7dce5; border: 1px solid var(--border); border-radius: 10px;
+  margin: 12px 0; font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem;
+}
+.console-title {
+  display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-bottom: 1px solid #243042;
+  font-family: system-ui, sans-serif; font-size: 0.8rem; color: #9ca3af;
+}
+.console-body { max-height: 260px; overflow-y: auto; padding: 8px 12px; }
+.console-line { display: grid; grid-template-columns: 64px 56px 1fr; gap: 10px; padding: 2px 0; line-height: 1.45; }
+.console-line.warn { color: #fbbf24; }
+.console-line.error { color: #f87171; }
+.console-line.muted { color: #6b7280; }
+.console-time, .console-elapsed { color: #6b7280; white-space: nowrap; }
 .agent-form { align-items: flex-end; margin-bottom: 4px; }
 .agent-form input {
   min-width: 200px; padding: 8px 10px; font-size: 0.95rem;
