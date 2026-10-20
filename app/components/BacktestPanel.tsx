@@ -83,12 +83,35 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-function DiagnosticsPanel({ diag, error }: { diag: Diagnostics | null; error: string | null }) {
+type Hello = { model: string; reply: string; latency_s: number; input_tokens: number; output_tokens: number; log: LogEntry[] };
+
+function DiagnosticsPanel({ diag, error, onLog }: { diag: Diagnostics | null; error: string | null; onLog: (entries: LogEntry[]) => void }) {
   const [open, setOpen] = useState(true);
+  const [hello, setHello] = useState<Hello | null>(null);
+  const [helloError, setHelloError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
   if (error) return <p className="msg error">Diagnostics unavailable: {error}</p>;
   if (!diag) return <p className="msg">Checking configuration…</p>;
   const db = diag.database;
   const dot = (ok: boolean | undefined) => <span className={`dot ${ok === undefined ? "" : ok ? "ok" : "down"}`} />;
+
+  async function testAi() {
+    setTesting(true);
+    setHello(null);
+    setHelloError(null);
+    try {
+      const r = await api<Hello>("/api/py/agent/hello", { method: "POST" });
+      setHello(r);
+      onLog(r.log);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "AI test failed";
+      setHelloError(msg);
+      onLog([{ t: new Date().toISOString(), elapsed_s: 0, level: "error", message: msg }]);
+    } finally {
+      setTesting(false);
+    }
+  }
+
   return (
     <div className="diag">
       <button type="button" className="linklike diag-toggle" onClick={() => setOpen((v) => !v)}>
@@ -97,11 +120,22 @@ function DiagnosticsPanel({ diag, error }: { diag: Diagnostics | null; error: st
       {open && (
         <div className="diag-grid">
           <div className="diag-item">
-            <span className="stat-label">{dot(diag.claude.provider !== "not configured")} Claude</span>
+            <span className="stat-label">{dot(hello ? true : helloError ? false : diag.claude.provider !== "not configured")} Claude</span>
             <strong>{diag.claude.provider}</strong>
             <span>{diag.claude.endpoint ?? "—"}</span>
             <span>model <code>{diag.claude.model ?? "—"}</code>{diag.claude.effort && <> · effort {diag.claude.effort}</>}</span>
             <span className="tile-note">{diag.claude.variables.join(" · ")}</span>
+            <span>
+              <button type="button" className="btn small ghost" disabled={testing || diag.claude.provider === "not configured"} onClick={testAi}>
+                {testing ? "Saying hello…" : "Test AI"}
+              </button>
+            </span>
+            {hello && (
+              <span className="hello-reply">
+                <strong>{hello.model}</strong> replied in {hello.latency_s}s: &ldquo;{hello.reply}&rdquo;
+              </span>
+            )}
+            {helloError && <span className="verdict-fail">{helloError}</span>}
           </div>
           <div className="diag-item">
             <span className="stat-label">{dot(db.connected)} Azure SQL</span>
@@ -450,7 +484,7 @@ export default function BacktestPanel() {
 
   return (
     <div className="single">
-      <DiagnosticsPanel diag={diag} error={diagError} />
+      <DiagnosticsPanel diag={diag} error={diagError} onLog={(entries) => setClientLog((prev) => [...prev, ...entries])} />
       <form className="filters agent-form" onSubmit={create}>
         <label>
           Skill
@@ -529,7 +563,7 @@ export default function BacktestPanel() {
       {error && <p className="msg error">{error}</p>}
 
       {(creating || preparing || clientLog.length > 0) && !bt && (
-        <LiveLog title={preparing ? "Downloading data" : "Preparing"} entries={clientLog} running={creating || preparing} />
+        <LiveLog title={preparing ? "Downloading data" : creating ? "Preparing" : "Debug"} entries={clientLog} running={creating || preparing} />
       )}
 
       {bt && c && (

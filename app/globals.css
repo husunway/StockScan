@@ -344,6 +344,8 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 }
 .diag-item .stat-label { display: inline-flex; align-items: center; gap: 6px; }
 .diag-item strong { font-size: 0.9rem; }
+.hello-reply { color: var(--text); font-style: italic; }
+.hello-reply strong { font-style: normal; }
 .console {
   background: #0f1420; color: #d7dce5; border: 1px solid var(--border); border-radius: 10px;
   margin: 12px 0; font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem;

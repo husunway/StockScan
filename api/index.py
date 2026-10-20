@@ -926,6 +926,52 @@ def claude_effort() -> str:
     return e if e in EFFORT_LEVELS else "high"
 
 
+HELLO_PROMPT = "Reply with one short sentence: say hello, state which model you are, and confirm you are ready to analyze a stock."
+
+
+def claude_hello(log: "RunLog | None" = None) -> dict:
+    """Tiny round-trip to the configured model so a misconfiguration shows up before a long run starts."""
+    import anthropic
+
+    provider = require_claude()
+    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    client = make_claude_client(provider)
+    if log:
+        log.step(f"AI hello: sending a one-line test prompt to {provider} ({client.base_url}, model '{model}') ...")
+    t0 = time.monotonic()
+    try:
+        r = client.messages.create(
+            model=model, max_tokens=80, output_config={"effort": "low"},
+            messages=[{"role": "user", "content": HELLO_PROMPT}],
+        )
+    except anthropic.AuthenticationError as e:
+        raise HTTPException(status_code=502, detail=f"AI hello failed: the {provider} API key was rejected.") from e
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"AI hello failed: {provider} returned {e.status_code}: {e.message[:300]}") from e
+    except anthropic.APIConnectionError as e:
+        cause = f"{type(e.__cause__).__name__}: {e.__cause__}" if e.__cause__ else str(e)
+        raise HTTPException(status_code=502, detail=f"AI hello failed: could not reach {client.base_url} ({cause[:200]})") from e
+    elapsed = time.monotonic() - t0
+    text = " ".join(b.text for b in r.content if b.type == "text").strip()
+    result = {"provider": provider, "endpoint": str(client.base_url), "model": r.model, "reply": text,
+              "latency_s": round(elapsed, 2), "stop_reason": r.stop_reason,
+              "input_tokens": r.usage.input_tokens, "output_tokens": r.usage.output_tokens}
+    if log:
+        log.step(f"AI hello OK in {elapsed:.1f} s - {r.model} replied: \"{text[:300]}\" "
+                 f"({r.usage.input_tokens} in / {r.usage.output_tokens} out tokens, stop_reason {r.stop_reason})")
+    if r.stop_reason == "refusal":
+        raise HTTPException(status_code=502, detail="AI hello: the model refused the test prompt; check the deployment's safety settings.")
+    return result
+
+
+@app.post("/api/py/agent/hello")
+def agent_hello():
+    """Manual AI connectivity test (used by the Test AI button)."""
+    log = RunLog("x", "y")
+    result = claude_hello(log)
+    return {**result, "log": log.entries}
+
+
 def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
     """One structured-output call, streamed so progress can be logged while the model generates.
     Skill instructions are the (cached) system prompt; the gathered data is the user turn."""
@@ -1049,6 +1095,7 @@ def agent_run(req: AgentRunRequest):
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
     log = RunLog(DECISIONS_TABLE, "decision_id")  # not persisted for single runs; returned with the result
+    claude_hello(log)
     data = gather_stock_data(symbol, skill, log=log)
     analysis, response = run_skill_with_claude(skill, data, log)
     archive_run_json(f"runs/{skill['id']}/{symbol}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}", data, analysis, log)
@@ -2056,6 +2103,7 @@ def create_backtest(req: BacktestRequest):
     require_claude()
     log = RunLog(BACKTESTS_TABLE, "backtest_id")
     log.add(f"Claude: {describe_claude()}")
+    claude_hello(log)  # first AI call of the run: prove the model answers before any data work
     log.add(f"Database: {describe_db()} ({_set('AZURE_SQL_PASSWORD')})")
     log.add(f"Blob storage: {'configured, access=' + blob_access() if blob_configured() else 'not configured - PDFs will be generated on demand'}")
     skill = get_skill(req.skill.strip().lower())
