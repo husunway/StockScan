@@ -1667,6 +1667,31 @@ def bundle_summary(bundle: dict) -> dict:
     }
 
 
+PRICES_MIN_ROWS = 250        # about one trading year
+PRICES_MAX_STALE_DAYS = 7    # latest stored close must be at most this old
+
+
+def stored_prices(symbol: str) -> list[dict] | None:
+    """Stored daily prices as plain dicts when they are sufficient for a run; None means download."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        if not table_exists(cur):
+            return None
+        cur.execute(f"SELECT COUNT(*), MAX(trade_date) FROM {TABLE} WHERE symbol = %s", (symbol,))
+        count, last = cur.fetchone()
+        if count < PRICES_MIN_ROWS or last is None or (date.today() - last).days > PRICES_MAX_STALE_DAYS:
+            return None
+        df = load_prices_df(cur, symbol)
+    finally:
+        conn.close()
+    return [
+        {"trade_date": r.date, "open": num(r.open), "high": num(r.high), "low": num(r.low), "close": num(r.close),
+         "adj_close": num(r.adj_close), "volume": None if r.volume != r.volume else int(r.volume)}
+        for r in df.itertuples(index=False)
+    ]
+
+
 def build_symbol_bundle(symbol: str, log: "RunLog | None" = None) -> dict:
     """Download prices (stored in dbo.stock_prices too), quote summary, annual + quarterly statements and
     earnings dates for one symbol."""
@@ -1676,10 +1701,16 @@ def build_symbol_bundle(symbol: str, log: "RunLog | None" = None) -> dict:
         if log:
             log.step(msg)
 
+    # Prices: reuse what is already stored unless it is thin or stale; download only then.
     t0 = time.monotonic()
-    rows = fetch_history(symbol)
-    save_prices(symbol, rows)
-    say(f"Prices: {len(rows)} daily rows ({rows[0].trade_date} to {rows[-1].trade_date}) downloaded and stored in {time.monotonic() - t0:.1f} s")
+    prices = stored_prices(symbol)
+    if prices:
+        say(f"Prices: {len(prices)} daily rows already stored ({prices[0]['trade_date']} to {prices[-1]['trade_date']}); not downloaded again")
+    else:
+        rows = fetch_history(symbol)
+        save_prices(symbol, rows)
+        prices = [r.model_dump(mode="json") for r in rows]
+        say(f"Prices: {len(prices)} daily rows ({prices[0]['trade_date']} to {prices[-1]['trade_date']}) downloaded and stored in {time.monotonic() - t0:.1f} s")
 
     t0 = time.monotonic()
     raw = fetch_backtest_raw(symbol)  # profile, statements A/Q (every line item), earnings dates
@@ -1691,7 +1722,7 @@ def build_symbol_bundle(symbol: str, log: "RunLog | None" = None) -> dict:
     bundle = {
         **raw,
         "quote_summary": quote_summary,
-        "prices": [r.model_dump(mode="json") for r in rows],
+        "prices": prices,
         "source": "Yahoo Finance via yfinance",
     }
     s = bundle_summary(bundle)
