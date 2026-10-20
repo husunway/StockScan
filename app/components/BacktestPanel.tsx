@@ -67,6 +67,7 @@ type DataStatus = {
   log?: LogEntry[];
 };
 
+const LAST_SYMBOL_KEY = "stockscan.backtest.lastSymbol";
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const DOW = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 const WEEK_OPTIONS = Array.from({ length: 52 }, (_, i) => i + 1);
@@ -263,7 +264,15 @@ export default function BacktestPanel() {
   const params = useSearchParams();
   const [skills, setSkills] = useState<Skill[]>([]);
   const [skillId, setSkillId] = useState(params.get("skill") ?? "warren-buffett");
-  const [symbol, setSymbol] = useState(params.get("symbol")?.toUpperCase() ?? "");
+  const [symbol, setSymbol] = useState(() => {
+    const fromUrl = params.get("symbol")?.toUpperCase();
+    if (fromUrl) return fromUrl;
+    try {
+      return localStorage.getItem(LAST_SYMBOL_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [year, setYear] = useState(2026);
   const [weeks, setWeeks] = useState(10);
   const [known, setKnown] = useState<string[]>([]);
@@ -335,23 +344,44 @@ export default function BacktestPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadPrevious = useCallback(async (sym: string, sk: string) => {
-    if (!sym || !sk) return;
+  const loadPrevious = useCallback(async (sym: string, sk: string): Promise<Previous[]> => {
+    if (!sym || !sk) return [];
     try {
       const d = await api<{ backtests: Previous[] }>(`/api/py/agent/backtests?symbol=${encodeURIComponent(sym)}&skill=${sk}`);
       setPrevious(d.backtests);
+      return d.backtests;
     } catch {
       setPrevious([]);
+      return [];
     }
   }, []);
 
+  // Remember the symbol per browser, and keep the URL in sync so refresh / back restores the view.
   useEffect(() => {
-    const t = setTimeout(() => {
-      loadPrevious(symbol.trim(), skillId);
-      loadDataStatus(symbol.trim());
+    try {
+      if (symbol.trim()) localStorage.setItem(LAST_SYMBOL_KEY, symbol.trim());
+    } catch {}
+  }, [symbol]);
+  useEffect(() => {
+    const q = new URLSearchParams();
+    if (skillId) q.set("skill", skillId);
+    if (symbol.trim()) q.set("symbol", symbol.trim());
+    if (bt) q.set("bt", String(bt.backtest_id));
+    window.history.replaceState(null, "", `${window.location.pathname}?${q}`);
+  }, [skillId, symbol, bt?.backtest_id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When a symbol is selected, show its most recent run for this skill (live if it is still going).
+  useEffect(() => {
+    const sym = symbol.trim();
+    const t = setTimeout(async () => {
+      loadDataStatus(sym);
+      const list = await loadPrevious(sym, skillId);
+      const matches = bt && bt.symbol === sym && bt.skill_id === skillId;
+      if (!matches && !running && !creating && list.length > 0) openPrevious(list[0].backtest_id);
+      else if (!matches && !running && !creating) setBt(null);
     }, 400);
     return () => clearTimeout(t);
-  }, [symbol, skillId, loadPrevious, loadDataStatus]);
+  }, [symbol, skillId, loadPrevious, loadDataStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Live status: poll the backtest while any Monday is pending or running (even if another tab drives it).
   const active = !!bt && bt.counts.pending + bt.counts.running > 0;
@@ -546,9 +576,19 @@ export default function BacktestPanel() {
         </div>
       )}
 
+      {bt && !running && c && c.pending > 0 && c.running === 0 && bt.status !== "stopped" && (
+        <p className="msg hint resume-hint">
+          Run #{bt.backtest_id} has {c.pending} Monday{c.pending === 1 ? "" : "s"} left and nothing is driving it from
+          this page (the run continues only while a tab is on it). Click <strong>Resume</strong> below to continue.
+        </p>
+      )}
+      {bt && !running && c && c.running > 0 && (
+        <p className="msg hint">Run #{bt.backtest_id} is in progress elsewhere; this page updates live.</p>
+      )}
+
       {previous.length > 0 && !running && (
         <p className="msg hint">
-          Previous runs for {symbol.trim()}:{" "}
+          {previous.length === 1 ? "Showing the latest run" : "Runs"} for {symbol.trim()}:{" "}
           {previous.slice(0, 6).map((p, i) => (
             <span key={p.backtest_id}>
               {i > 0 && " · "}
