@@ -6,7 +6,9 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
@@ -571,45 +573,52 @@ def single_stock_analysis(symbol: str, index: str | None = None, sector: str | N
 
 
 # ---------------------------------------------------------------------------
-# AI: Warren Buffett-style analysis (Claude)
+# AI agent: runs a skill file (skills/<id>/SKILL.md) against gathered stock data with Claude
 # ---------------------------------------------------------------------------
 DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 
-BUFFETT_SYSTEM_PROMPT = """You are an equity analyst who applies Warren Buffett's investment approach exactly as he has described it in Berkshire Hathaway shareholder letters and public remarks. You produce a disciplined, evidence-based assessment of one company and return it in the required JSON structure.
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
-# The approach you apply
 
-1. Circle of competence. Is the business simple and understandable? Can its economics be forecast with reasonable confidence ten years out? If not, that alone argues against buying.
-2. Durable competitive advantage (moat). Look for pricing power, low-cost production, switching costs, network effects, or trusted brands. Evidence of a moat shows up as consistently high return on equity (ideally above 15% without heavy leverage), high and stable gross and operating margins, and earnings that grow steadily rather than erratically.
-3. Management quality. Rational capital allocation (buybacks only below intrinsic value, acquisitions that earn their cost of capital, dividends when there is nothing better to do), candour with shareholders, and resistance to the institutional imperative. Judge from the numbers provided: trend in shares outstanding, debt, return on retained earnings, dividends and repurchases.
-4. Financial strength. Low debt relative to equity and earnings, strong and consistent free cash flow ("owner earnings": net income plus depreciation and amortization minus maintenance capital expenditure), ample interest coverage, little need for outside capital.
-5. Valuation and margin of safety. Estimate intrinsic value as the discounted value of owner earnings over a ten-year horizon plus a conservative terminal value. Use a discount rate of roughly 9-10% (long government bond yield plus an equity premium; never below the bond yield) and growth assumptions that are no higher than the demonstrated historical record and taper toward 2-3% terminal growth. Produce a low, base and high estimate. Demand a margin of safety of at least 25% (more for lower-quality or cyclical businesses) before recommending a purchase.
-6. Temperament. Price is what you pay; value is what you get. Ignore short-term price movements and macro forecasts; technical indicators are provided only as context on where the price sits, not as inputs to the decision.
+def parse_skill(path: Path) -> dict:
+    """SKILL.md = frontmatter (simple `key: value` lines between --- fences) + markdown instructions."""
+    text = path.read_text(encoding="utf-8")
+    meta, body = {}, text
+    if text.startswith("---"):
+        head, _, body = text[3:].partition("\n---")
+        for line in head.strip().splitlines():
+            if ":" in line and not line.startswith((" ", "#")):
+                k, _, v = line.partition(":")
+                meta[k.strip()] = v.strip().strip('"').strip("'")
+    skill_id = path.parent.name
+    return {
+        "id": skill_id,
+        "name": meta.get("name", skill_id),
+        "description": meta.get("description", ""),
+        "version": meta.get("version", ""),
+        "inputs": meta.get("inputs", "symbol"),
+        "output": meta.get("output", "stock-verdict"),
+        "path": f"skills/{skill_id}/SKILL.md",
+        "instructions": body.strip(),
+        "content": text,
+    }
 
-# Decision rules
 
-- BUY: a good business, inside the circle of competence, with a moat and sound finances, trading at or below buy_below_price (intrinsic value base estimate less the required margin of safety). Conviction must be medium or high.
-- HOLD: a good business trading between buy_below_price and a level well above intrinsic value, or a borderline case where key data is missing. HOLD is also the correct answer when evidence is insufficient to act.
-- SELL: the thesis is broken (moat eroding, returns falling, leverage rising, management misallocating capital), or the price is far above even the high intrinsic value estimate so that expected forward returns are poor, or capital is clearly better deployed elsewhere.
+def list_skills() -> list[dict]:
+    if not SKILLS_DIR.is_dir():
+        return []
+    return [parse_skill(p) for p in sorted(SKILLS_DIR.glob("*/SKILL.md"))]
 
-# Price targets (mandatory)
 
-- buy_below_price: always set. The maximum price at which a purchase meets the margin of safety.
-- target_price: REQUIRED when recommendation is BUY (may also be given for HOLD). The price at which the position should be reviewed for sale because it would be fully valued - normally at or modestly above the base intrinsic value estimate, and never below the current price for a BUY.
-- stop_price: REQUIRED when recommendation is BUY. Buffett does not use mechanical stop-losses; treat this as the risk-control level at which the investor should stop and re-examine whether the thesis is broken rather than average down blindly. Set it at a level that would signal permanent capital impairment is becoming likely (typically 15-25% below the current price or below a clearly identified support level, whichever is more meaningful), and say plainly in stop_rationale that this is a risk-control convention, not a Buffett principle.
-- For SELL, target_price is the price at or below which the shares would become interesting again (may be null if the thesis is broken regardless of price); stop_price should be null.
-- All prices are in the stock's trading currency and must be consistent: for BUY, stop_price < current_price <= buy_below_price < target_price.
+def get_skill(skill_id: str) -> dict:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,59}", skill_id):
+        raise HTTPException(status_code=400, detail="Invalid skill id")
+    path = SKILLS_DIR / skill_id / "SKILL.md"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_id}' not found (looked in {SKILLS_DIR})")
+    return parse_skill(path)
 
-# Evidence and honesty rules
-
-- Use ONLY the data supplied in the user message. Do not invent figures, ratios, quotes, or events. If a metric is missing, list it under data_gaps and lower conviction accordingly; do not estimate it as if it were known.
-- Every item in key_metrics must name its source field from the supplied data (for example "fundamentals.returnOnEquity" or "price.ma200").
-- List every judgment call that is not directly supported by the data under assumptions, including every valuation input (growth rates, discount rate, terminal growth, owner-earnings adjustments).
-- Write in clear, professional Canadian English. Be direct; avoid hedging language that does not change the conclusion. The summary should read as a short investment memo.
-- This output is informational analysis for a reader who makes their own decisions; do not address the reader as if executing trades for them.
-"""
-
-BUFFETT_SCHEMA = {
+STOCK_VERDICT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -786,37 +795,39 @@ def load_price_history_any(symbol: str):
     return df, "yahoo"
 
 
-class BuffettRequest(BaseModel):
+class AgentRunRequest(BaseModel):
+    skill: str = Field(..., min_length=1, max_length=60)
     symbol: str = Field(..., min_length=1, max_length=20)
 
 
-def validate_buffett_output(a: dict) -> list[str]:
-    """Hard rule: a BUY must carry target and stop prices. Soft checks become warnings."""
+def validate_verdict(a: dict) -> list[str]:
+    """Hard rules: BUY needs target and stop prices; SELL needs a target price. Soft checks become warnings."""
     rec = a.get("recommendation")
     if rec == "BUY" and (a.get("target_price") is None or a.get("stop_price") is None):
         raise HTTPException(status_code=502, detail="The model returned a BUY without both a target price and a stop price.")
+    if rec == "SELL" and a.get("target_price") is None:
+        raise HTTPException(status_code=502, detail="The model returned a SELL without a target price.")
     warnings = []
     price = a.get("current_price")
-    if rec == "BUY" and price is not None:
+    if price is None:
+        return warnings
+    if rec == "BUY":
         if a["stop_price"] >= price:
             warnings.append("Stop price is not below the current price.")
         if a["target_price"] <= price:
             warnings.append("Target price is not above the current price.")
         if a.get("buy_below_price") is not None and price > a["buy_below_price"]:
             warnings.append("Current price is above the buy-below price, which is inconsistent with a BUY.")
-    if rec == "SELL" and a.get("stop_price") is not None:
-        warnings.append("A stop price was given for a SELL recommendation.")
+    elif rec == "SELL":
+        if a["target_price"] >= price:
+            warnings.append("Target price for a SELL is not below the current price.")
+        if a.get("stop_price") is not None:
+            warnings.append("A stop price was given for a SELL recommendation.")
     return warnings
 
 
-@app.post("/api/py/ai/buffett")
-def buffett_analysis(req: BuffettRequest):
-    import anthropic
+def gather_stock_data(symbol: str) -> dict:
     from datetime import date as _date
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
-    symbol = normalize_symbol(req.symbol)
 
     df, price_source = load_price_history_any(symbol)
     data = {
@@ -829,6 +840,12 @@ def buffett_analysis(req: BuffettRequest):
     }
     if not data["fundamentals"]:
         raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no fundamentals for {symbol}.")
+    return data
+
+
+def run_skill_with_claude(skill: dict, data: dict):
+    """One structured-output call: skill instructions as the (cached) system prompt, gathered data as the user turn."""
+    import anthropic
 
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
     client = anthropic.Anthropic(timeout=240.0, max_retries=1)
@@ -838,11 +855,11 @@ def buffett_analysis(req: BuffettRequest):
             max_tokens=16000,
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
-            system=[{"type": "text", "text": BUFFETT_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            output_config={"effort": "high", "format": {"type": "json_schema", "schema": BUFFETT_SCHEMA}},
+            system=[{"type": "text", "text": skill["instructions"], "cache_control": {"type": "ephemeral"}}],
+            output_config={"effort": "high", "format": {"type": "json_schema", "schema": STOCK_VERDICT_SCHEMA}},
             messages=[{
                 "role": "user",
-                "content": "Analyze this company using the approach in your instructions and return the JSON.\n\n"
+                "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON.\n\n"
                            + json.dumps(data, default=str, sort_keys=True),
             }],
         )
@@ -862,16 +879,36 @@ def buffett_analysis(req: BuffettRequest):
         raise HTTPException(status_code=502, detail="The analysis was cut off (max_tokens); please retry.")
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
-        analysis = json.loads(text)
+        return json.loads(text), response
     except ValueError as e:
         raise HTTPException(status_code=502, detail="The model did not return valid JSON.") from e
 
-    warnings = validate_buffett_output(analysis)
+
+@app.get("/api/py/agent/skills")
+def agent_skills():
+    keys = ("id", "name", "description", "version", "inputs", "output", "path")
+    return {"skills": [{k: s[k] for k in keys} for s in list_skills()], "directory": str(SKILLS_DIR)}
+
+
+@app.get("/api/py/agent/skills/{skill_id}")
+def agent_skill(skill_id: str):
+    return get_skill(skill_id)
+
+
+@app.post("/api/py/agent/run")
+def agent_run(req: AgentRunRequest):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
+    skill = get_skill(req.skill.strip().lower())
+    symbol = normalize_symbol(req.symbol)
+    data = gather_stock_data(symbol)
+    analysis, response = run_skill_with_claude(skill, data)
     usage = response.usage
     return {
+        "skill": {k: skill[k] for k in ("id", "name", "version", "path")},
         "symbol": symbol,
         "analysis": analysis,
-        "warnings": warnings,
+        "warnings": validate_verdict(analysis),
         "data_used": data,
         "model": response.model,
         "generated_at": datetime.now(timezone.utc).isoformat(),

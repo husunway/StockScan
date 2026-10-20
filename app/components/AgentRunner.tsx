@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
+type Skill = { id: string; name: string; description: string; version: string; path: string };
 type Checklist = { criterion: string; verdict: "pass" | "fail" | "unclear"; evidence: string };
 type Metric = { name: string; value: string; assessment: string; source: string };
 
@@ -42,9 +44,11 @@ type Analysis = {
 };
 
 type Result = {
+  skill: { id: string; name: string; version: string; path: string };
   symbol: string;
   analysis: Analysis;
   warnings: string[];
+  data_used: unknown;
   model: string;
   generated_at: string;
   usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number | null };
@@ -57,9 +61,12 @@ const money = (v: number | null | undefined, ccy: string) =>
 const pct = (v: number | null | undefined) =>
   v === null || v === undefined ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
 const VERDICT_ICON = { pass: "✓", fail: "✗", unclear: "?" } as const;
+const paragraphs = (text: string) => text.split(/\n{2,}/).filter(Boolean);
 
-export default function BuffettPanel() {
+export default function AgentRunner() {
   const params = useSearchParams();
+  const [skills, setSkills] = useState<Skill[] | null>(null);
+  const [skillId, setSkillId] = useState(params.get("skill") ?? "");
   const [symbol, setSymbol] = useState(params.get("symbol")?.toUpperCase() ?? "");
   const [known, setKnown] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
@@ -68,6 +75,20 @@ export default function BuffettPanel() {
   const [showData, setShowData] = useState(false);
 
   useEffect(() => {
+    fetch("/api/py/agent/skills")
+      .then(async (r) => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "Could not list skills");
+        return d.skills as Skill[];
+      })
+      .then((list) => {
+        setSkills(list);
+        setSkillId((prev) => (prev && list.some((s) => s.id === prev) ? prev : list[0]?.id ?? ""));
+      })
+      .catch((e: Error) => {
+        setSkills([]);
+        setError(e.message);
+      });
     fetch("/api/py/symbols")
       .then((r) => (r.ok ? r.json() : { symbols: [] }))
       .then((d) => setKnown((d.symbols ?? []).map((s: { symbol: string }) => s.symbol)))
@@ -77,15 +98,15 @@ export default function BuffettPanel() {
   async function run(e: React.FormEvent) {
     e.preventDefault();
     const s = symbol.trim();
-    if (!s) return;
+    if (!s || !skillId) return;
     setLoading(true);
     setError(null);
     setResult(null);
     try {
-      const res = await fetch("/api/py/ai/buffett", {
+      const res = await fetch("/api/py/agent/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: s }),
+        body: JSON.stringify({ skill: skillId, symbol: s }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${res.status})`);
@@ -97,6 +118,7 @@ export default function BuffettPanel() {
     }
   }
 
+  const skill = skills?.find((s) => s.id === skillId);
   const a = result?.analysis;
   const ccy = a?.currency ?? "";
   const upside = a && a.target_price ? (a.target_price / a.current_price - 1) * 100 : null;
@@ -104,33 +126,48 @@ export default function BuffettPanel() {
 
   return (
     <div className="single">
-      <form className="search-form buffett-form" onSubmit={run}>
-        <input
-          list="known-symbols"
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-          placeholder="Ticker symbol, e.g. KO, AAPL, RY.TO"
-          maxLength={20}
-          aria-label="Ticker symbol"
-        />
-        <datalist id="known-symbols">
-          {known.map((s) => (
-            <option key={s} value={s} />
-          ))}
-        </datalist>
-        <button type="submit" disabled={loading || !symbol.trim()}>
-          {loading ? "Analyzing…" : "Analyze"}
+      <form className="filters agent-form" onSubmit={run}>
+        <label>
+          Skill
+          <select value={skillId} onChange={(e) => setSkillId(e.target.value)} disabled={!skills?.length}>
+            {skills?.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Symbol
+          <input
+            list="known-symbols"
+            value={symbol}
+            onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+            placeholder="e.g. KO, AAPL, RY.TO"
+            maxLength={20}
+          />
+          <datalist id="known-symbols">
+            {known.map((s) => (
+              <option key={s} value={s} />
+            ))}
+          </datalist>
+        </label>
+        <button type="submit" className="btn" disabled={loading || !symbol.trim() || !skillId}>
+          {loading ? "Running…" : "Run skill"}
         </button>
       </form>
-      <p className="msg hint">
-        Fundamentals come from Yahoo Finance; prices from your loaded data (or Yahoo if the
-        symbol is not loaded). The analysis usually takes 30–90 seconds.
-      </p>
+      {skill && (
+        <p className="msg hint">
+          {skill.description}{" "}
+          <Link href={`/agent/skill?id=${skill.id}`}>View skill file</Link> ({skill.path}, v{skill.version || "—"}).
+          Usually takes 30–90 seconds.
+        </p>
+      )}
 
       {error && <p className="msg error">{error}</p>}
       {loading && (
         <div className="working">
-          <span className="spinner" aria-hidden /> Gathering data and running the Buffett framework…
+          <span className="spinner" aria-hidden /> Gathering data and running {skill?.name ?? "the skill"}…
         </div>
       )}
 
@@ -144,8 +181,9 @@ export default function BuffettPanel() {
                   {result.symbol}: {a.headline}
                 </h2>
                 <p className="verdict-meta">
-                  Conviction <strong>{a.conviction}</strong> · Horizon {a.time_horizon} · Margin of safety{" "}
-                  <strong>{pct(a.margin_of_safety_pct)}</strong> (required {a.required_margin_of_safety_pct.toFixed(0)}%)
+                  {result.skill.name} · Conviction <strong>{a.conviction}</strong> · Horizon {a.time_horizon} ·
+                  Margin of safety <strong>{pct(a.margin_of_safety_pct)}</strong> (required{" "}
+                  {a.required_margin_of_safety_pct.toFixed(0)}%)
                 </p>
               </div>
             </div>
@@ -165,8 +203,8 @@ export default function BuffettPanel() {
                 <span className="stat-label">Buy below</span>
                 <span className="stat-value">{money(a.buy_below_price, ccy)}</span>
               </div>
-              <div className={`stat ${a.recommendation === "BUY" ? "emph" : ""}`}>
-                <span className="stat-label">Target price (sell)</span>
+              <div className={`stat ${a.recommendation !== "HOLD" ? "emph" : ""}`}>
+                <span className="stat-label">Target price</span>
                 <span className="stat-value">{money(a.target_price, ccy)}</span>
                 {upside !== null && <span className="tile-note">{pct(upside)} from current</span>}
               </div>
@@ -199,14 +237,14 @@ export default function BuffettPanel() {
             )}
           </section>
 
-          <h2 className="section-title">Summary</h2>
-          {a.summary.split(/\n{2,}/).map((p, i) => (
+          <h2 className="section-title">Summary and justification</h2>
+          {paragraphs(a.summary).map((p, i) => (
             <p key={i} className="prose">
               {p}
             </p>
           ))}
 
-          <h2 className="section-title">Buffett checklist</h2>
+          <h2 className="section-title">Checklist</h2>
           <div className="table-wrap">
             <table className="table">
               <thead>
@@ -233,7 +271,7 @@ export default function BuffettPanel() {
           {a.sections.map((s) => (
             <section key={s.title}>
               <h2 className="section-title">{s.title}</h2>
-              {s.content.split(/\n{2,}/).map((p, i) => (
+              {paragraphs(s.content).map((p, i) => (
                 <p key={i} className="prose">
                   {p}
                 </p>
@@ -298,16 +336,14 @@ export default function BuffettPanel() {
           )}
 
           <p className="msg">
-            Generated {new Date(result.generated_at).toLocaleString()} by {result.model} ·{" "}
+            Generated {new Date(result.generated_at).toLocaleString()} by {result.model} using {result.skill.path} ·{" "}
             {result.usage.input_tokens.toLocaleString()} in / {result.usage.output_tokens.toLocaleString()} out tokens
             {" · "}
             <button type="button" className="linklike" onClick={() => setShowData((v) => !v)}>
               {showData ? "Hide" : "Show"} data sent to the model
             </button>
           </p>
-          {showData && (
-            <pre className="data-dump">{JSON.stringify((result as unknown as { data_used: unknown }).data_used, null, 2)}</pre>
-          )}
+          {showData && <pre className="data-dump">{JSON.stringify(result.data_used, null, 2)}</pre>}
           <p className="msg disclaimer">
             This is model-generated analysis based on third-party data that may be incomplete or out of date.
             It is not investment advice. Verify the figures and make your own decision.

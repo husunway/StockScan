@@ -267,6 +267,20 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
   font-size: 0.75rem; overflow: auto; max-height: 420px;
 }
 .disclaimer { font-size: 0.8rem; }
+.agent-form { align-items: flex-end; margin-bottom: 4px; }
+.agent-form input {
+  min-width: 200px; padding: 8px 10px; font-size: 0.95rem;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text);
+}
+.btn.small { padding: 7px 14px; font-size: 0.85rem; display: inline-block; }
+.btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+.btn.ghost:hover:not(:disabled) { background: var(--bg); }
+.card-actions { display: flex; gap: 8px; margin-top: 12px; }
+.skill-card .tile-note { margin-bottom: 0; }
+.skill-md {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+  font-size: 0.82rem; line-height: 1.5; white-space: pre-wrap; overflow: auto; max-width: 900px;
+}
 
 /* Footer */
 .footer {

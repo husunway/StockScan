@@ -15,10 +15,13 @@ const items: Item[] = [
     children: [{ href: "/analysis/single", label: "Single stock" }],
   },
   {
-    href: "/ai",
-    label: "AI",
+    href: "/agent",
+    label: "AI agent",
     icon: "✦",
-    children: [{ href: "/ai/buffett", label: "Warren Buffett" }],
+    children: [
+      { href: "/agent/run?skill=warren-buffett", label: "Warren Buffett" },
+      { href: "/agent", label: "Skill library" },
+    ],
   },
   { href: "/diagnosis", label: "Diagnosis", icon: "⚙" },
 ];
@@ -42,7 +45,7 @@ export default function Sidebar() {
               <Link
                 key={child.href}
                 href={child.href}
-                className={`sub ${pathname === child.href ? "active" : ""}`}
+                className={`sub ${pathname === child.href.split("?")[0] && child.href !== item.href ? "active" : ""}`}
               >
                 {child.label}
               </Link>

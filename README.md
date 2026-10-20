@@ -43,26 +43,47 @@ Computed in Python (pandas) from the stored daily prices:
 
 The chart is drawn with [lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache 2.0).
 
-### AI: Warren Buffett analysis (`/ai/buffett`)
+### AI agent and skills (`/agent`)
 
-`POST /api/py/ai/buffett` with `{ "symbol": "KO" }`:
+The agent runs a **skill file** against a stock. Skills live in the repository:
+
+```
+skills/
+  warren-buffett/
+    SKILL.md     # frontmatter (name, description, version, inputs, output) + markdown instructions
+```
+
+The frontmatter describes the skill; the markdown body becomes Claude's system prompt. To add a
+skill, add a folder with a `SKILL.md`; to change how an existing one reasons, edit the file. Nothing
+in the code needs to change. (`vercel.json` includes `skills/**` in the Python function bundle.)
+
+| Method | Path                            | Description                                   |
+| ------ | ------------------------------- | --------------------------------------------- |
+| GET    | `/api/py/agent/skills`          | List skills (id, name, description, version)  |
+| GET    | `/api/py/agent/skills/{id}`     | One skill including its full file content     |
+| POST   | `/api/py/agent/run`             | `{ "skill": "warren-buffett", "symbol": "KO" }` |
+
+A run:
 
 1. Gathers data - fundamentals and three years of annual statements from Yahoo Finance (yfinance),
    plus a price snapshot (52-week range, 200-day average, 1-year return, volatility, drawdown)
    from the stored prices, or from Yahoo if the symbol is not loaded.
-2. Sends the data to Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`) with a
-   system prompt that encodes Buffett's framework - circle of competence, moat, management, financial
-   strength, owner-earnings intrinsic value, margin of safety - and strict decision rules.
-3. Claude must return a fixed JSON structure (structured outputs): recommendation BUY/HOLD/SELL,
-   conviction, intrinsic value low/base/high, buy-below price, target price, stop price, checklist,
-   supporting sections, key metrics with their source fields, valuation inputs, risks, assumptions
-   and data gaps. A BUY without both a target and a stop price is rejected server-side.
+2. Calls Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`) with the skill's
+   instructions as the system prompt and the data as the user message.
+3. Requires a fixed JSON structure (structured outputs, `STOCK_VERDICT_SCHEMA`): recommendation
+   BUY/HOLD/SELL, conviction, intrinsic value low/base/high, buy-below price, target price, stop
+   price, summary, checklist, sections, key metrics with source fields, valuation inputs, risks,
+   assumptions and data gaps.
 
-The page shows the conclusion first (recommendation, prices, margin of safety), then the detail.
-Everything the model saw is viewable on the page ("Show data sent to the model"). The model is told
-to use only supplied data and to list assumptions separately; treat the output as analysis to verify,
-not advice. A refusal fallback (`fallbacks: "default"`) is enabled so a safety decline is retried on a
-fallback model in the same call.
+Server-side rules, independent of the skill: a **BUY must carry a target price and a stop price**;
+a **SELL must carry a target price**; inconsistent prices (e.g. a BUY target below the current
+price) are flagged as warnings on the page.
+
+The page shows the conclusion first (recommendation, prices, margin of safety), then the summary
+and justification, then the detail. Everything the model saw is viewable ("Show data sent to the
+model"). Skills instruct the model to use only supplied data and to list assumptions separately;
+treat the output as analysis to verify, not advice. A refusal fallback (`fallbacks: "default"`) is
+enabled so a safety decline is retried on a fallback model in the same call.
 
 Requires `ANTHROPIC_API_KEY`. Each run uses roughly 10-20K input and 3-6K output tokens.
 `vercel.json` raises the Python function's `maxDuration` to 120 s because the call takes 30-90 s.
