@@ -50,12 +50,17 @@ The agent runs a **skill file** against a stock. Skills live in the repository:
 ```
 skills/
   warren-buffett/
-    SKILL.md     # frontmatter (name, description, version, inputs, output) + markdown instructions
+    SKILL.md             # frontmatter (name, description, version, inputs, output) + markdown instructions
+    data-structure.json  # input contract (every field the agent receives) + output schema it must return
 ```
 
-The frontmatter describes the skill; the markdown body becomes Claude's system prompt. To add a
-skill, add a folder with a `SKILL.md`; to change how an existing one reasons, edit the file. Nothing
-in the code needs to change. (`vercel.json` includes `skills/**` in the Python function bundle.)
+The frontmatter describes the skill; the markdown body becomes Claude's system prompt.
+`data-structure.json` documents the `input` object (price snapshot, fundamentals, annual statements -
+types, units, sources, and which fields are the minimum useful set) and holds the `output` JSON
+schema, which the API loads and enforces with structured outputs (falling back to the built-in
+`STOCK_VERDICT_SCHEMA` if the file is absent). To add a skill, add a folder with a `SKILL.md` (and
+optionally its own `data-structure.json`); to change how an existing one reasons, edit the file.
+Nothing in the code needs to change. (`vercel.json` includes `skills/**` in the Python function bundle.)
 
 | Method | Path                            | Description                                   |
 | ------ | ------------------------------- | --------------------------------------------- |

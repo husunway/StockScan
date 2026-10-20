@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Warren Buffett skill - data structure",
+  "version": "1.0",
+  "description": "Complete data contract for the warren-buffett skill. `input` is the JSON object the agent receives in the user message (built by gather_stock_data in api/index.py). `output` is the JSON object the agent must return; the API enforces it with structured outputs and the server-side price rules. Missing input fields are omitted rather than nulled: the agent must list them under output.data_gaps and must never estimate them as if known.",
+  "conventions": {
+    "currency": "Prices and valuation outputs are in the stock's trading currency (input.fundamentals.currency). Statement figures are in input.fundamentals.financialCurrency, which can differ (e.g. a TSX listing reporting in USD).",
+    "ratios": "Fundamentals ratios from Yahoo Finance are fractions unless stated (returnOnEquity 0.35 = 35%). debtToEquity is a percentage (150 = 150%). dividendYield's unit has changed between yfinance versions; treat it as a percentage if > 1, otherwise a fraction, and say which was assumed.",
+    "signs": "Cash-flow statement outflows are negative as reported (Capital Expenditure, Repurchase Of Capital Stock, Cash Dividends Paid).",
+    "dates": "ISO 8601 (YYYY-MM-DD). Statement columns are fiscal year-ends keyed by the year (\"2025\")."
+  },
+  "sources": {
+    "price": "Azure SQL dbo.stock_prices (two years of daily OHLCV loaded from Yahoo Finance), or a direct Yahoo Finance download when the symbol is not loaded. input.price.source says which.",
+    "fundamentals": "Yahoo Finance quote summary via yfinance (Ticker.info).",
+    "annual_statements": "Yahoo Finance annual statements via yfinance (income_stmt, balance_sheet, cashflow), typically the last four fiscal years."
+  },
+  "minimum_useful_input": [
+    "symbol",
+    "price.last_close",
+    "fundamentals.currency",
+    "fundamentals.marketCap or fundamentals.sharesOutstanding",
+    "at least two fiscal years of annual_statements.income.Net Income and annual_statements.cashflow.Free Cash Flow (or Operating Cash Flow and Capital Expenditure)",
+    "fundamentals.returnOnEquity or annual_statements.balance.Stockholders Equity"
+  ],
+  "input": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["symbol", "analysis_date", "price", "fundamentals", "annual_statements", "source_note"],
+    "properties": {
+      "symbol": { "type": "string", "description": "Ticker as used by Yahoo Finance, upper case (AAPL, RY.TO, ^GSPTSE)." },
+      "analysis_date": { "type": "string", "format": "date", "description": "Date the analysis is run; use as 'today' for horizons and staleness." },
+      "source_note": { "type": "string", "description": "Provenance note for fundamentals and statements." },
+      "price": {
+        "type": "object",
+        "description": "Snapshot derived from daily closes. Context on where the price sits; not a decision input under the Buffett approach.",
+        "additionalProperties": false,
+        "required": ["as_of", "last_close", "high_52w", "low_52w", "source"],
+        "properties": {
+          "as_of": { "type": "string", "format": "date", "description": "Date of the last stored close." },
+          "last_close": { "type": "number", "description": "Last daily close; the 'current price' for the verdict." },
+          "high_52w": { "type": "number", "description": "Highest daily high in the last 252 trading days." },
+          "low_52w": { "type": "number", "description": "Lowest daily low in the last 252 trading days." },
+          "ma200": { "type": ["number", "null"], "description": "200-day simple moving average of close; null if fewer than 200 rows." },
+          "pct_vs_ma200": { "type": ["number", "null"], "description": "(last_close / ma200 - 1) * 100." },
+          "return_1y_pct": { "type": ["number", "null"], "description": "Price return over the last 252 trading days, percent." },
+          "annualized_volatility_pct": { "type": ["number", "null"], "description": "Std. dev. of daily returns over 252 days * sqrt(252) * 100." },
+          "max_drawdown_1y_pct": { "type": ["number", "null"], "description": "Largest peak-to-trough decline in the last year, percent (<= 0)." },
+          "source": { "type": "string", "enum": ["database", "yahoo"], "description": "Where the price history came from." }
+        }
+      },
+      "fundamentals": {
+        "type": "object",
+        "description": "Yahoo Finance quote-summary fields. Only fields Yahoo returned are present.",
+        "additionalProperties": false,
+        "properties": {
+          "longName": { "type": "string", "description": "Company name." },
+          "sector": { "type": "string" },
+          "industry": { "type": "string" },
+          "country": { "type": "string", "description": "Country of domicile." },
+          "currency": { "type": "string", "description": "Trading currency of the listing (ISO 4217). All output prices use this." },
+          "financialCurrency": { "type": "string", "description": "Reporting currency of the financial statements." },
+          "marketCap": { "type": "number", "description": "Market capitalization in trading currency." },
+          "enterpriseValue": { "type": "number", "description": "Market cap + debt - cash, trading currency." },
+          "currentPrice": { "type": "number", "description": "Yahoo's latest price; may differ slightly from price.last_close (intraday vs close)." },
+          "trailingPE": { "type": "number", "description": "Price / trailing 12-month diluted EPS." },
+          "forwardPE": { "type": "number", "description": "Price / consensus next-12-month EPS (analyst estimate, not company data)." },
+          "priceToBook": { "type": "number", "description": "Price / book value per share." },
+          "enterpriseToEbitda": { "type": "number", "description": "Enterprise value / trailing EBITDA." },
+          "trailingEps": { "type": "number", "description": "Trailing 12-month diluted EPS, financial currency." },
+          "forwardEps": { "type": "number", "description": "Consensus forward EPS (estimate)." },
+          "returnOnEquity": { "type": "number", "description": "Net income / shareholders' equity, trailing, as a fraction. Key moat indicator (Buffett looks for > 0.15 sustained without heavy leverage)." },
+          "returnOnAssets": { "type": "number", "description": "Fraction." },
+          "debtToEquity": { "type": "number", "description": "Total debt / equity as a PERCENTAGE (e.g. 45.2)." },
+          "currentRatio": { "type": "number", "description": "Current assets / current liabilities." },
+          "totalDebt": { "type": "number", "description": "Short + long-term debt, financial currency." },
+          "totalCash": { "type": "number", "description": "Cash and short-term investments, financial currency." },
+          "freeCashflow": { "type": "number", "description": "Trailing free cash flow (operating cash flow - capex), financial currency. Starting point for owner earnings." },
+          "operatingCashflow": { "type": "number", "description": "Trailing operating cash flow." },
+          "totalRevenue": { "type": "number", "description": "Trailing 12-month revenue." },
+          "revenueGrowth": { "type": "number", "description": "Latest quarter revenue growth year-over-year, fraction." },
+          "earningsGrowth": { "type": "number", "description": "Latest quarter earnings growth year-over-year, fraction." },
+          "grossMargins": { "type": "number", "description": "Fraction. Stability over time indicates pricing power." },
+          "operatingMargins": { "type": "number", "description": "Fraction." },
+          "profitMargins": { "type": "number", "description": "Net margin, fraction." },
+          "dividendYield": { "type": "number", "description": "See conventions.ratios for the unit." },
+          "payoutRatio": { "type": "number", "description": "Dividends / earnings, fraction." },
+          "sharesOutstanding": { "type": "number", "description": "Current shares outstanding. Compare with annual_statements.balance['Ordinary Shares Number'] for buyback/dilution trend." },
+          "bookValue": { "type": "number", "description": "Book value PER SHARE, financial currency." },
+          "beta": { "type": "number", "description": "5-year monthly beta vs the market. Context only; not a Buffett input." },
+          "fiftyTwoWeekHigh": { "type": "number" },
+          "fiftyTwoWeekLow": { "type": "number" },
+          "heldPercentInsiders": { "type": "number", "description": "Fraction of shares held by insiders; a management-alignment signal." },
+          "longBusinessSummary": { "type": "string", "description": "Company description. Primary input for the circle-of-competence and moat judgments." }
+        }
+      },
+      "annual_statements": {
+        "type": "object",
+        "description": "Selected line items from the annual statements, each as {fiscal year: value}. A row is absent if Yahoo did not report it; a year is null if that year is missing.",
+        "additionalProperties": false,
+        "required": ["income", "balance", "cashflow"],
+        "properties": {
+          "income": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "Total Revenue": { "$ref": "#/$defs/yearSeries", "description": "Revenue by fiscal year. Trend and consistency matter more than level." },
+              "Gross Profit": { "$ref": "#/$defs/yearSeries" },
+              "Operating Income": { "$ref": "#/$defs/yearSeries" },
+              "Net Income": { "$ref": "#/$defs/yearSeries", "description": "Earnings by year; with equity gives historical ROE, with shares gives EPS growth." },
+              "Diluted EPS": { "$ref": "#/$defs/yearSeries", "description": "Per-share earnings; growth rate is the ceiling for valuation growth assumptions." },
+              "Interest Expense": { "$ref": "#/$defs/yearSeries", "description": "With Operating Income gives interest coverage." }
+            }
+          },
+          "balance": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "Total Debt": { "$ref": "#/$defs/yearSeries" },
+              "Long Term Debt": { "$ref": "#/$defs/yearSeries" },
+              "Stockholders Equity": { "$ref": "#/$defs/yearSeries", "description": "With Net Income gives ROE by year; trend shows retained-earnings compounding." },
+              "Cash And Cash Equivalents": { "$ref": "#/$defs/yearSeries" },
+              "Total Assets": { "$ref": "#/$defs/yearSeries" },
+              "Ordinary Shares Number": { "$ref": "#/$defs/yearSeries", "description": "Shares outstanding at year-end; falling = buybacks, rising = dilution." }
+            }
+          },
+          "cashflow": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "Operating Cash Flow": { "$ref": "#/$defs/yearSeries" },
+              "Capital Expenditure": { "$ref": "#/$defs/yearSeries", "description": "Negative as reported. Separate maintenance from growth capex by judgment and list it as an assumption." },
+              "Free Cash Flow": { "$ref": "#/$defs/yearSeries", "description": "Operating cash flow + capital expenditure (which is negative)." },
+              "Depreciation And Amortization": { "$ref": "#/$defs/yearSeries", "description": "Owner earnings = Net Income + D&A - maintenance capex." },
+              "Repurchase Of Capital Stock": { "$ref": "#/$defs/yearSeries", "description": "Negative = cash spent on buybacks. Judge against intrinsic value at the time." },
+              "Cash Dividends Paid": { "$ref": "#/$defs/yearSeries", "description": "Negative = cash paid out." }
+            }
+          }
+        }
+      }
+    },
+    "$defs": {
+      "yearSeries": {
+        "type": "object",
+        "description": "Fiscal-year keyed values in the financial currency.",
+        "propertyNames": { "pattern": "^[0-9]{4}$" },
+        "additionalProperties": { "type": ["number", "null"] }
+      }
+    }
+  },
+  "output": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "recommendation": { "type": "string", "enum": ["BUY", "HOLD", "SELL"] },
+      "conviction": { "type": "string", "enum": ["high", "medium", "low"] },
+      "headline": { "type": "string", "description": "One-sentence conclusion stating the recommendation and the main reason." },
+      "currency": { "type": "string" },
+      "current_price": { "type": "number" },
+      "intrinsic_value_low": { "type": "number" },
+      "intrinsic_value_base": { "type": "number" },
+      "intrinsic_value_high": { "type": "number" },
+      "margin_of_safety_pct": { "type": "number", "description": "(intrinsic_value_base - current_price) / intrinsic_value_base * 100" },
+      "required_margin_of_safety_pct": { "type": "number" },
+      "buy_below_price": { "type": "number" },
+      "target_price": { "type": ["number", "null"] },
+      "stop_price": { "type": ["number", "null"] },
+      "target_rationale": { "type": "string" },
+      "stop_rationale": { "type": "string" },
+      "time_horizon": { "type": "string" },
+      "summary": { "type": "string", "description": "Two to four paragraphs supporting the decision." },
+      "checklist": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "criterion": { "type": "string" },
+            "verdict": { "type": "string", "enum": ["pass", "fail", "unclear"] },
+            "evidence": { "type": "string" }
+          },
+          "required": ["criterion", "verdict", "evidence"]
+        }
+      },
+      "sections": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "title": { "type": "string" }, "content": { "type": "string" } },
+          "required": ["title", "content"]
+        }
+      },
+      "key_metrics": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "value": { "type": "string" },
+            "assessment": { "type": "string" },
+            "source": { "type": "string" }
+          },
+          "required": ["name", "value", "assessment", "source"]
+        }
+      },
+      "valuation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "method": { "type": "string" },
+          "owner_earnings": { "type": "string" },
+          "growth_rate_pct_years_1_5": { "type": "number" },
+          "growth_rate_pct_years_6_10": { "type": "number" },
+          "discount_rate_pct": { "type": "number" },
+          "terminal_growth_pct": { "type": "number" },
+          "notes": { "type": "string" }
+        },
+        "required": [
+          "method", "owner_earnings", "growth_rate_pct_years_1_5", "growth_rate_pct_years_6_10",
+          "discount_rate_pct", "terminal_growth_pct", "notes"
+        ]
+      },
+      "risks": { "type": "array", "items": { "type": "string" } },
+      "assumptions": { "type": "array", "items": { "type": "string" } },
+      "data_gaps": { "type": "array", "items": { "type": "string" } }
+    },
+    "required": [
+      "recommendation", "conviction", "headline", "currency", "current_price",
+      "intrinsic_value_low", "intrinsic_value_base", "intrinsic_value_high",
+      "margin_of_safety_pct", "required_margin_of_safety_pct", "buy_below_price",
+      "target_price", "stop_price", "target_rationale", "stop_rationale", "time_horizon",
+      "summary", "checklist", "sections", "key_metrics", "valuation", "risks", "assumptions", "data_gaps"
+    ]
+  },
+  "output_rules_enforced_by_server": [
+    "recommendation BUY requires target_price and stop_price (non-null); the run is rejected otherwise.",
+    "recommendation SELL requires target_price (non-null); the run is rejected otherwise.",
+    "Warnings (not rejections): BUY with stop_price >= current_price, target_price <= current_price, or current_price > buy_below_price; SELL with target_price >= current_price or a non-null stop_price."
+  ]
+}

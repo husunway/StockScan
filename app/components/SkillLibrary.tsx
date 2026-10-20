@@ -3,7 +3,15 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 
-type Skill = { id: string; name: string; description: string; version: string; inputs: string; path: string };
+type Skill = {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  inputs: string;
+  path: string;
+  data_structure_path: string | null;
+};
 
 export default function SkillLibrary() {
   const [skills, setSkills] = useState<Skill[] | null>(null);
@@ -41,7 +49,14 @@ export default function SkillLibrary() {
             <h2>{s.name}</h2>
             <p>{s.description}</p>
             <p className="tile-note">
-              <code>{s.path}</code> · v{s.version || "—"} · input: {s.inputs}
+              <code>{s.path}</code>
+              {s.data_structure_path && (
+                <>
+                  {" · "}
+                  <code>{s.data_structure_path}</code>
+                </>
+              )}
+              {" · "}v{s.version || "—"} · input: {s.inputs}
             </p>
             <div className="card-actions">
               <Link href={`/agent/run?skill=${s.id}`} className="btn small">
@@ -50,6 +65,11 @@ export default function SkillLibrary() {
               <Link href={`/agent/skill?id=${s.id}`} className="btn small ghost">
                 View file
               </Link>
+              {s.data_structure_path && (
+                <Link href={`/agent/skill?id=${s.id}&tab=data`} className="btn small ghost">
+                  Data structure
+                </Link>
+              )}
             </div>
           </div>
         ))}

@@ -13,6 +13,8 @@ type Skill = {
   output: string;
   path: string;
   content: string;
+  data_structure_path: string | null;
+  data_structure: unknown;
 };
 
 export default function SkillView() {
@@ -20,6 +22,7 @@ export default function SkillView() {
   const id = params.get("id") ?? "";
   const [skill, setSkill] = useState<Skill | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<"skill" | "data">(params.get("tab") === "data" ? "data" : "skill");
 
   useEffect(() => {
     if (!id) {
@@ -57,13 +60,29 @@ export default function SkillView() {
             <tr><td>Inputs</td><td>{skill.inputs}</td></tr>
             <tr><td>Output schema</td><td>{skill.output}</td></tr>
             <tr><td>File</td><td><code>{skill.path}</code></td></tr>
+            <tr>
+              <td>Data structure</td>
+              <td>{skill.data_structure_path ? <code>{skill.data_structure_path}</code> : "— (built-in output schema)"}</td>
+            </tr>
           </tbody>
         </table>
       </div>
-      <pre className="skill-md">{skill.content}</pre>
+      {skill.data_structure_path && (
+        <div className="seg" role="tablist" style={{ marginBottom: 10 }}>
+          <button type="button" className={tab === "skill" ? "on" : ""} onClick={() => setTab("skill")}>
+            SKILL.md
+          </button>
+          <button type="button" className={tab === "data" ? "on" : ""} onClick={() => setTab("data")}>
+            data-structure.json
+          </button>
+        </div>
+      )}
+      <pre className="skill-md">
+        {tab === "data" ? JSON.stringify(skill.data_structure, null, 2) : skill.content}
+      </pre>
       <p className="msg hint">
-        To change how the agent reasons, edit this file in the repository and commit it. The system
-        enforces the output structure; the file controls everything else.
+        SKILL.md controls how the agent reasons; data-structure.json documents every input field it
+        receives and defines the output it must return. Edit either in the repository and commit.
       </p>
     </div>
   );

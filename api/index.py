@@ -591,6 +591,14 @@ def parse_skill(path: Path) -> dict:
                 k, _, v = line.partition(":")
                 meta[k.strip()] = v.strip().strip('"').strip("'")
     skill_id = path.parent.name
+    # Optional data-structure.json beside SKILL.md: documents the input and holds the output schema.
+    ds_path = path.parent / "data-structure.json"
+    data_structure = None
+    if ds_path.is_file():
+        try:
+            data_structure = json.loads(ds_path.read_text(encoding="utf-8"))
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=f"{ds_path.name} for skill '{skill_id}' is not valid JSON: {e}") from e
     return {
         "id": skill_id,
         "name": meta.get("name", skill_id),
@@ -599,8 +607,11 @@ def parse_skill(path: Path) -> dict:
         "inputs": meta.get("inputs", "symbol"),
         "output": meta.get("output", "stock-verdict"),
         "path": f"skills/{skill_id}/SKILL.md",
+        "data_structure_path": f"skills/{skill_id}/data-structure.json" if data_structure else None,
+        "output_schema": (data_structure or {}).get("output"),
         "instructions": body.strip(),
         "content": text,
+        "data_structure": data_structure,
     }
 
 
@@ -848,6 +859,7 @@ def run_skill_with_claude(skill: dict, data: dict):
     import anthropic
 
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    schema = skill.get("output_schema") or STOCK_VERDICT_SCHEMA  # skill's data-structure.json wins
     client = anthropic.Anthropic(timeout=240.0, max_retries=1)
     try:
         response = client.beta.messages.create(
@@ -856,7 +868,7 @@ def run_skill_with_claude(skill: dict, data: dict):
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
             system=[{"type": "text", "text": skill["instructions"], "cache_control": {"type": "ephemeral"}}],
-            output_config={"effort": "high", "format": {"type": "json_schema", "schema": STOCK_VERDICT_SCHEMA}},
+            output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
             messages=[{
                 "role": "user",
                 "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON.\n\n"
@@ -886,7 +898,7 @@ def run_skill_with_claude(skill: dict, data: dict):
 
 @app.get("/api/py/agent/skills")
 def agent_skills():
-    keys = ("id", "name", "description", "version", "inputs", "output", "path")
+    keys = ("id", "name", "description", "version", "inputs", "output", "path", "data_structure_path")
     return {"skills": [{k: s[k] for k in keys} for s in list_skills()], "directory": str(SKILLS_DIR)}
 
 
@@ -905,7 +917,7 @@ def agent_run(req: AgentRunRequest):
     analysis, response = run_skill_with_claude(skill, data)
     usage = response.usage
     return {
-        "skill": {k: skill[k] for k in ("id", "name", "version", "path")},
+        "skill": {k: skill[k] for k in ("id", "name", "version", "path", "data_structure_path")},
         "symbol": symbol,
         "analysis": analysis,
         "warnings": validate_verdict(analysis),
