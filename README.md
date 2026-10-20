@@ -126,8 +126,11 @@ configured.
 
 **Data bundle.** Everything a run needs is downloaded **once per symbol** - two years of daily prices,
 the company profile and quote summary, every line item of the annual and quarterly statements, and the
-earnings-release dates - and stored as one JSON bundle in Vercel Blob (`data/<SYMBOL>/latest.json` plus a
-dated copy) and in `dbo.symbol_data`. Prices already in `dbo.stock_prices` are reused (not downloaded
+earnings-release dates - and stored in Vercel Blob under `data/<SYMBOL>/` as browsable documents
+(`profile.json`, `quote-summary.json`, `earnings-dates.json`, `prices.json`,
+`statements/annual/{income-statement,balance-sheet,cash-flow-statement}.json`, the same under
+`statements/quarterly/`, an `index.json` manifest), plus the complete bundle the runs read
+(`latest.json`) and a dated snapshot; the bundle is also kept in `dbo.symbol_data`. Prices already in `dbo.stock_prices` are reused (not downloaded
 again) when at least 250 rows exist and the latest close is at most 7 days old. AI runs (single runs and every backtest Monday) read the bundle;
 nothing is fetched from Yahoo during a run. A bundle older than 24 h is refreshed automatically when a
 run starts; the backtest page shows the bundle's contents and has *Pre-download data* / *Refresh data*

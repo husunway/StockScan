@@ -8,7 +8,7 @@ type Skill = { id: string; name: string; description: string; version: string };
 type Counts = { pending: number; running: number; done: number; failed: number; cancelled: number; total: number };
 type LogEntry = { t: string; elapsed_s: number; level: "info" | "warn" | "error"; message: string };
 type Diagnostics = {
-  claude: { provider: string; endpoint: string | null; model: string | null; credentials: string | null; variables: string[] };
+  claude: { provider: string; endpoint: string | null; model: string | null; effort?: string; credentials: string | null; variables: string[] };
   database: {
     server: string | null; database: string | null; user: string | null; variables: string[];
     connected?: boolean; latency_ms?: number; version?: string; symbols_loaded?: number; price_rows?: number; error?: string;
@@ -63,6 +63,7 @@ type DataStatus = {
   price_rows?: number;
   price_range?: [string, string] | null;
   data_pathname?: string | null;
+  data_files?: string[];
   log?: LogEntry[];
 };
 
@@ -99,7 +100,7 @@ function DiagnosticsPanel({ diag, error }: { diag: Diagnostics | null; error: st
             <span className="stat-label">{dot(diag.claude.provider !== "not configured")} Claude</span>
             <strong>{diag.claude.provider}</strong>
             <span>{diag.claude.endpoint ?? "—"}</span>
-            <span>model <code>{diag.claude.model ?? "—"}</code></span>
+            <span>model <code>{diag.claude.model ?? "—"}</code>{diag.claude.effort && <> · effort {diag.claude.effort}</>}</span>
             <span className="tile-note">{diag.claude.variables.join(" · ")}</span>
           </div>
           <div className="diag-item">
@@ -156,10 +157,14 @@ function LiveLog({ title, entries, running }: { title: string; entries: LogEntry
           </div>
         ))}
         {running && last && (
-          <div className="console-line muted">
+          <div className={`console-line ${waiting > 150 ? "warn" : "muted"}`}>
             <span className="console-time">…</span>
             <span className="console-elapsed">{waiting}s</span>
-            <span>waiting for the next update (the log refreshes every few seconds; a model call takes 30–90 s)</span>
+            <span>
+              {waiting > 150
+                ? "No update for over 150 s. The server function may have been terminated (Vercel limit 120 s per step). Use Stop run, then Retry failed; consider ANTHROPIC_EFFORT=medium."
+                : "waiting for the next update (progress lines appear every ~15 s while the model generates)"}
+            </span>
           </div>
         )}
         <div ref={endRef} />
@@ -489,7 +494,14 @@ export default function BacktestPanel() {
               annual {dataStatus.annual_periods?.map((p) => p.slice(0, 4)).join(", ")} · quarterly {dataStatus.quarterly_periods?.length} periods ·
               {dataStatus.annual_line_items} + {dataStatus.quarterly_line_items} line items · {dataStatus.earnings_dates} earnings dates ·
               {dataStatus.quote_summary_fields} quote fields
-              {dataStatus.data_pathname ? <> · Blob <code>{dataStatus.data_pathname}</code></> : " · SQL only"}
+              {dataStatus.data_pathname ? (
+                <>
+                  {" · "}Blob <code>{dataStatus.data_pathname.replace(/latest\.json$/, "")}</code>
+                  {dataStatus.data_files && dataStatus.data_files.length > 0 && (
+                    <> ({dataStatus.data_files.length} files: profile, quote summary, earnings dates, prices, annual and quarterly statements, latest.json, snapshot, index.json)</>
+                  )}
+                </>
+              ) : " · SQL only"}
             </span>
           ) : (
             <span><span className="dot" /> not downloaded yet - it will be fetched when a run starts, or pre-download now</span>

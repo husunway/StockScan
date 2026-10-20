@@ -917,48 +917,107 @@ def make_claude_client(provider: str):
     return anthropic.Anthropic(timeout=240.0, max_retries=1)
 
 
-def run_skill_with_claude(skill: dict, data: dict):
-    """One structured-output call: skill instructions as the (cached) system prompt, gathered data as the user turn."""
+CLAUDE_TIMEOUT_S = 240.0
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def claude_effort() -> str:
+    e = os.environ.get("ANTHROPIC_EFFORT", "high").strip().lower()
+    return e if e in EFFORT_LEVELS else "high"
+
+
+def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
+    """One structured-output call, streamed so progress can be logged while the model generates.
+    Skill instructions are the (cached) system prompt; the gathered data is the user turn."""
     import anthropic
 
     provider = require_claude()
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    effort = claude_effort()
     schema = skill.get("output_schema") or STOCK_VERDICT_SCHEMA  # skill's data-structure.json wins
     client = make_claude_client(provider)
+    user_text = (f"Apply the skill to {data['symbol']} using only the data below and return the JSON. "
+                 "In key_metrics.source and within sections, cite the specific statement and period each "
+                 "figure came from (for example 'annual_statements.cashflow.Free Cash Flow 2025', "
+                 "'fundamentals.returnOnEquity' or 'price.ma200').\n\n"
+                 + json.dumps(data, default=str, sort_keys=True))
     request = dict(
         model=model,
         max_tokens=16000,
         system=[{"type": "text", "text": skill["instructions"], "cache_control": {"type": "ephemeral"}}],
-        output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
-        messages=[{
-            "role": "user",
-            "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON. "
-                       "In key_metrics.source and within sections, cite the specific statement and period each "
-                       "figure came from (for example 'annual_statements.cashflow.Free Cash Flow 2025', "
-                       "'fundamentals.returnOnEquity' or 'price.ma200').\n\n"
-                       + json.dumps(data, default=str, sort_keys=True),
-        }],
+        output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+        messages=[{"role": "user", "content": user_text}],
     )
+
+    def say(msg, level="info"):
+        if log:
+            log.step(msg, level)
+
+    say(f"Request to {provider} at {client.base_url}: model {model}, effort {effort}, max_tokens 16000, "
+        f"system {len(skill['instructions']):,} chars (cached), data {len(user_text):,} chars "
+        f"(~{(len(skill['instructions']) + len(user_text)) // 4:,} input tokens), JSON schema enforced, "
+        f"timeout {CLAUDE_TIMEOUT_S:.0f} s, 1 retry, streaming"
+        + (" - Vercel function limit 120 s" if os.environ.get("VERCEL") else ""))
+
+    t0 = time.monotonic()
+    last_report = t0
+    first_token_at = None
+    text_chars = 0
+    thinking_events = 0
+    events = 0
     try:
         if provider == "foundry":
             # Foundry has no server-side refusal fallback; plain Messages API.
-            response = client.messages.create(**request)
+            manager = client.messages.stream(**request)
         else:
-            response = client.beta.messages.create(
-                betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request
-            )
+            manager = client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request)
+        with manager as stream:
+            for event in stream:
+                events += 1
+                et = getattr(event, "type", "")
+                if et == "message_start":
+                    u = event.message.usage
+                    say(f"Connected after {time.monotonic() - t0:.1f} s: {u.input_tokens:,} input tokens "
+                        f"(cache read {getattr(u, 'cache_read_input_tokens', 0) or 0:,}, cache write "
+                        f"{getattr(u, 'cache_creation_input_tokens', 0) or 0:,}); model generating ...")
+                elif et == "content_block_delta":
+                    d = event.delta
+                    dt = getattr(d, "type", "")
+                    if dt == "text_delta":
+                        text_chars += len(d.text)
+                    elif dt == "thinking_delta":
+                        thinking_events += 1
+                    if first_token_at is None:
+                        first_token_at = time.monotonic() - t0
+                        say(f"First output after {first_token_at:.1f} s ({'thinking' if dt == 'thinking_delta' else 'answer text'})")
+                    if time.monotonic() - last_report >= 15:
+                        last_report = time.monotonic()
+                        say(f"Still generating: {time.monotonic() - t0:.0f} s elapsed, ~{text_chars // 4:,} answer tokens so far"
+                            + (f", {thinking_events:,} thinking chunks" if thinking_events else ""))
+                elif et == "content_block_start" and getattr(getattr(event, "content_block", None), "type", "") == "thinking":
+                    say(f"Model is thinking (effort {effort}) ...")
+            response = stream.get_final_message()
+        u = response.usage
+        say(f"Completed in {time.monotonic() - t0:.1f} s: stop_reason {response.stop_reason}, {u.input_tokens:,} input / "
+            f"{u.output_tokens:,} output tokens, {events} stream events, ~{text_chars:,} chars of JSON")
     except anthropic.AuthenticationError as e:
         raise HTTPException(status_code=502, detail="Anthropic API key was rejected.") from e
     except anthropic.RateLimitError as e:
         raise HTTPException(status_code=503, detail="Anthropic API rate limit reached; try again shortly.") from e
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error {e.status_code}: {e.message}") from e
+    except anthropic.APITimeoutError as e:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Claude did not finish within {CLAUDE_TIMEOUT_S:.0f} s after {time.monotonic() - t0:.0f} s "
+                   f"(~{text_chars:,} chars received). Lower ANTHROPIC_EFFORT (medium/low) or use a faster model.",
+        ) from e
     except anthropic.APIConnectionError as e:
         cause = f"{type(e.__cause__).__name__}: {e.__cause__}" if e.__cause__ else str(e)
         raise HTTPException(
             status_code=502,
-            detail=f"Could not connect to Claude via {provider} at {client.base_url} ({cause[:300]}). "
-                   "Check the resource name / base URL, DNS and any corporate proxy or firewall.",
+            detail=f"Could not connect to Claude via {provider} at {client.base_url} ({cause[:300]}) after "
+                   f"{time.monotonic() - t0:.0f} s. Check the resource name / base URL, DNS and any corporate proxy or firewall.",
         ) from e
 
     if response.stop_reason == "refusal":
@@ -991,7 +1050,7 @@ def agent_run(req: AgentRunRequest):
     symbol = normalize_symbol(req.symbol)
     log = RunLog(DECISIONS_TABLE, "decision_id")  # not persisted for single runs; returned with the result
     data = gather_stock_data(symbol, skill, log=log)
-    analysis, response = run_skill_with_claude(skill, data)
+    analysis, response = run_skill_with_claude(skill, data, log)
     archive_run_json(f"runs/{skill['id']}/{symbol}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}", data, analysis, log)
     usage = response.usage
     return {
@@ -1108,12 +1167,13 @@ def env_diagnostics() -> dict:
         base = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL") or \
             f"https://{os.environ.get('ANTHROPIC_FOUNDRY_RESOURCE')}.services.ai.azure.com/anthropic/"
         claude = {"provider": "Microsoft Foundry", "endpoint": base, "model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
-                  "credentials": _set("ANTHROPIC_FOUNDRY_API_KEY"),
+                  "effort": claude_effort(), "credentials": _set("ANTHROPIC_FOUNDRY_API_KEY"),
                   "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"),
-                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("ANTHROPIC_MODEL")]}
+                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_EFFORT")]}
     elif provider == "anthropic":
         claude = {"provider": "Anthropic API", "endpoint": "https://api.anthropic.com/", "model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
-                  "credentials": _set("ANTHROPIC_API_KEY"), "variables": [_set("ANTHROPIC_API_KEY"), _set("ANTHROPIC_MODEL")]}
+                  "effort": claude_effort(), "credentials": _set("ANTHROPIC_API_KEY"),
+                  "variables": [_set("ANTHROPIC_API_KEY"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_EFFORT")]}
     else:
         claude = {"provider": "not configured", "endpoint": None, "model": None, "credentials": None,
                   "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"), _set("ANTHROPIC_API_KEY")]}
@@ -1664,6 +1724,7 @@ def bundle_summary(bundle: dict) -> dict:
         "price_rows": len(prices),
         "price_range": [prices[0]["trade_date"], prices[-1]["trade_date"]] if prices else None,
         "data_pathname": bundle.get("data_pathname"),
+        "data_files": bundle.get("data_files", []),
     }
 
 
@@ -1742,12 +1803,40 @@ def store_symbol_bundle(bundle: dict, log: "RunLog | None" = None) -> dict:
     if blob_configured():
         from vercel.blob.sync import put_blob
 
-        body = json.dumps(bundle).encode()
-        for name in (f"data/{symbol}/{stamp}.json", f"data/{symbol}/latest.json"):
+        def put(name: str, obj) -> int:
+            body = json.dumps(obj, indent=1).encode()
             r = put_blob(name, body, access=blob_access(), content_type="application/json", allow_overwrite=True)
+            return len(body)
+
+        base = f"data/{symbol}"
+        # One document per data set, browsable in the Blob store ...
+        parts: dict[str, object] = {
+            "profile.json": bundle.get("profile", {}),
+            "quote-summary.json": bundle.get("quote_summary", {}),
+            "earnings-dates.json": bundle.get("earnings_dates", []),
+            "prices.json": bundle.get("prices", []),
+        }
+        for period, folder in (("A", "annual"), ("Q", "quarterly")):
+            for stmt, fname in (("income", "income-statement"), ("balance", "balance-sheet"), ("cashflow", "cash-flow-statement")):
+                parts[f"statements/{folder}/{fname}.json"] = bundle["statements"].get(period, {}).get(stmt, {})
+        files = []
+        for name, obj in parts.items():
+            size = put(f"{base}/{name}", obj)
+            files.append({"path": f"{base}/{name}", "bytes": size})
+        # ... plus the complete bundle the runs read, a dated snapshot, and a manifest.
+        full = json.dumps(bundle).encode()
+        for name in (f"{base}/{stamp}.json", f"{base}/latest.json"):
+            r = put_blob(name, full, access=blob_access(), content_type="application/json", allow_overwrite=True)
             bundle["data_pathname"] = r.pathname
+        files.append({"path": f"{base}/latest.json", "bytes": len(full)})
+        files.append({"path": f"{base}/{stamp}.json", "bytes": len(full)})
+        manifest = {"symbol": symbol, "fetched_at": bundle["fetched_at"], "source": bundle.get("source"), "files": files}
+        put(f"{base}/index.json", manifest)
+        bundle["data_files"] = [f["path"] for f in files] + [f"{base}/index.json"]
         if log:
-            log.step(f"Data bundle stored in Vercel Blob: data/{symbol}/latest.json ({len(body) / 1024:.0f} KB) and dated copy {stamp}.json")
+            log.step(f"Data stored in Vercel Blob under {base}/: {len(bundle['data_files'])} files - profile, quote summary, "
+                     f"earnings dates, prices, 3 annual + 3 quarterly statements, latest.json ({len(full) / 1024:.0f} KB), "
+                     f"snapshot {stamp}.json, index.json")
     elif log:
         log.step("Blob storage not configured; data bundle kept in dbo.symbol_data only", "warn")
     summary = bundle_summary(bundle)
@@ -2195,10 +2284,7 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         log.step(f"Point-in-time data as of {as_of}: price through {payload['price']['as_of']}, {n_stmt} statement "
                  f"periods visible, {len(payload['fundamentals'])} derived fundamentals")
         log.step(f"Querying Claude ({env_diagnostics()['claude']['provider']}, model '{os.environ.get('ANTHROPIC_MODEL', DEFAULT_CLAUDE_MODEL)}') ...")
-        t0 = time.monotonic()
-        analysis, response = run_skill_with_claude(skill, payload)
-        log.step(f"Claude responded in {time.monotonic() - t0:.1f} s: model {response.model}, stop_reason {response.stop_reason}, "
-                 f"{response.usage.input_tokens:,} input / {response.usage.output_tokens:,} output tokens")
+        analysis, response = run_skill_with_claude(skill, payload, log)
         warnings = validate_verdict(analysis)
         log.add(f"Verdict {analysis['recommendation']} ({analysis.get('conviction')}): target {analysis.get('target_price')}, "
                 f"stop {analysis.get('stop_price')}; {len(warnings)} warning(s)")
