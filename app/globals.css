@@ -317,6 +317,14 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 @keyframes pulse { from { opacity: 0.55; } to { opacity: 1; } }
 .pdf-frame { width: 100%; height: 860px; border: 1px solid var(--border); border-radius: 10px; background: #fff; }
 
+.data-status {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 4px 0 12px; padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; font-size: 0.82rem;
+}
+.data-status .stat-label { white-space: nowrap; }
+.data-status > span:not(.stat-label) { flex: 1; min-width: 240px; color: var(--muted); }
+.data-status .dot { display: inline-block; margin-right: 4px; }
+
 /* Diagnostics and live log */
 .diag { margin-bottom: 14px; }
 .diag-toggle { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }

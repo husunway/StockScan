@@ -47,6 +47,23 @@ type Backtest = {
   decisions: Decision[];
 };
 type Previous = { backtest_id: number; skill_id: string; symbol: string; year: number; created_at: string; done: number; failed: number; total: number };
+type DataStatus = {
+  symbol: string;
+  available: boolean;
+  fresh?: boolean;
+  age_hours?: number;
+  fetched_at?: string;
+  annual_periods?: string[];
+  quarterly_periods?: string[];
+  annual_line_items?: number;
+  quarterly_line_items?: number;
+  earnings_dates?: number;
+  quote_summary_fields?: number;
+  price_rows?: number;
+  price_range?: [string, string] | null;
+  data_pathname?: string | null;
+  log?: LogEntry[];
+};
 
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const DOW = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
@@ -217,7 +234,43 @@ export default function BacktestPanel() {
   const [diag, setDiag] = useState<Diagnostics | null>(null);
   const [diagError, setDiagError] = useState<string | null>(null);
   const [clientLog, setClientLog] = useState<LogEntry[]>([]);
+  const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
+  const [preparing, setPreparing] = useState(false);
   const stopRef = useRef(false);
+
+  const loadDataStatus = useCallback(async (sym: string) => {
+    if (!sym) return setDataStatus(null);
+    try {
+      setDataStatus(await api<DataStatus>(`/api/py/data/${encodeURIComponent(sym)}`));
+    } catch {
+      setDataStatus(null);
+    }
+  }, []);
+
+  async function prepareData(refresh: boolean) {
+    const s = symbol.trim();
+    if (!s) return;
+    setPreparing(true);
+    setError(null);
+    setClientLog([]);
+    note(`Pre-downloading all documents and data for ${s} from Yahoo Finance (prices, annual and quarterly reports, earnings dates, profile, quote summary) ...`);
+    try {
+      const r = await api<DataStatus>("/api/py/data/prepare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: s, refresh }),
+      });
+      for (const e of r.log ?? []) setClientLog((prev) => [...prev, e]);
+      note(`Data bundle ready${r.data_pathname ? ` - stored in Blob at ${r.data_pathname}` : ""}`);
+      await loadDataStatus(s);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Data download failed";
+      setError(msg);
+      note(msg, "error");
+    } finally {
+      setPreparing(false);
+    }
+  }
 
   const note = useCallback((message: string, level: LogEntry["level"] = "info") => {
     setClientLog((prev) => [...prev, { t: new Date().toISOString(), elapsed_s: 0, level, message }]);
@@ -250,9 +303,12 @@ export default function BacktestPanel() {
   }, []);
 
   useEffect(() => {
-    const t = setTimeout(() => loadPrevious(symbol.trim(), skillId), 400);
+    const t = setTimeout(() => {
+      loadPrevious(symbol.trim(), skillId);
+      loadDataStatus(symbol.trim());
+    }, 400);
     return () => clearTimeout(t);
-  }, [symbol, skillId, loadPrevious]);
+  }, [symbol, skillId, loadPrevious, loadDataStatus]);
 
   // Live status: poll the backtest while any Monday is pending or running (even if another tab drives it).
   const active = !!bt && bt.counts.pending + bt.counts.running > 0;
@@ -385,6 +441,27 @@ export default function BacktestPanel() {
         Each Monday is one model call (30–90 s); you can stop and resume.
       </p>
 
+      {symbol.trim() && (
+        <div className="data-status">
+          <span className="stat-label">Data bundle for {symbol.trim()}</span>
+          {dataStatus?.available ? (
+            <span>
+              <span className={`dot ${dataStatus.fresh ? "ok" : "down"}`} /> fetched {dataStatus.age_hours}h ago ·
+              prices {dataStatus.price_range?.[0]} → {dataStatus.price_range?.[1]} ({dataStatus.price_rows} rows) ·
+              annual {dataStatus.annual_periods?.map((p) => p.slice(0, 4)).join(", ")} · quarterly {dataStatus.quarterly_periods?.length} periods ·
+              {dataStatus.annual_line_items} + {dataStatus.quarterly_line_items} line items · {dataStatus.earnings_dates} earnings dates ·
+              {dataStatus.quote_summary_fields} quote fields
+              {dataStatus.data_pathname ? <> · Blob <code>{dataStatus.data_pathname}</code></> : " · SQL only"}
+            </span>
+          ) : (
+            <span><span className="dot" /> not downloaded yet - it will be fetched when a run starts, or pre-download now</span>
+          )}
+          <button type="button" className="btn small ghost" disabled={preparing || running} onClick={() => prepareData(!!dataStatus?.available)}>
+            {preparing ? "Downloading…" : dataStatus?.available ? "Refresh data" : "Pre-download data"}
+          </button>
+        </div>
+      )}
+
       {previous.length > 0 && !running && (
         <p className="msg hint">
           Previous runs for {symbol.trim()}:{" "}
@@ -401,8 +478,8 @@ export default function BacktestPanel() {
 
       {error && <p className="msg error">{error}</p>}
 
-      {(creating || clientLog.length > 0) && !bt && (
-        <LiveLog title="Preparing" entries={clientLog} running={creating} />
+      {(creating || preparing || clientLog.length > 0) && !bt && (
+        <LiveLog title={preparing ? "Downloading data" : "Preparing"} entries={clientLog} running={creating || preparing} />
       )}
 
       {bt && c && (

@@ -852,21 +852,37 @@ def validate_verdict(a: dict) -> list[str]:
     return warnings
 
 
-def gather_stock_data(symbol: str, skill: dict | None = None) -> dict:
+def gather_stock_data(symbol: str, skill: dict | None = None, log: "RunLog | None" = None) -> dict:
+    """Current-date payload for a single run, read from the symbol's stored data bundle (no live Yahoo call
+    unless the bundle is missing or older than BUNDLE_MAX_AGE_HOURS)."""
+    import pandas as pd
     from datetime import date as _date
 
     info_fields, statement_rows = skill_data_requirements(skill)
-    df, price_source = load_price_history_any(symbol)
+    bundle = load_symbol_bundle(symbol, log=log)
+    df = pd.DataFrame(bundle["prices"])
+    df["date"] = df["trade_date"].astype(str)
+    for c in ("open", "high", "low", "close", "adj_close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    fundamentals = {k: v for k, v in bundle.get("quote_summary", {}).items() if k in info_fields}
+    annual = bundle["statements"].get("A", {})
+    annual_rows = {
+        stmt: {item: {pe[:4]: v for pe, v in annual.get(stmt, {}).get(item, {}).items()}
+               for item in rows if item in annual.get(stmt, {})}
+        for stmt, rows in statement_rows.items()
+    }
     data = {
         "symbol": symbol,
         "analysis_date": _date.today().isoformat(),
-        "price": {**price_snapshot(df), "source": price_source},
-        **gather_fundamentals(symbol, info_fields, statement_rows),
-        "source_note": "fundamentals and annual_statements: Yahoo Finance via yfinance; values as reported by Yahoo, "
-                       "statement figures in the company's financial currency.",
+        "price": {**price_snapshot(df), "source": "database"},
+        "fundamentals": fundamentals,
+        "annual_statements": annual_rows,
+        "source_note": f"Data bundle fetched {bundle['fetched_at'][:19]} UTC from Yahoo Finance via yfinance "
+                       f"(stored copy; nothing fetched live for this run). Values as reported by Yahoo; statement "
+                       f"figures in the company's financial currency.",
     }
     if not data["fundamentals"]:
-        raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no fundamentals for {symbol}.")
+        raise HTTPException(status_code=404, detail=f"The stored data for {symbol} has no quote-summary fundamentals.")
     return data
 
 
@@ -973,10 +989,13 @@ def agent_run(req: AgentRunRequest):
     require_claude()
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
-    data = gather_stock_data(symbol, skill)
+    log = RunLog(DECISIONS_TABLE, "decision_id")  # not persisted for single runs; returned with the result
+    data = gather_stock_data(symbol, skill, log=log)
     analysis, response = run_skill_with_claude(skill, data)
+    archive_run_json(f"runs/{skill['id']}/{symbol}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}", data, analysis, log)
     usage = response.usage
     return {
+        "log": log.entries,
         "skill": {k: skill[k] for k in ("id", "name", "version", "path", "data_structure_path")},
         "symbol": symbol,
         "analysis": analysis,
@@ -1593,11 +1612,216 @@ def report_pathname(skill_id: str, symbol: str, as_of: str, decision_id: int) ->
     return f"reports/{skill_id}/{safe_symbol}/{as_of[:4]}/{as_of}-{decision_id}.pdf"
 
 
+# ---------------------------------------------------------------------------
+# Symbol data bundle: everything the skills need, downloaded once per symbol and stored in Vercel Blob
+# (data/<SYMBOL>/latest.json + a dated copy) and in dbo.symbol_data. AI runs read the bundle, never Yahoo.
+# ---------------------------------------------------------------------------
+SYMBOL_DATA_TABLE = "dbo.symbol_data"
+BUNDLE_MAX_AGE_HOURS = 24
+
+ENSURE_SYMBOL_DATA_SQL = f"""
+IF OBJECT_ID('{SYMBOL_DATA_TABLE}', 'U') IS NULL
+CREATE TABLE {SYMBOL_DATA_TABLE} (
+    symbol        NVARCHAR(20)   NOT NULL PRIMARY KEY,
+    fetched_at    DATETIME2      NOT NULL,
+    bundle_json   NVARCHAR(MAX)  NOT NULL,
+    data_pathname NVARCHAR(400)  NULL,
+    summary_json  NVARCHAR(MAX)  NULL
+);
+IF COL_LENGTH('{BACKTESTS_TABLE}', 'data_pathname') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD data_pathname NVARCHAR(400) NULL;
+"""
+
+
+def all_info_fields() -> tuple:
+    """Union of the default quote-summary fields and every skill's documented fundamentals fields."""
+    fields = set(INFO_FIELDS)
+    for s in list_skills():
+        try:
+            fields |= set(s["data_structure"]["input"]["properties"]["fundamentals"]["properties"])
+        except (KeyError, TypeError):
+            pass
+    return tuple(sorted(fields))
+
+
+def bundle_summary(bundle: dict) -> dict:
+    a = bundle["statements"].get("A", {})
+    q = bundle["statements"].get("Q", {})
+    a_periods = sorted({pe for s in a.values() for ser in s.values() for pe in ser})
+    q_periods = sorted({pe for s in q.values() for ser in s.values() for pe in ser})
+    prices = bundle.get("prices", [])
+    return {
+        "symbol": bundle["symbol"],
+        "fetched_at": bundle["fetched_at"],
+        "profile": bool(bundle.get("profile")),
+        "quote_summary_fields": len(bundle.get("quote_summary", {})),
+        "annual_periods": a_periods,
+        "quarterly_periods": q_periods,
+        "annual_line_items": sum(len(rows) for rows in a.values()),
+        "quarterly_line_items": sum(len(rows) for rows in q.values()),
+        "earnings_dates": len(bundle.get("earnings_dates", [])),
+        "price_rows": len(prices),
+        "price_range": [prices[0]["trade_date"], prices[-1]["trade_date"]] if prices else None,
+        "data_pathname": bundle.get("data_pathname"),
+    }
+
+
+def build_symbol_bundle(symbol: str, log: "RunLog | None" = None) -> dict:
+    """Download prices (stored in dbo.stock_prices too), quote summary, annual + quarterly statements and
+    earnings dates for one symbol."""
+    import yfinance as yf
+
+    def say(msg):
+        if log:
+            log.step(msg)
+
+    t0 = time.monotonic()
+    rows = fetch_history(symbol)
+    save_prices(symbol, rows)
+    say(f"Prices: {len(rows)} daily rows ({rows[0].trade_date} to {rows[-1].trade_date}) downloaded and stored in {time.monotonic() - t0:.1f} s")
+
+    t0 = time.monotonic()
+    raw = fetch_backtest_raw(symbol)  # profile, statements A/Q (every line item), earnings dates
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    quote_summary = {k: info[k] for k in all_info_fields() if info.get(k) is not None}
+    bundle = {
+        **raw,
+        "quote_summary": quote_summary,
+        "prices": [r.model_dump(mode="json") for r in rows],
+        "source": "Yahoo Finance via yfinance",
+    }
+    s = bundle_summary(bundle)
+    say(f"Reports: {len(s['annual_periods'])} annual and {len(s['quarterly_periods'])} quarterly periods "
+        f"({s['annual_line_items']} + {s['quarterly_line_items']} line items), {s['earnings_dates']} earnings dates, "
+        f"{s['quote_summary_fields']} quote-summary fields, profile {'found' if s['profile'] else 'missing'} - "
+        f"{time.monotonic() - t0:.1f} s")
+    if not raw["statements"]["A"].get("income"):
+        raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no financial statements for {symbol}.")
+    return bundle
+
+
+def store_symbol_bundle(bundle: dict, log: "RunLog | None" = None) -> dict:
+    """Blob first (when configured), then dbo.symbol_data. Returns the summary."""
+    symbol = bundle["symbol"]
+    stamp = bundle["fetched_at"][:19].replace(":", "-")
+    if blob_configured():
+        from vercel.blob.sync import put_blob
+
+        body = json.dumps(bundle).encode()
+        for name in (f"data/{symbol}/{stamp}.json", f"data/{symbol}/latest.json"):
+            r = put_blob(name, body, access=blob_access(), content_type="application/json", allow_overwrite=True)
+            bundle["data_pathname"] = r.pathname
+        if log:
+            log.step(f"Data bundle stored in Vercel Blob: data/{symbol}/latest.json ({len(body) / 1024:.0f} KB) and dated copy {stamp}.json")
+    elif log:
+        log.step("Blob storage not configured; data bundle kept in dbo.symbol_data only", "warn")
+    summary = bundle_summary(bundle)
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_SYMBOL_DATA_SQL)
+        cur.execute(
+            f"MERGE {SYMBOL_DATA_TABLE} AS t USING (SELECT %s AS symbol) AS s ON t.symbol = s.symbol "
+            f"WHEN MATCHED THEN UPDATE SET fetched_at = %s, bundle_json = %s, data_pathname = %s, summary_json = %s "
+            f"WHEN NOT MATCHED THEN INSERT (symbol, fetched_at, bundle_json, data_pathname, summary_json) "
+            f"VALUES (%s, %s, %s, %s, %s);",
+            (symbol, bundle["fetched_at"], json.dumps(bundle), bundle.get("data_pathname"), json.dumps(summary),
+             symbol, bundle["fetched_at"], json.dumps(bundle), bundle.get("data_pathname"), json.dumps(summary)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if log:
+        log.step(f"Data bundle saved in {SYMBOL_DATA_TABLE}")
+    return summary
+
+
+def load_symbol_bundle(symbol: str, max_age_hours: float = BUNDLE_MAX_AGE_HOURS, refresh: bool = False,
+                       log: "RunLog | None" = None) -> dict:
+    """Stored bundle if fresh enough, otherwise download and store a new one."""
+    if not refresh:
+        conn = db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(ENSURE_SYMBOL_DATA_SQL)
+            conn.commit()
+            cur.execute(f"SELECT fetched_at, bundle_json FROM {SYMBOL_DATA_TABLE} WHERE symbol = %s", (symbol,))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            age_h = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if age_h <= max_age_hours:
+                if log:
+                    log.step(f"Using stored data bundle for {symbol} fetched {age_h:.1f} h ago (no live download)")
+                return json.loads(row[1])
+            if log:
+                log.step(f"Stored data bundle for {symbol} is {age_h:.0f} h old; refreshing")
+        elif log:
+            log.step(f"No stored data bundle for {symbol}; downloading")
+    bundle = build_symbol_bundle(symbol, log)
+    store_symbol_bundle(bundle, log)
+    return bundle
+
+
+def archive_run_json(prefix: str, payload: dict | None, output: dict | None, log: "RunLog | None" = None) -> None:
+    """Keep each run's exact model input and output in Blob next to its report (best effort)."""
+    if not blob_configured():
+        return
+    try:
+        from vercel.blob.sync import put_blob
+
+        for name, obj in ((f"{prefix}-input.json", payload), (f"{prefix}-output.json", output)):
+            if obj is not None:
+                put_blob(name, json.dumps(obj).encode(), access=blob_access(), content_type="application/json", allow_overwrite=True)
+        if log:
+            log.add(f"Run input/output archived in Vercel Blob: {prefix}-input.json, {prefix}-output.json")
+    except Exception as e:  # noqa: BLE001
+        if log:
+            log.add(f"Could not archive run JSON in Blob: {type(e).__name__}: {str(e)[:150]}", "warn")
+
+
+class PrepareRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+    refresh: bool = False
+
+
+@app.get("/api/py/data/{symbol}")
+def data_status(symbol: str):
+    symbol = normalize_symbol(symbol)
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_SYMBOL_DATA_SQL)
+        conn.commit()
+        cur.execute(f"SELECT fetched_at, summary_json, data_pathname FROM {SYMBOL_DATA_TABLE} WHERE symbol = %s", (symbol,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"symbol": symbol, "available": False}
+    age_h = (datetime.now(timezone.utc) - row[0].replace(tzinfo=timezone.utc)).total_seconds() / 3600
+    return {"symbol": symbol, "available": True, "age_hours": round(age_h, 1), "fresh": age_h <= BUNDLE_MAX_AGE_HOURS,
+            "data_pathname": row[2], **(json.loads(row[1]) if row[1] else {})}
+
+
+@app.post("/api/py/data/prepare")
+def data_prepare(req: PrepareRequest):
+    """Pre-download everything for a symbol and store it (Blob + SQL)."""
+    symbol = normalize_symbol(req.symbol)
+    log = RunLog(SYMBOL_DATA_TABLE, "symbol")  # row_id None: entries are returned, not persisted
+    bundle = load_symbol_bundle(symbol, refresh=req.refresh, log=log)
+    return {**bundle_summary(bundle), "log": log.entries}
+
+
 class BacktestRequest(BaseModel):
     skill: str = Field(..., min_length=1, max_length=60)
     symbol: str = Field(..., min_length=1, max_length=20)
     year: int = Field(2026, ge=2000, le=2100)
     weeks: int = Field(10, ge=1, le=52, description="How many Mondays to run, counting from January 1")
+    refresh_data: bool = Field(False, description="Re-download the symbol's data bundle even if a fresh one is stored")
 
 
 def _decision_dict(row) -> dict:
@@ -1711,42 +1935,23 @@ def create_backtest(req: BacktestRequest):
         raise HTTPException(status_code=422, detail=f"No Mondays in {req.year} on or before today.")
     log.add(f"Schedule: {len(dates)} Mondays from {dates[0]} to {dates[-1]}")
 
-    # Make sure two years of prices are stored, then pull the statements once.
-    t0 = time.monotonic()
-    conn = db_connect()
-    try:
-        cur = conn.cursor()
-        log.add(f"Database connected in {round((time.monotonic() - t0) * 1000)} ms")
-        cur.execute(ENSURE_TABLE_SQL)
-        cur.execute(f"SELECT COUNT(*), MIN(trade_date) FROM {TABLE} WHERE symbol = %s", (symbol,))
-        count, first = cur.fetchone()
-    finally:
-        conn.close()
-    if count < 250 or (first and first > date(req.year - 1, 1, 1)):
-        log.add(f"Only {count} price rows stored for {symbol}; downloading two years from Yahoo Finance")
-        rows = fetch_history(symbol)
-        save_prices(symbol, rows)
-        log.add(f"Saved {len(rows)} price rows ({rows[0].trade_date} to {rows[-1].trade_date})")
-    else:
-        log.add(f"Prices already stored: {count} rows from {first}")
-    t0 = time.monotonic()
-    raw = fetch_backtest_raw(symbol)
-    if not raw["statements"]["A"].get("income"):
-        raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no financial statements for {symbol}.")
-    a_periods = {pe for s in raw["statements"]["A"].values() for ser in s.values() for pe in ser}
-    q_periods = {pe for s in raw["statements"]["Q"].values() for ser in s.values() for pe in ser}
-    log.add(f"Yahoo Finance statements fetched in {time.monotonic() - t0:.1f} s: {len(a_periods)} annual periods, "
-            f"{len(q_periods)} quarterly periods, {len(raw['earnings_dates'])} earnings dates, profile "
-            f"{'found' if raw['profile'] else 'missing'}")
+    # All documents and data come from the symbol's stored bundle (downloaded once, kept in Blob + SQL).
+    bundle = load_symbol_bundle(symbol, refresh=req.refresh_data, log=log)
+    raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
+    s = bundle_summary(bundle)
+    log.add(f"Data for the run: prices {s['price_range'][0]} to {s['price_range'][1]} ({s['price_rows']} rows), "
+            f"annual periods {', '.join(s['annual_periods'])}, quarterly periods {len(s['quarterly_periods'])}, "
+            f"bundle {bundle.get('data_pathname') or 'in dbo.symbol_data'}")
 
     conn = db_connect()
     try:
         cur = conn.cursor()
         ensure_backtest_tables(cur)
+        cur.execute(ENSURE_SYMBOL_DATA_SQL)
         cur.execute(
-            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data) "
-            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s)",
-            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw)),
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, data_pathname) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, %s)",
+            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), bundle.get("data_pathname")),
         )
         backtest_id = cur.fetchone()[0]
         log.row_id = backtest_id
@@ -1911,6 +2116,7 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
                 t0 = time.monotonic()
                 report = upload_report(pathname, pdf_bytes)
                 log.add(f"Stored in Vercel Blob in {time.monotonic() - t0:.1f} s")
+                archive_run_json(pathname[:-4], payload, analysis, log)
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"Report PDF could not be stored in Vercel Blob ({type(e).__name__}: {str(e)[:200]}); it will be generated on demand.")
                 log.add(f"Blob upload failed: {type(e).__name__}: {str(e)[:200]}", "warn")

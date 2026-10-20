@@ -124,6 +124,16 @@ reads the blob directly: `/api/py/agent/backtest/{id}/decision/{did}/report.pdf`
 behind the login, and regenerates the PDF from the stored output if the blob is missing or no store is
 configured.
 
+**Data bundle.** Everything a run needs is downloaded **once per symbol** - two years of daily prices,
+the company profile and quote summary, every line item of the annual and quarterly statements, and the
+earnings-release dates - and stored as one JSON bundle in Vercel Blob (`data/<SYMBOL>/latest.json` plus a
+dated copy) and in `dbo.symbol_data`. AI runs (single runs and every backtest Monday) read the bundle;
+nothing is fetched from Yahoo during a run. A bundle older than 24 h is refreshed automatically when a
+run starts; the backtest page shows the bundle's contents and has *Pre-download data* / *Refresh data*
+buttons (`GET /api/py/data/{symbol}`, `POST /api/py/data/prepare`). Each run's exact model input and
+output JSON are archived in Blob next to its PDF (`reports/.../<date>-<id>-input.json`, `-output.json`;
+single runs under `runs/<skill>/<symbol>/`).
+
 Point-in-time rules for each Monday `D`:
 
 - Prices: stored daily closes strictly before `D` (52-week range, 200-day average, etc. computed from them).
