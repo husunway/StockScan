@@ -196,7 +196,7 @@ function LiveLog({ title, entries, running }: { title: string; entries: LogEntry
             <span className="console-elapsed">{waiting}s</span>
             <span>
               {waiting > 150
-                ? "No update for over 150 s. The server function may have been terminated (Vercel limit 120 s per step). Use Stop run, then Retry failed; consider ANTHROPIC_EFFORT=medium."
+                ? "No update for over 150 s. The server function may have been terminated (Vercel maxDuration per step, 300 s in vercel.json). Use Stop run, then Retry failed; consider ANTHROPIC_EFFORT=medium."
                 : "waiting for the next update (progress lines appear every ~15 s while the model generates)"}
             </span>
           </div>

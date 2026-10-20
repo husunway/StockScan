@@ -100,8 +100,10 @@ model"). Skills instruct the model to use only supplied data and to list assumpt
 treat the output as analysis to verify, not advice. A refusal fallback (`fallbacks: "default"`) is
 enabled so a safety decline is retried on a fallback model in the same call.
 
-Requires `ANTHROPIC_API_KEY`. Each run uses roughly 10-20K input and 3-6K output tokens.
-`vercel.json` raises the Python function's `maxDuration` to 120 s because the call takes 30-90 s.
+Each run uses roughly 10-20K input and 3-6K output tokens. `vercel.json` sets the Python function's
+`maxDuration` to 300 s (requires Fluid Compute, on by default): at `ANTHROPIC_EFFORT=high` a model can
+think for 60-80 s before writing a 4-6K-token verdict at ~70 tokens/s, so a step can take 150-180 s.
+The default is `ANTHROPIC_EFFORT=medium`, which keeps the thinking phase to seconds; set `high` only if you accept 150 s+ steps.
 
 ### Weekly backtest (`/agent/backtest`)
 

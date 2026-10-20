@@ -922,8 +922,8 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
 def claude_effort() -> str:
-    e = os.environ.get("ANTHROPIC_EFFORT", "high").strip().lower()
-    return e if e in EFFORT_LEVELS else "high"
+    e = os.environ.get("ANTHROPIC_EFFORT", "medium").strip().lower()
+    return e if e in EFFORT_LEVELS else "medium"
 
 
 HELLO_PROMPT = "Reply with one short sentence: say hello, state which model you are, and confirm you are ready to analyze a stock."
@@ -1003,7 +1003,9 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
         f"system {len(skill['instructions']):,} chars (cached), data {len(user_text):,} chars "
         f"(~{(len(skill['instructions']) + len(user_text)) // 4:,} input tokens), JSON schema enforced, "
         f"timeout {CLAUDE_TIMEOUT_S:.0f} s, 1 retry, streaming"
-        + (" - Vercel function limit 120 s" if os.environ.get("VERCEL") else ""))
+        + (" - Vercel function limit 300 s (vercel.json maxDuration)" if os.environ.get("VERCEL") else "")
+        + (" - WARNING: effort high can think for 60+ s before answering; set ANTHROPIC_EFFORT=medium if steps time out"
+           if effort in ("high", "xhigh", "max") and os.environ.get("VERCEL") else ""))
 
     t0 = time.monotonic()
     last_report = t0
