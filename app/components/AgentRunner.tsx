@@ -29,19 +29,28 @@ type Analysis = {
   checklist: Checklist[];
   sections: { title: string; content: string }[];
   key_metrics: Metric[];
-  valuation: {
-    method: string;
-    owner_earnings: string;
-    growth_rate_pct_years_1_5: number;
-    growth_rate_pct_years_6_10: number;
-    discount_rate_pct: number;
-    terminal_growth_pct: number;
-    notes: string;
-  };
+  // Skill-specific blocks: valuation keys differ per skill; balance_sheet / stress_test are optional.
+  valuation: Record<string, string | number | null>;
+  balance_sheet?: Record<string, string>;
+  stress_test?: {
+    scenario: string;
+    assumptions: string;
+    earnings_impact_pct: number;
+    price_impact_pct: number;
+    survives_without_capital_raise: boolean;
+  }[];
   risks: string[];
   assumptions: string[];
   data_gaps: string[];
 };
+
+const label = (key: string) => key.replace(/_/g, " ").replace(/\bpct\b/g, "%").replace(/^\w/, (c) => c.toUpperCase());
+const cell = (key: string, v: string | number | null) =>
+  v === null || v === undefined
+    ? "—"
+    : typeof v === "number"
+      ? `${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}${/pct|rate|yield/.test(key) ? "%" : ""}`
+      : v;
 
 type Result = {
   skill: { id: string; name: string; version: string; path: string };
@@ -244,6 +253,61 @@ export default function AgentRunner() {
             </p>
           ))}
 
+          {a.balance_sheet && (
+            <>
+              <h2 className="section-title">
+                Balance sheet{" "}
+                <span className={`grade grade-${a.balance_sheet.grade}`}>{a.balance_sheet.grade}</span>
+              </h2>
+              <div className="table-wrap">
+                <table className="table">
+                  <tbody>
+                    {Object.entries(a.balance_sheet)
+                      .filter(([k]) => k !== "grade")
+                      .map(([k, v]) => (
+                        <tr key={k}>
+                          <td>{label(k)}</td>
+                          <td className="wrap">{v}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {a.stress_test && a.stress_test.length > 0 && (
+            <>
+              <h2 className="section-title">Stress test</h2>
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Scenario</th>
+                      <th>Assumptions</th>
+                      <th className="num">Earnings impact</th>
+                      <th className="num">Price impact</th>
+                      <th>Survives without capital raise</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {a.stress_test.map((s) => (
+                      <tr key={s.scenario}>
+                        <td style={{ textTransform: "capitalize" }}>{s.scenario}</td>
+                        <td className="wrap">{s.assumptions}</td>
+                        <td className="num">{pct(s.earnings_impact_pct)}</td>
+                        <td className="num">{pct(s.price_impact_pct)}</td>
+                        <td className={s.survives_without_capital_raise ? "verdict-pass" : "verdict-fail"}>
+                          {s.survives_without_capital_raise ? "✓ yes" : "✗ no"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
           <h2 className="section-title">Checklist</h2>
           <div className="table-wrap">
             <table className="table">
@@ -283,13 +347,12 @@ export default function AgentRunner() {
           <div className="table-wrap">
             <table className="table">
               <tbody>
-                <tr><td>Method</td><td className="wrap">{a.valuation.method}</td></tr>
-                <tr><td>Owner earnings</td><td className="wrap">{a.valuation.owner_earnings}</td></tr>
-                <tr><td>Growth, years 1–5</td><td>{a.valuation.growth_rate_pct_years_1_5.toFixed(1)}%</td></tr>
-                <tr><td>Growth, years 6–10</td><td>{a.valuation.growth_rate_pct_years_6_10.toFixed(1)}%</td></tr>
-                <tr><td>Discount rate</td><td>{a.valuation.discount_rate_pct.toFixed(1)}%</td></tr>
-                <tr><td>Terminal growth</td><td>{a.valuation.terminal_growth_pct.toFixed(1)}%</td></tr>
-                <tr><td>Notes</td><td className="wrap">{a.valuation.notes}</td></tr>
+                {Object.entries(a.valuation).map(([k, v]) => (
+                  <tr key={k}>
+                    <td>{label(k)}</td>
+                    <td className="wrap">{cell(k, v)}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

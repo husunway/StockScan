@@ -52,13 +52,19 @@ skills/
   warren-buffett/
     SKILL.md             # frontmatter (name, description, version, inputs, output) + markdown instructions
     data-structure.json  # input contract (every field the agent receives) + output schema it must return
+  jamie-dimon/
+    SKILL.md             # fortress balance sheet, risk discipline, through-the-cycle earnings, stress test
+    data-structure.json  # adds liquidity/leverage/coverage fields, governance risk scores, debt flows;
+                         # output adds balance_sheet grade and a 3-scenario stress_test
 ```
 
 The frontmatter describes the skill; the markdown body becomes Claude's system prompt.
-`data-structure.json` documents the `input` object (price snapshot, fundamentals, annual statements -
-types, units, sources, and which fields are the minimum useful set) and holds the `output` JSON
-schema, which the API loads and enforces with structured outputs (falling back to the built-in
-`STOCK_VERDICT_SCHEMA` if the file is absent). To add a skill, add a folder with a `SKILL.md` (and
+`data-structure.json` does two jobs: its `input` schema **drives data gathering** (the API fetches
+exactly the fundamentals fields and statement rows it lists, so each skill gets the data it needs)
+and documents them (types, units, sources, minimum useful set); its `output` schema is enforced
+with structured outputs (falling back to the built-in `STOCK_VERDICT_SCHEMA` if the file is absent).
+The result page renders the common verdict fields and any skill-specific blocks (`valuation` keys,
+`balance_sheet`, `stress_test`) generically. To add a skill, add a folder with a `SKILL.md` (and
 optionally its own `data-structure.json`); to change how an existing one reasons, edit the file.
 Nothing in the code needs to change. (`vercel.json` includes `skills/**` in the Python function bundle.)
 
@@ -92,6 +98,38 @@ enabled so a safety decline is retried on a fallback model in the same call.
 
 Requires `ANTHROPIC_API_KEY`. Each run uses roughly 10-20K input and 3-6K output tokens.
 `vercel.json` raises the Python function's `maxDuration` to 120 s because the call takes 30-90 s.
+
+### Weekly backtest (`/agent/backtest`)
+
+Runs a skill as of **every Monday of a year** (default 2026, up to today) and stores each decision.
+The AI agent › Warren Buffett menu item opens this page with the Buffett skill selected.
+
+Point-in-time rules for each Monday `D`:
+
+- Prices: stored daily closes strictly before `D` (52-week range, 200-day average, etc. computed from them).
+- Statements: Yahoo annual **and** quarterly statements, every line item, fetched once per backtest and
+  stored with the backtest. A fiscal period is visible only once reported: the first earnings-release
+  date after period end where Yahoo lists one, otherwise period end + 90 days (annual) / 45 days (quarterly).
+- Ratios: Yahoo's live quote summary is *today's* and is **not** used. Market cap, trailing EPS and P/E,
+  book value and P/B, ROE, margins, debt/equity, current ratio, cash flows and payout are derived from
+  the visible statements (trailing four quarters when available) and the price on `D`. The payload's
+  `source_note` says so, and tells the model it has no knowledge after `D`.
+- Limitation: the model's training knowledge cannot be rewound. Treat results as a test of the
+  framework on the data, not as hindsight-free.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST | `/api/py/agent/backtest` | `{skill, symbol, year}` → ensures prices are loaded, fetches statements once, creates one pending row per Monday |
+| POST | `/api/py/agent/backtest/{id}/step` | runs the next pending Monday (one model call); `?retry_failed=true` also picks failed rows |
+| GET  | `/api/py/agent/backtest/{id}` | status, counts and all decisions |
+| GET  | `/api/py/agent/backtest/{id}/decision/{decision_id}` | one decision with the full input and output JSON |
+| GET  | `/api/py/agent/backtests?symbol=&skill=` | previous backtests |
+
+Tables (created on first use): `dbo.agent_backtests` (one per run, holds the raw statements JSON) and
+`dbo.agent_decisions` (one per Monday: status, recommendation, conviction, price, buy-below, target,
+stop, intrinsic values, margin of safety, headline, summary, full input/output JSON, tokens, errors).
+The page calls `/step` in a loop and updates as each Monday completes; it can be stopped and resumed,
+and failed Mondays retried. A 2026 run is ~42 model calls (roughly US$5-8 on Opus 5.5).
 
 Prices are saved to `dbo.stock_prices` (created automatically on first load):
 

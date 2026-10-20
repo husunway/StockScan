@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 
 type Item = { href: string; label: string; icon?: string; children?: Item[] };
 
@@ -19,15 +20,34 @@ const items: Item[] = [
     label: "AI agent",
     icon: "✦",
     children: [
-      { href: "/agent/run?skill=warren-buffett", label: "Warren Buffett" },
+      { href: "/agent/backtest?skill=warren-buffett", label: "Warren Buffett" },
+      { href: "/agent/run?skill=jamie-dimon", label: "Jamie Dimon" },
       { href: "/agent", label: "Skill library" },
     ],
   },
   { href: "/diagnosis", label: "Diagnosis", icon: "⚙" },
 ];
 
+// A child link is active when its path matches and, if it carries a query (e.g. ?skill=x),
+// that query matches too - so two skills under the same page highlight independently.
+function isActive(pathname: string, search: URLSearchParams, href: string, parentHref: string) {
+  const [path, query] = href.split("?");
+  if (path !== pathname || href === parentHref) return false;
+  if (!query) return !search.get("skill");
+  return [...new URLSearchParams(query)].every(([k, v]) => search.get(k) === v);
+}
+
 export default function Sidebar() {
+  return (
+    <Suspense fallback={<aside className="sidebar" />}>
+      <SidebarNav />
+    </Suspense>
+  );
+}
+
+function SidebarNav() {
   const pathname = usePathname();
+  const search = useSearchParams();
 
   return (
     <aside className="sidebar">
@@ -45,7 +65,7 @@ export default function Sidebar() {
               <Link
                 key={child.href}
                 href={child.href}
-                className={`sub ${pathname === child.href.split("?")[0] && child.href !== item.href ? "active" : ""}`}
+                className={`sub ${isActive(pathname, search, child.href, item.href) ? "active" : ""}`}
               >
                 {child.label}
               </Link>

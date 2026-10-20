@@ -9,7 +9,7 @@ import json
 import re
 import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -746,7 +746,7 @@ def _statement_rows(df, rows):
     return out
 
 
-def gather_fundamentals(symbol: str) -> dict:
+def gather_fundamentals(symbol: str, info_fields=INFO_FIELDS, statement_rows=STATEMENT_ROWS) -> dict:
     """Fundamentals and annual statements from Yahoo Finance (via yfinance). Missing data is omitted, never guessed."""
     import yfinance as yf
 
@@ -755,14 +755,28 @@ def gather_fundamentals(symbol: str) -> dict:
         info = t.info or {}
     except Exception:  # noqa: BLE001
         info = {}
-    fundamentals = {k: info[k] for k in INFO_FIELDS if info.get(k) is not None}
+    fundamentals = {k: info[k] for k in info_fields if info.get(k) is not None}
     statements = {}
     for key, attr in (("income", "income_stmt"), ("balance", "balance_sheet"), ("cashflow", "cashflow")):
         try:
-            statements[key] = _statement_rows(getattr(t, attr), STATEMENT_ROWS[key])
+            statements[key] = _statement_rows(getattr(t, attr), statement_rows.get(key, ()))
         except Exception:  # noqa: BLE001
             statements[key] = {}
     return {"fundamentals": fundamentals, "annual_statements": statements}
+
+
+def skill_data_requirements(skill: dict | None):
+    """Which fundamentals fields and statement rows to gather: taken from the skill's data-structure.json
+    input schema when present, otherwise the defaults."""
+    try:
+        props = skill["data_structure"]["input"]["properties"]
+        info_fields = tuple(props["fundamentals"]["properties"])
+        statement_rows = {k: tuple(v["properties"]) for k, v in props["annual_statements"]["properties"].items()}
+        if info_fields and statement_rows:
+            return info_fields, statement_rows
+    except (KeyError, TypeError):
+        pass
+    return INFO_FIELDS, STATEMENT_ROWS
 
 
 def price_snapshot(df) -> dict:
@@ -837,15 +851,16 @@ def validate_verdict(a: dict) -> list[str]:
     return warnings
 
 
-def gather_stock_data(symbol: str) -> dict:
+def gather_stock_data(symbol: str, skill: dict | None = None) -> dict:
     from datetime import date as _date
 
+    info_fields, statement_rows = skill_data_requirements(skill)
     df, price_source = load_price_history_any(symbol)
     data = {
         "symbol": symbol,
         "analysis_date": _date.today().isoformat(),
         "price": {**price_snapshot(df), "source": price_source},
-        **gather_fundamentals(symbol),
+        **gather_fundamentals(symbol, info_fields, statement_rows),
         "source_note": "fundamentals and annual_statements: Yahoo Finance via yfinance; values as reported by Yahoo, "
                        "statement figures in the company's financial currency.",
     }
@@ -913,7 +928,7 @@ def agent_run(req: AgentRunRequest):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
-    data = gather_stock_data(symbol)
+    data = gather_stock_data(symbol, skill)
     analysis, response = run_skill_with_claude(skill, data)
     usage = response.usage
     return {
@@ -930,6 +945,507 @@ def agent_run(req: AgentRunRequest):
             "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Agent backtests: run a skill as of every Monday of a year, seeing only data available then.
+# One row per Monday in dbo.agent_decisions; the page drives /step calls until none are pending.
+# ---------------------------------------------------------------------------
+BACKTESTS_TABLE = "dbo.agent_backtests"
+DECISIONS_TABLE = "dbo.agent_decisions"
+ANNUAL_LAG_DAYS, QUARTERLY_LAG_DAYS = 90, 45
+PROFILE_FIELDS = ("longName", "sector", "industry", "country", "currency", "financialCurrency", "longBusinessSummary")
+
+ENSURE_BACKTEST_TABLES_SQL = f"""
+IF OBJECT_ID('{BACKTESTS_TABLE}', 'U') IS NULL
+CREATE TABLE {BACKTESTS_TABLE} (
+    backtest_id   INT IDENTITY(1,1) PRIMARY KEY,
+    skill_id      NVARCHAR(60)  NOT NULL,
+    skill_version NVARCHAR(20)  NULL,
+    symbol        NVARCHAR(20)  NOT NULL,
+    [year]        INT           NOT NULL,
+    raw_data      NVARCHAR(MAX) NOT NULL,
+    created_at    DATETIME2     NOT NULL CONSTRAINT DF_agent_backtests_created DEFAULT SYSUTCDATETIME()
+);
+IF OBJECT_ID('{DECISIONS_TABLE}', 'U') IS NULL
+CREATE TABLE {DECISIONS_TABLE} (
+    decision_id          INT IDENTITY(1,1) PRIMARY KEY,
+    backtest_id          INT            NOT NULL,
+    skill_id             NVARCHAR(60)   NOT NULL,
+    symbol               NVARCHAR(20)   NOT NULL,
+    as_of_date           DATE           NOT NULL,
+    status               NVARCHAR(10)   NOT NULL,
+    recommendation       CHAR(4)        NULL,
+    conviction           NVARCHAR(10)   NULL,
+    current_price        DECIMAL(18, 4) NULL,
+    buy_below_price      DECIMAL(18, 4) NULL,
+    target_price         DECIMAL(18, 4) NULL,
+    stop_price           DECIMAL(18, 4) NULL,
+    intrinsic_value_low  DECIMAL(18, 4) NULL,
+    intrinsic_value_base DECIMAL(18, 4) NULL,
+    intrinsic_value_high DECIMAL(18, 4) NULL,
+    margin_of_safety_pct DECIMAL(9, 2)  NULL,
+    headline             NVARCHAR(500)  NULL,
+    summary              NVARCHAR(MAX)  NULL,
+    input_json           NVARCHAR(MAX)  NULL,
+    output_json          NVARCHAR(MAX)  NULL,
+    warnings_json        NVARCHAR(MAX)  NULL,
+    model                NVARCHAR(60)   NULL,
+    input_tokens         INT            NULL,
+    output_tokens        INT            NULL,
+    error                NVARCHAR(1000) NULL,
+    started_at           DATETIME2      NULL,
+    finished_at          DATETIME2      NULL,
+    CONSTRAINT UQ_agent_decisions UNIQUE (backtest_id, as_of_date)
+);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_symbol')
+CREATE INDEX IX_agent_decisions_symbol ON {DECISIONS_TABLE} (symbol, skill_id, as_of_date);
+"""
+
+DECISION_COLUMNS = (
+    "decision_id", "backtest_id", "skill_id", "symbol", "as_of_date", "status", "recommendation", "conviction",
+    "current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low", "intrinsic_value_base",
+    "intrinsic_value_high", "margin_of_safety_pct", "headline", "summary", "warnings_json", "model",
+    "input_tokens", "output_tokens", "error", "started_at", "finished_at",
+)
+
+
+def mondays(year: int, until: date) -> list[date]:
+    d = date(year, 1, 1)
+    d += timedelta(days=(7 - d.weekday()) % 7)  # first Monday
+    out = []
+    while d.year == year and d <= until:
+        out.append(d)
+        d += timedelta(days=7)
+    return out
+
+
+def _frame_to_dict(df) -> dict:
+    """yfinance statement frame -> {line_item: {period_end_iso: value}}, keeping every row."""
+    out = {}
+    if df is None or getattr(df, "empty", True):
+        return out
+    for row in df.index:
+        vals = {}
+        for col, v in df.loc[row].items():
+            key = col.date().isoformat() if hasattr(col, "date") else str(col)[:10]
+            vals[key] = num(v, 4)
+        out[str(row)] = vals
+    return out
+
+
+def fetch_backtest_raw(symbol: str) -> dict:
+    """One Yahoo pull per backtest: profile text, annual + quarterly statements (all rows), earnings dates."""
+    import yfinance as yf
+
+    t = yf.Ticker(symbol)
+    try:
+        info = t.info or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    profile = {k: info[k] for k in PROFILE_FIELDS if info.get(k) is not None}
+    statements = {}
+    for period, prefix in (("A", ""), ("Q", "quarterly_")):
+        statements[period] = {}
+        for key, attr in (("income", "income_stmt"), ("balance", "balance_sheet"), ("cashflow", "cashflow")):
+            try:
+                statements[period][key] = _frame_to_dict(getattr(t, prefix + attr))
+            except Exception:  # noqa: BLE001
+                statements[period][key] = {}
+    earnings_dates: list[str] = []
+    try:
+        ed = t.get_earnings_dates(limit=24)
+        if ed is not None and not ed.empty:
+            earnings_dates = sorted({str(ts)[:10] for ts in ed.index})
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "symbol": symbol,
+        "profile": profile,
+        "statements": statements,
+        "earnings_dates": earnings_dates,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def available_from(period_end: date, period_type: str, earnings_dates: list[str]) -> date:
+    """Date a fiscal period became public: the first earnings release after period end, else a fixed lag."""
+    lag = ANNUAL_LAG_DAYS if period_type == "A" else QUARTERLY_LAG_DAYS
+    for s in earnings_dates:
+        d = date.fromisoformat(s)
+        if period_end < d <= period_end + timedelta(days=lag + 60):
+            return d
+    return period_end + timedelta(days=lag)
+
+
+def visible_statements(raw: dict, as_of: date, period_type: str) -> dict:
+    """{stmt: {line_item: {period_end: value}}} restricted to periods reported before as_of."""
+    out: dict = {}
+    for stmt, rows in raw["statements"].get(period_type, {}).items():
+        out[stmt] = {}
+        for item, series in rows.items():
+            kept = {}
+            for pe, v in series.items():
+                try:
+                    pe_d = date.fromisoformat(pe)
+                except ValueError:
+                    continue
+                if available_from(pe_d, period_type, raw.get("earnings_dates", [])) < as_of:
+                    kept[pe] = v
+            if kept:
+                out[stmt][item] = kept
+    return out
+
+
+def _latest(series: dict):
+    for pe in sorted(series, reverse=True):
+        if series[pe] is not None:
+            return pe, series[pe]
+    return None, None
+
+
+def _ttm(series: dict):
+    vals = [series[pe] for pe in sorted(series, reverse=True)[:4]]
+    return sum(vals) if len(vals) == 4 and all(v is not None for v in vals) else None
+
+
+def derive_fundamentals(raw: dict, annual: dict, quarterly: dict, price: float | None):
+    """Rebuild quote-summary style fields from statements visible at the time (Yahoo's live ratios can't be rewound)."""
+    f = dict(raw.get("profile", {}))
+
+    def flow(stmt, item):  # income / cash-flow items: trailing four quarters, else latest fiscal year
+        v = _ttm(quarterly.get(stmt, {}).get(item, {}))
+        if v is not None:
+            return v, "ttm"
+        pe, v = _latest(annual.get(stmt, {}).get(item, {}))
+        return (v, f"fy{pe[:4]}") if v is not None else (None, None)
+
+    def stock(stmt, item):  # balance-sheet items: most recent period from either source
+        cands = [c for c in (_latest(src.get(stmt, {}).get(item, {})) for src in (quarterly, annual)) if c[0]]
+        return max(cands)[1] if cands else None
+
+    shares = stock("balance", "Ordinary Shares Number")
+    equity = stock("balance", "Stockholders Equity")
+    debt = stock("balance", "Total Debt")
+    cash = stock("balance", "Cash And Cash Equivalents")
+    cur_assets, cur_liab = stock("balance", "Current Assets"), stock("balance", "Current Liabilities")
+    revenue, basis = flow("income", "Total Revenue")
+    gross, _ = flow("income", "Gross Profit")
+    op_inc, _ = flow("income", "Operating Income")
+    net_inc, _ = flow("income", "Net Income")
+    ocf, _ = flow("cashflow", "Operating Cash Flow")
+    fcf, _ = flow("cashflow", "Free Cash Flow")
+    dividends, _ = flow("cashflow", "Cash Dividends Paid")
+
+    if price:
+        f["currentPrice"] = round(price, 4)
+    if shares:
+        f["sharesOutstanding"] = shares
+        if price:
+            f["marketCap"] = round(price * shares, 2)
+    if net_inc is not None and shares:
+        eps = net_inc / shares
+        f["trailingEps"] = round(eps, 4)
+        if price and eps > 0:
+            f["trailingPE"] = round(price / eps, 2)
+    if equity and shares:
+        bv = equity / shares
+        f["bookValue"] = round(bv, 4)
+        if price and bv > 0:
+            f["priceToBook"] = round(price / bv, 3)
+    if net_inc is not None and equity:
+        f["returnOnEquity"] = round(net_inc / equity, 4)
+    if revenue:
+        f["totalRevenue"] = revenue
+        for key, val in (("grossMargins", gross), ("operatingMargins", op_inc), ("profitMargins", net_inc)):
+            if val is not None:
+                f[key] = round(val / revenue, 4)
+    if debt is not None:
+        f["totalDebt"] = debt
+        if equity:
+            f["debtToEquity"] = round(debt / equity * 100, 2)
+    if cash is not None:
+        f["totalCash"] = cash
+    if cur_assets and cur_liab:
+        f["currentRatio"] = round(cur_assets / cur_liab, 3)
+    if ocf is not None:
+        f["operatingCashflow"] = ocf
+    if fcf is not None:
+        f["freeCashflow"] = fcf
+    if dividends and net_inc and net_inc > 0:
+        f["payoutRatio"] = round(-dividends / net_inc, 4)
+        if shares and price:
+            f["dividendYield"] = round(-dividends / shares / price, 4)
+
+    basis_text = "trailing four quarters" if basis == "ttm" else f"latest visible fiscal year ({basis})" if basis else "no statements"
+    note = (f"Fundamentals (market cap, EPS, P/E, book value, ROE, margins, debt/equity, cash flows, payout) are DERIVED "
+            f"from statements visible at the analysis date using {basis_text}; dividendYield is a fraction. "
+            f"Yahoo's live quote-summary ratios were not used because they cannot be rewound to a past date.")
+    return f, note
+
+
+def point_in_time_payload(raw: dict, prices_df, as_of: date, skill: dict) -> dict:
+    info_fields, statement_rows = skill_data_requirements(skill)
+    hist = prices_df[prices_df["date"] < as_of.isoformat()]
+    if len(hist) < 30:
+        raise HTTPException(status_code=422, detail=f"Fewer than 30 price rows before {as_of}; load more history first.")
+    price = float(hist["close"].iloc[-1])
+    annual = visible_statements(raw, as_of, "A")
+    quarterly = visible_statements(raw, as_of, "Q")
+    fundamentals, note = derive_fundamentals(raw, annual, quarterly, price)
+    fundamentals = {k: v for k, v in fundamentals.items() if k in info_fields}
+    annual_rows = {
+        stmt: {
+            item: {pe[:4]: v for pe, v in annual.get(stmt, {}).get(item, {}).items()}
+            for item in rows if item in annual.get(stmt, {})
+        }
+        for stmt, rows in statement_rows.items()
+    }
+    years = sorted({pe[:4] for s in annual.values() for ser in s.values() for pe in ser})
+    quarters = sorted({pe for s in quarterly.values() for ser in s.values() for pe in ser})
+    return {
+        "symbol": raw["symbol"],
+        "analysis_date": as_of.isoformat(),
+        "price": {**price_snapshot(hist), "source": "database"},
+        "fundamentals": fundamentals,
+        "annual_statements": annual_rows,
+        "source_note": (
+            f"POINT-IN-TIME BACKTEST. Today is {as_of.isoformat()}. Prices run through {hist['date'].iloc[-1]}. "
+            f"Annual statements visible: fiscal years {', '.join(years) if years else 'none'}; quarterly periods visible: "
+            f"{', '.join(quarters) if quarters else 'none'} (a period is visible only once reported - actual earnings-release "
+            f"dates where known, otherwise {ANNUAL_LAG_DAYS}-day annual / {QUARTERLY_LAG_DAYS}-day quarterly lags). {note} "
+            f"You have no knowledge of anything after {as_of.isoformat()}; do not use it."
+        ),
+    }
+
+
+class BacktestRequest(BaseModel):
+    skill: str = Field(..., min_length=1, max_length=60)
+    symbol: str = Field(..., min_length=1, max_length=20)
+    year: int = Field(2026, ge=2000, le=2100)
+
+
+def _decision_dict(row) -> dict:
+    d = dict(zip(DECISION_COLUMNS, row))
+    for k in ("current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low",
+              "intrinsic_value_base", "intrinsic_value_high", "margin_of_safety_pct"):
+        d[k] = num(d[k], 4)
+    for k in ("as_of_date", "started_at", "finished_at"):
+        d[k] = d[k].isoformat() if d[k] is not None else None
+    d["warnings"] = json.loads(d.pop("warnings_json") or "[]")
+    return d
+
+
+def _decision_counts(cur, backtest_id: int) -> dict:
+    cur.execute(f"SELECT status, COUNT(*) FROM {DECISIONS_TABLE} WHERE backtest_id = %s GROUP BY status", (backtest_id,))
+    counts = {"pending": 0, "running": 0, "done": 0, "failed": 0}
+    for status, n in cur.fetchall():
+        counts[status] = n
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def _backtest_meta(cur, backtest_id: int) -> dict:
+    cur.execute(
+        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at FROM {BACKTESTS_TABLE} WHERE backtest_id = %s",
+        (backtest_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Backtest not found")
+    return {"backtest_id": row[0], "skill_id": row[1], "skill_version": row[2], "symbol": row[3], "year": row[4],
+            "created_at": row[5].isoformat(), "counts": _decision_counts(cur, backtest_id)}
+
+
+def _decisions(cur, backtest_id: int) -> list[dict]:
+    cur.execute(
+        f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE backtest_id = %s ORDER BY as_of_date",
+        (backtest_id,),
+    )
+    return [_decision_dict(r) for r in cur.fetchall()]
+
+
+@app.get("/api/py/agent/backtests")
+def list_backtests(symbol: str | None = None, skill: str | None = None):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_BACKTEST_TABLES_SQL)
+        conn.commit()
+        where, params = [], []
+        if symbol:
+            where.append("b.symbol = %s"); params.append(normalize_symbol(symbol))
+        if skill:
+            where.append("b.skill_id = %s"); params.append(skill.strip().lower())
+        cur.execute(
+            f"SELECT b.backtest_id, b.skill_id, b.symbol, b.[year], b.created_at, "
+            f"SUM(CASE WHEN d.status = 'done' THEN 1 ELSE 0 END), SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END), COUNT(d.decision_id) "
+            f"FROM {BACKTESTS_TABLE} b LEFT JOIN {DECISIONS_TABLE} d ON d.backtest_id = b.backtest_id "
+            + (f"WHERE {' AND '.join(where)} " if where else "")
+            + "GROUP BY b.backtest_id, b.skill_id, b.symbol, b.[year], b.created_at ORDER BY b.created_at DESC",
+            tuple(params),
+        )
+        return {"backtests": [
+            {"backtest_id": r[0], "skill_id": r[1], "symbol": r[2], "year": r[3], "created_at": r[4].isoformat(),
+             "done": r[5] or 0, "failed": r[6] or 0, "total": r[7]}
+            for r in cur.fetchall()
+        ]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/agent/backtest")
+def create_backtest(req: BacktestRequest):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
+    skill = get_skill(req.skill.strip().lower())
+    symbol = normalize_symbol(req.symbol)
+    dates = mondays(req.year, date.today())
+    if not dates:
+        raise HTTPException(status_code=422, detail=f"No Mondays in {req.year} on or before today.")
+
+    # Make sure two years of prices are stored, then pull the statements once.
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_TABLE_SQL)
+        cur.execute(f"SELECT COUNT(*), MIN(trade_date) FROM {TABLE} WHERE symbol = %s", (symbol,))
+        count, first = cur.fetchone()
+    finally:
+        conn.close()
+    if count < 250 or (first and first > date(req.year - 1, 1, 1)):
+        save_prices(symbol, fetch_history(symbol))
+    raw = fetch_backtest_raw(symbol)
+    if not raw["statements"]["A"].get("income"):
+        raise HTTPException(status_code=404, detail=f"Yahoo Finance returned no financial statements for {symbol}.")
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_BACKTEST_TABLES_SQL)
+        cur.execute(
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s)",
+            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw)),
+        )
+        backtest_id = cur.fetchone()[0]
+        cur.executemany(
+            f"INSERT INTO {DECISIONS_TABLE} (backtest_id, skill_id, symbol, as_of_date, status) VALUES (%s, %s, %s, %s, 'pending')",
+            [(backtest_id, skill["id"], symbol, d) for d in dates],
+        )
+        conn.commit()
+        return {**_backtest_meta(cur, backtest_id), "decisions": _decisions(cur, backtest_id)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/agent/backtest/{backtest_id}")
+def get_backtest(backtest_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        return {**_backtest_meta(cur, backtest_id), "decisions": _decisions(cur, backtest_id)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}")
+def get_decision(backtest_id: int, decision_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT {', '.join(DECISION_COLUMNS)}, input_json, output_json FROM {DECISIONS_TABLE} "
+            f"WHERE backtest_id = %s AND decision_id = %s",
+            (backtest_id, decision_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Decision not found")
+        d = _decision_dict(row[: len(DECISION_COLUMNS)])
+        d["input"] = json.loads(row[-2]) if row[-2] else None
+        d["output"] = json.loads(row[-1]) if row[-1] else None
+        return d
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/agent/backtest/{backtest_id}/step")
+def backtest_step(backtest_id: int, retry_failed: bool = False):
+    """Run the next pending Monday (one Claude call per request so it fits a serverless time limit)."""
+    # Phase 1: claim a decision and load what it needs, then release the connection for the model call.
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT skill_id, symbol, raw_data FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Backtest not found")
+        skill_id, symbol, raw_json = row
+        statuses = "('pending', 'failed')" if retry_failed else "('pending')"
+        cur.execute(
+            f"SELECT TOP 1 decision_id, as_of_date FROM {DECISIONS_TABLE} "
+            f"WHERE backtest_id = %s AND status IN {statuses} ORDER BY as_of_date",
+            (backtest_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"done": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
+        decision_id, as_of = row
+        cur.execute(
+            f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, started_at = SYSUTCDATETIME() WHERE decision_id = %s",
+            (decision_id,),
+        )
+        conn.commit()
+        prices_df = load_prices_df(cur, symbol)
+    finally:
+        conn.close()
+
+    skill = get_skill(skill_id)
+    raw = json.loads(raw_json)
+    result: dict = {}
+    error: str | None = None
+    payload = None
+    try:
+        payload = point_in_time_payload(raw, prices_df, as_of, skill)
+        analysis, response = run_skill_with_claude(skill, payload)
+        warnings = validate_verdict(analysis)
+        result = {"analysis": analysis, "warnings": warnings, "model": response.model,
+                  "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+    except HTTPException as e:
+        error = str(e.detail)[:1000]
+
+    # Phase 2: persist the outcome.
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        if error:
+            cur.execute(
+                f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = %s, input_json = %s, finished_at = SYSUTCDATETIME() "
+                f"WHERE decision_id = %s",
+                (error, json.dumps(payload) if payload else None, decision_id),
+            )
+        else:
+            a = result["analysis"]
+            cur.execute(
+                f"UPDATE {DECISIONS_TABLE} SET status = 'done', recommendation = %s, conviction = %s, current_price = %s, "
+                f"buy_below_price = %s, target_price = %s, stop_price = %s, intrinsic_value_low = %s, intrinsic_value_base = %s, "
+                f"intrinsic_value_high = %s, margin_of_safety_pct = %s, headline = %s, summary = %s, input_json = %s, "
+                f"output_json = %s, warnings_json = %s, model = %s, input_tokens = %s, output_tokens = %s, "
+                f"finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
+                (a["recommendation"], a["conviction"], a.get("current_price"), a.get("buy_below_price"),
+                 a.get("target_price"), a.get("stop_price"), a.get("intrinsic_value_low"), a.get("intrinsic_value_base"),
+                 a.get("intrinsic_value_high"), a.get("margin_of_safety_pct"), (a.get("headline") or "")[:500],
+                 a.get("summary"), json.dumps(payload), json.dumps(a), json.dumps(result["warnings"]),
+                 result["model"], result["input_tokens"], result["output_tokens"], decision_id),
+            )
+        conn.commit()
+        cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
+        decision = _decision_dict(cur.fetchone())
+        counts = _decision_counts(cur, backtest_id)
+    finally:
+        conn.close()
+    return {"done": counts["pending"] == 0 and counts["running"] == 0, "decision": decision, "counts": counts}
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY"}

@@ -267,6 +267,28 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
   font-size: 0.75rem; overflow: auto; max-height: 420px;
 }
 .disclaimer { font-size: 0.8rem; }
+.grade {
+  display: inline-block; margin-left: 8px; padding: 2px 10px; border-radius: 999px;
+  font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: #fff; background: var(--muted); vertical-align: middle;
+}
+.grade-fortress, .grade-solid { background: #0ca30c; }
+.grade-adequate { background: #c98500; }
+.grade-stretched, .grade-fragile { background: #d03b3b; }
+
+/* Backtest */
+.progress-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+.progress { flex: 1; min-width: 160px; height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }
+.progress-bar { height: 100%; background: var(--accent); transition: width 0.3s; }
+.progress-text { font-size: 0.85rem; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+.spinner.inline { width: 12px; height: 12px; }
+.rec-pill { padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; color: #fff; }
+.rec-pill.rec-buy { background: #0ca30c; }
+.rec-pill.rec-hold { background: #c98500; }
+.rec-pill.rec-sell { background: #d03b3b; }
+.row-running td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.row-failed td { opacity: 0.8; }
+.row-pending td { color: var(--muted); }
 .agent-form { align-items: flex-end; margin-bottom: 4px; }
 .agent-form input {
   min-width: 200px; padding: 8px 10px; font-size: 0.95rem;
