@@ -869,30 +869,67 @@ def gather_stock_data(symbol: str, skill: dict | None = None) -> dict:
     return data
 
 
+def claude_provider() -> str | None:
+    """'foundry' when Microsoft Foundry credentials are set, 'anthropic' for the Claude API, None if neither."""
+    if os.environ.get("ANTHROPIC_FOUNDRY_API_KEY") and (
+        os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE") or os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
+    ):
+        return "foundry"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return None
+
+
+def require_claude() -> str:
+    provider = claude_provider()
+    if not provider:
+        raise HTTPException(
+            status_code=500,
+            detail="No Claude provider configured. Set ANTHROPIC_FOUNDRY_API_KEY + ANTHROPIC_FOUNDRY_RESOURCE "
+                   "(Microsoft Foundry) or ANTHROPIC_API_KEY (Claude API).",
+        )
+    return provider
+
+
+def make_claude_client(provider: str):
+    import anthropic
+
+    if provider == "foundry":
+        # Reads ANTHROPIC_FOUNDRY_API_KEY and ANTHROPIC_FOUNDRY_RESOURCE / ANTHROPIC_FOUNDRY_BASE_URL itself.
+        return anthropic.AnthropicFoundry(timeout=240.0, max_retries=1)
+    return anthropic.Anthropic(timeout=240.0, max_retries=1)
+
+
 def run_skill_with_claude(skill: dict, data: dict):
     """One structured-output call: skill instructions as the (cached) system prompt, gathered data as the user turn."""
     import anthropic
 
+    provider = require_claude()
     model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
     schema = skill.get("output_schema") or STOCK_VERDICT_SCHEMA  # skill's data-structure.json wins
-    client = anthropic.Anthropic(timeout=240.0, max_retries=1)
+    client = make_claude_client(provider)
+    request = dict(
+        model=model,
+        max_tokens=16000,
+        system=[{"type": "text", "text": skill["instructions"], "cache_control": {"type": "ephemeral"}}],
+        output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
+        messages=[{
+            "role": "user",
+            "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON. "
+                       "In key_metrics.source and within sections, cite the specific statement and period each "
+                       "figure came from (for example 'annual_statements.cashflow.Free Cash Flow 2025', "
+                       "'fundamentals.returnOnEquity' or 'price.ma200').\n\n"
+                       + json.dumps(data, default=str, sort_keys=True),
+        }],
+    )
     try:
-        response = client.beta.messages.create(
-            model=model,
-            max_tokens=16000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            system=[{"type": "text", "text": skill["instructions"], "cache_control": {"type": "ephemeral"}}],
-            output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
-            messages=[{
-                "role": "user",
-                "content": f"Apply the skill to {data['symbol']} using only the data below and return the JSON. "
-                           "In key_metrics.source and within sections, cite the specific statement and period each "
-                           "figure came from (for example 'annual_statements.cashflow.Free Cash Flow 2025', "
-                           "'fundamentals.returnOnEquity' or 'price.ma200').\n\n"
-                           + json.dumps(data, default=str, sort_keys=True),
-            }],
-        )
+        if provider == "foundry":
+            # Foundry has no server-side refusal fallback; plain Messages API.
+            response = client.messages.create(**request)
+        else:
+            response = client.beta.messages.create(
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request
+            )
     except anthropic.AuthenticationError as e:
         raise HTTPException(status_code=502, detail="Anthropic API key was rejected.") from e
     except anthropic.RateLimitError as e:
@@ -927,8 +964,7 @@ def agent_skill(skill_id: str):
 
 @app.post("/api/py/agent/run")
 def agent_run(req: AgentRunRequest):
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
+    require_claude()
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
     data = gather_stock_data(symbol, skill)
@@ -941,6 +977,7 @@ def agent_run(req: AgentRunRequest):
         "warnings": validate_verdict(analysis),
         "data_used": data,
         "model": response.model,
+        "provider": claude_provider(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "usage": {
             "input_tokens": usage.input_tokens,
@@ -1541,8 +1578,7 @@ def list_backtests(symbol: str | None = None, skill: str | None = None):
 
 @app.post("/api/py/agent/backtest")
 def create_backtest(req: BacktestRequest):
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured.")
+    require_claude()
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
     dates = mondays(req.year, date.today())[: req.weeks]
@@ -1748,10 +1784,12 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     return {"done": counts["pending"] == 0 and counts["running"] == 0, "decision": decision, "counts": counts}
 
 
-SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "BLOB_READ_WRITE_TOKEN"}
+SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",
+               "BLOB_READ_WRITE_TOKEN"}
 CONFIG_VARS = (
     "AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD",
     "AUTH_USERNAME", "AUTH_PASSWORD", "AUTH_SECRET",
+    "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL",
     "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
     "BLOB_READ_WRITE_TOKEN", "BLOB_ACCESS",
 )
@@ -1775,6 +1813,8 @@ def diagnosis():
 
     return {
         "variables": variables,
+        "claude_provider": claude_provider() or "not configured",
+        "claude_model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
         "env_local_present": os.path.isfile(".env.local"),
         "working_directory": os.getcwd(),
         "python_version": sys.version.split()[0],

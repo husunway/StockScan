@@ -80,7 +80,11 @@ A run:
    plus a price snapshot (52-week range, 200-day average, 1-year return, volatility, drawdown)
    from the stored prices, or from Yahoo if the symbol is not loaded.
 2. Calls Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`) with the skill's
-   instructions as the system prompt and the data as the user message.
+   instructions as the system prompt and the data as the user message. The provider is **Microsoft
+   Foundry** when `ANTHROPIC_FOUNDRY_API_KEY` and `ANTHROPIC_FOUNDRY_RESOURCE` (or `_BASE_URL`) are set
+   (same Anthropic SDK, `AnthropicFoundry` client; structured outputs, effort and prompt caching all
+   apply; the server-side refusal fallback is not available there), otherwise the Anthropic API via
+   `ANTHROPIC_API_KEY`. The Diagnosis page shows which provider is active.
 3. Requires a fixed JSON structure (structured outputs, `STOCK_VERDICT_SCHEMA`): recommendation
    BUY/HOLD/SELL, conviction, intrinsic value low/base/high, buy-below price, target price, stop
    price, summary, checklist, sections, key metrics with source fields, valuation inputs, risks,
@@ -185,8 +189,10 @@ AZURE_SQL_PASSWORD=
 AUTH_USERNAME=
 AUTH_PASSWORD=
 AUTH_SECRET=        # random, e.g. node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-ANTHROPIC_API_KEY=  # for the AI pages
-ANTHROPIC_MODEL=    # optional, default claude-opus-5-5
+ANTHROPIC_FOUNDRY_API_KEY=   # Claude via Microsoft Foundry (preferred when set) ...
+ANTHROPIC_FOUNDRY_RESOURCE=  # ... resource name from https://<resource>.services.ai.azure.com/anthropic/
+ANTHROPIC_API_KEY=           # or the Anthropic Claude API, used only when the Foundry variables are absent
+ANTHROPIC_MODEL=             # optional, default claude-opus-5-5 (on Foundry: the deployed model name)
 BLOB_READ_WRITE_TOKEN=  # Vercel Blob store for backtest PDFs (set automatically when the store is connected on Vercel)
 BLOB_ACCESS=private     # or public; must match the store
 ```

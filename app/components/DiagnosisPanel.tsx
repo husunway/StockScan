@@ -6,6 +6,8 @@ type Variable = { name: string; set: boolean; value: string | null };
 
 type Diagnosis = {
   variables: Variable[];
+  claude_provider?: string;
+  claude_model?: string;
   env_local_present: boolean;
   working_directory: string;
   python_version: string;
@@ -91,6 +93,10 @@ export default function DiagnosisPanel() {
           <div className="table-wrap">
             <table className="table">
               <tbody>
+                <tr>
+                  <td>Claude provider</td>
+                  <td>{data.claude_provider ?? "—"}{data.claude_model ? ` · model ${data.claude_model}` : ""}</td>
+                </tr>
                 <tr>
                   <td>.env.local present</td>
                   <td>{data.env_local_present ? "yes" : "no"}</td>
