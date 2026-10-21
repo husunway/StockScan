@@ -22,6 +22,7 @@ const items: Item[] = [
     children: [
       { href: "/agent/backtest?skill=warren-buffett", label: "Warren Buffett" },
       { href: "/agent/run?skill=jamie-dimon", label: "Jamie Dimon" },
+      { href: "/agent/backtest?skill=john-murphy", label: "John Murphy" },
       { href: "/agent", label: "Skill library" },
     ],
   },

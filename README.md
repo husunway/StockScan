@@ -56,7 +56,26 @@ skills/
     SKILL.md             # fortress balance sheet, risk discipline, through-the-cycle earnings, stress test
     data-structure.json  # adds liquidity/leverage/coverage fields, governance risk scores, debt flows;
                          # output adds balance_sheet grade and a 3-scenario stress_test
+
+  john-murphy/
+    SKILL.md             # Murphy's "Technical Analysis of the Financial Markets": Dow Theory, trend, S/R, MAs,
+                         # oscillators, volume, patterns, Fibonacci, trading rules; data_source: tech
+    data-structure.json  # documents every TECH_ table/field the agent receives + the technical output schema
 ```
+
+**Technical skills (`data_source: tech`)** read nothing online and calculate nothing at run time. All of
+their data is computed once per symbol from stored daily prices by `POST /api/py/tech/prepare` (or
+automatically when a run starts if missing/stale) and written to nine `TECH_` tables:
+`TECH_PRICE_DAILY`, `TECH_PRICE_WEEKLY`, `TECH_INDICATOR_DAILY` (SMA 5-200, EMA, MACD, RSI, stochastics,
+Bollinger, ATR, OBV, volume ratio, ADX/DI, 52-week range, returns, volatility), `TECH_TREND_DAILY`
+(primary/intermediate/short trend, strength, swing structure), `TECH_PIVOT` (swing highs/lows with the
+date they were confirmed), `TECH_LEVEL` (support/resistance clusters and Fibonacci levels as of each
+day), `TECH_SIGNAL` (crosses, zone entries, breakouts, volume spikes, divergences), `TECH_PATTERN`
+(double top/bottom, head and shoulders with neckline, confirmation date and measured-move target) and
+`TECH_LOAD` (audit). A run reads rows dated on or before the analysis date; pivots and patterns are
+included only from their confirmation date, so the agent never sees anything newer than "today".
+`GET /api/py/tech/{symbol}` reports what is stored. The AI agent › John Murphy menu item opens the
+weekly runner with this skill; its page shows the TECH_ status with a *Prepare technical data* button.
 
 The frontmatter describes the skill; the markdown body becomes Claude's system prompt.
 `data-structure.json` does two jobs: its `input` schema **drives data gathering** (the API fetches

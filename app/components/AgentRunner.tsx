@@ -42,7 +42,18 @@ type Analysis = {
   risks: string[];
   assumptions: string[];
   data_gaps: string[];
+  // Technical skills add these; rendered generically.
+  trend_assessment?: Record<string, unknown>;
+  trade_plan?: Record<string, unknown>;
+  key_levels?: Record<string, unknown>[];
+  indicator_readings?: Record<string, unknown>[];
+  patterns_identified?: Record<string, unknown>[];
 };
+
+const OBJECT_BLOCKS = ["trend_assessment", "trade_plan"] as const;
+const LIST_BLOCKS = ["key_levels", "indicator_readings", "patterns_identified"] as const;
+const show = (v: unknown) =>
+  v === null || v === undefined ? "—" : typeof v === "boolean" ? (v ? "yes" : "no") : typeof v === "number" ? v.toLocaleString(undefined, { maximumFractionDigits: 2 }) : String(v);
 
 const label = (key: string) => key.replace(/_/g, " ").replace(/\bpct\b/g, "%").replace(/^\w/, (c) => c.toUpperCase());
 const cell = (key: string, v: string | number | null) =>
@@ -308,6 +319,50 @@ export default function AgentRunner() {
             </>
           )}
 
+          {OBJECT_BLOCKS.map((k) => {
+            const block = a[k];
+            if (!block || typeof block !== "object") return null;
+            return (
+              <section key={k}>
+                <h2 className="section-title">{label(k)}</h2>
+                <div className="table-wrap">
+                  <table className="table">
+                    <tbody>
+                      {Object.entries(block).map(([kk, v]) => (
+                        <tr key={kk}>
+                          <td>{label(kk)}</td>
+                          <td className="wrap">{show(v)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            );
+          })}
+          {LIST_BLOCKS.map((k) => {
+            const items = a[k];
+            if (!Array.isArray(items) || items.length === 0) return null;
+            const cols = Array.from(new Set(items.flatMap((it) => Object.keys(it))));
+            return (
+              <section key={k}>
+                <h2 className="section-title">{label(k)}</h2>
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>{cols.map((c) => <th key={c}>{label(c)}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {items.map((it, i) => (
+                        <tr key={i}>{cols.map((c) => <td key={c} className="wrap">{show(it[c])}</td>)}</tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            );
+          })}
+
           <h2 className="section-title">Checklist</h2>
           <div className="table-wrap">
             <table className="table">
@@ -343,19 +398,23 @@ export default function AgentRunner() {
             </section>
           ))}
 
-          <h2 className="section-title">Valuation inputs</h2>
-          <div className="table-wrap">
-            <table className="table">
-              <tbody>
-                {Object.entries(a.valuation).map(([k, v]) => (
-                  <tr key={k}>
-                    <td>{label(k)}</td>
-                    <td className="wrap">{cell(k, v)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {a.valuation && Object.keys(a.valuation).length > 0 && (
+            <>
+              <h2 className="section-title">Valuation inputs</h2>
+              <div className="table-wrap">
+                <table className="table">
+                  <tbody>
+                    {Object.entries(a.valuation).map(([k, v]) => (
+                      <tr key={k}>
+                        <td>{label(k)}</td>
+                        <td className="wrap">{cell(k, v)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
 
           <h2 className="section-title">Key metrics</h2>
           <div className="table-wrap">

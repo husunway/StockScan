@@ -4,7 +4,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-type Skill = { id: string; name: string; description: string; version: string };
+type Skill = { id: string; name: string; description: string; version: string; data_source?: string };
+type TechStatus = {
+  symbol: string;
+  available: boolean;
+  fresh?: boolean;
+  computed_at?: string;
+  first_trade_date?: string;
+  last_trade_date?: string;
+  latest_price_date?: string | null;
+  price_rows?: number;
+  counts?: Record<string, number>;
+  tables?: string[];
+  log?: LogEntry[];
+};
 type Counts = { pending: number; running: number; done: number; failed: number; cancelled: number; total: number };
 type LogEntry = { t: string; elapsed_s: number; level: "info" | "warn" | "error"; message: string };
 type Diagnostics = {
@@ -287,7 +300,42 @@ export default function BacktestPanel() {
   const [diagError, setDiagError] = useState<string | null>(null);
   const [clientLog, setClientLog] = useState<LogEntry[]>([]);
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
+  const [techStatus, setTechStatus] = useState<TechStatus | null>(null);
   const [preparing, setPreparing] = useState(false);
+
+  const loadTechStatus = useCallback(async (sym: string) => {
+    if (!sym) return setTechStatus(null);
+    try {
+      setTechStatus(await api<TechStatus>(`/api/py/tech/${encodeURIComponent(sym)}`));
+    } catch {
+      setTechStatus(null);
+    }
+  }, []);
+
+  async function prepareTech() {
+    const s = symbol.trim();
+    if (!s) return;
+    setPreparing(true);
+    setError(null);
+    setClientLog([]);
+    note(`Computing technical data for ${s}: indicators, trend, pivots, levels, signals, patterns -> TECH_ tables ...`);
+    try {
+      const r = await api<TechStatus>("/api/py/tech/prepare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: s }),
+      });
+      for (const e of r.log ?? []) setClientLog((prev) => [...prev, e]);
+      note("Technical data ready in the TECH_ tables");
+      await loadTechStatus(s);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Technical data preparation failed";
+      setError(msg);
+      note(msg, "error");
+    } finally {
+      setPreparing(false);
+    }
+  }
   const stopRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const [stopping, setStopping] = useState(false);
@@ -378,10 +426,11 @@ export default function BacktestPanel() {
     const sym = symbol.trim();
     const t = setTimeout(() => {
       loadDataStatus(sym);
+      loadTechStatus(sym);
       loadPrevious(sym, skillId);
     }, 400);
     return () => clearTimeout(t);
-  }, [symbol, skillId, loadPrevious, loadDataStatus]);
+  }, [symbol, skillId, loadPrevious, loadDataStatus, loadTechStatus]);
 
   async function loadLastRun() {
     const sym = symbol.trim();
@@ -569,7 +618,28 @@ export default function BacktestPanel() {
         Each Monday is one model call (30–90 s); you can stop and resume.
       </p>
 
-      {symbol.trim() && (
+      {symbol.trim() && skill?.data_source === "tech" && (
+        <div className="data-status">
+          <span className="stat-label">Technical data for {symbol.trim()} (TECH_ tables)</span>
+          {techStatus?.available ? (
+            <span>
+              <span className={`dot ${techStatus.fresh ? "ok" : "down"}`} /> computed {techStatus.computed_at?.slice(0, 16).replace("T", " ")} UTC ·
+              {techStatus.price_rows} trading days {techStatus.first_trade_date} → {techStatus.last_trade_date}
+              {!techStatus.fresh && techStatus.latest_price_date && <> · stale: prices now to {techStatus.latest_price_date}</>}
+              {techStatus.counts && (
+                <> · {Object.entries(techStatus.counts).map(([k, v]) => `${k.replace("TECH_", "").toLowerCase()} ${v}`).join(", ")}</>
+              )}
+            </span>
+          ) : (
+            <span><span className="dot" /> not computed yet - it will be computed when a run starts, or prepare now</span>
+          )}
+          <button type="button" className="btn small ghost" disabled={preparing || running} onClick={prepareTech}>
+            {preparing ? "Computing…" : techStatus?.available ? "Recompute technical data" : "Prepare technical data"}
+          </button>
+        </div>
+      )}
+
+      {symbol.trim() && skill?.data_source !== "tech" && (
         <div className="data-status">
           <span className="stat-label">Data bundle for {symbol.trim()}</span>
           {dataStatus?.available ? (

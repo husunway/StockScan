@@ -607,6 +607,7 @@ def parse_skill(path: Path) -> dict:
         "version": meta.get("version", ""),
         "inputs": meta.get("inputs", "symbol"),
         "output": meta.get("output", "stock-verdict"),
+        "data_source": meta.get("data_source", "fundamentals"),
         "path": f"skills/{skill_id}/SKILL.md",
         "data_structure_path": f"skills/{skill_id}/data-structure.json" if data_structure else None,
         "output_schema": (data_structure or {}).get("output"),
@@ -1082,7 +1083,7 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
 
 @app.get("/api/py/agent/skills")
 def agent_skills():
-    keys = ("id", "name", "description", "version", "inputs", "output", "path", "data_structure_path")
+    keys = ("id", "name", "description", "version", "inputs", "output", "data_source", "path", "data_structure_path")
     return {"skills": [{k: s[k] for k in keys} for s in list_skills()], "directory": str(SKILLS_DIR)}
 
 
@@ -1098,7 +1099,12 @@ def agent_run(req: AgentRunRequest):
     symbol = normalize_symbol(req.symbol)
     log = RunLog(DECISIONS_TABLE, "decision_id")  # not persisted for single runs; returned with the result
     claude_hello(log)
-    data = gather_stock_data(symbol, skill, log=log)
+    if skill.get("data_source") == "tech":
+        ensure_technicals(symbol, log)
+        data, _refs = load_tech_bundle(symbol, date.today(), skill)
+        log.step(f"Technical data as of today ({data['today']['trade_date']}) read from TECH_ tables")
+    else:
+        data = gather_stock_data(symbol, skill, log=log)
     analysis, response = run_skill_with_claude(skill, data, log)
     archive_run_json(f"runs/{skill['id']}/{symbol}/{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')}", data, analysis, log)
     usage = response.usage
@@ -1660,6 +1666,21 @@ def build_decision_pdf(skill: dict, symbol: str, as_of: str, analysis: dict, ref
                 pct(s.get("price_impact_pct")), "yes" if s.get("survives_without_capital_raise") else "no")
                for s in analysis["stress_test"]], (16, 52, 12, 10, 10))
 
+    # Skill-specific blocks (technical skills): objects as key/value tables, lists of objects as tables.
+    for key in ("trend_assessment", "trade_plan"):
+        block = analysis.get(key)
+        if isinstance(block, dict) and block:
+            heading(key.replace("_", " ").capitalize())
+            table(("Item", "Value"), [(k.replace("_", " "), "-" if v is None else str(v)) for k, v in block.items()], (35, 65))
+    for key in ("key_levels", "indicator_readings", "patterns_identified"):
+        items = analysis.get(key)
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            cols = list(items[0].keys())
+            heading(key.replace("_", " ").capitalize())
+            table(tuple(c.replace("_", " ") for c in cols),
+                  [tuple("-" if r.get(c) is None else str(r.get(c)) for c in cols) for r in items],
+                  tuple([max(8, 100 // len(cols))] * len(cols)))
+
     heading("Checklist")
     table(("Criterion", "Verdict", "Evidence"),
           [(c.get("criterion", ""), c.get("verdict", ""), c.get("evidence", "")) for c in analysis.get("checklist", [])],
@@ -1669,9 +1690,10 @@ def build_decision_pdf(skill: dict, symbol: str, as_of: str, analysis: dict, ref
         heading(s.get("title", ""))
         para(s.get("content", ""))
 
-    heading("Valuation inputs")
-    val = analysis.get("valuation", {}) or {}
-    table(("Input", "Value"), [(k.replace("_", " "), "-" if v is None else str(v)) for k, v in val.items()], (35, 65))
+    val = analysis.get("valuation") or {}
+    if val:
+        heading("Valuation inputs")
+        table(("Input", "Value"), [(k.replace("_", " "), "-" if v is None else str(v)) for k, v in val.items()], (35, 65))
 
     heading("Key metrics")
     table(("Metric", "Value", "Assessment", "Source"),
@@ -2181,13 +2203,23 @@ def create_backtest(req: BacktestRequest):
         raise HTTPException(status_code=422, detail=f"No Mondays in {req.year} on or before today.")
     log.add(f"Schedule: {len(dates)} Mondays from {dates[0]} to {dates[-1]}")
 
-    # All documents and data come from the symbol's stored bundle (downloaded once, kept in Blob + SQL).
-    bundle = load_symbol_bundle(symbol, refresh=req.refresh_data, log=log)
-    raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
-    s = bundle_summary(bundle)
-    log.add(f"Data for the run: prices {s['price_range'][0]} to {s['price_range'][1]} ({s['price_rows']} rows), "
-            f"annual periods {', '.join(s['annual_periods'])}, quarterly periods {len(s['quarterly_periods'])}, "
-            f"bundle {bundle.get('data_pathname') or 'in dbo.symbol_data'}")
+    if skill.get("data_source") == "tech":
+        # Technical skills read the TECH_ tables only; make sure they exist and are current before the run.
+        st = ensure_technicals(symbol, log)
+        raw = {"symbol": symbol, "data_source": "tech", "computed_at": st["computed_at"], "fetched_at": st["computed_at"],
+               "first_trade_date": st["first_trade_date"], "last_trade_date": st["last_trade_date"], "counts": st["counts"]}
+        data_pathname = None
+        log.add(f"Data for the run: TECH_ tables for {symbol} - {st['price_rows']} trading days {st['first_trade_date']} to "
+                f"{st['last_trade_date']}; " + ", ".join(f"{k} {v}" for k, v in st["counts"].items()))
+    else:
+        # All documents and data come from the symbol's stored bundle (downloaded once, kept in Blob + SQL).
+        bundle = load_symbol_bundle(symbol, refresh=req.refresh_data, log=log)
+        raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
+        data_pathname = bundle.get("data_pathname")
+        s = bundle_summary(bundle)
+        log.add(f"Data for the run: prices {s['price_range'][0]} to {s['price_range'][1]} ({s['price_rows']} rows), "
+                f"annual periods {', '.join(s['annual_periods'])}, quarterly periods {len(s['quarterly_periods'])}, "
+                f"bundle {data_pathname or 'in dbo.symbol_data'}")
 
     conn = db_connect()
     try:
@@ -2197,7 +2229,7 @@ def create_backtest(req: BacktestRequest):
         cur.execute(
             f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, data_pathname) "
             f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, %s)",
-            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), bundle.get("data_pathname")),
+            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), data_pathname),
         )
         backtest_id = cur.fetchone()[0]
         log.row_id = backtest_id
@@ -2394,10 +2426,17 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     references: list[dict] = []
     report: dict = {}
     try:
-        payload, references = point_in_time_bundle(raw, prices_df, as_of, skill)
-        n_stmt = sum(1 for r in references if r["type"] == "statement")
-        log.step(f"Point-in-time data as of {as_of}: price through {payload['price']['as_of']}, {n_stmt} statement "
-                 f"periods visible, {len(payload['fundamentals'])} derived fundamentals")
+        if skill.get("data_source") == "tech":
+            payload, references = load_tech_bundle(symbol, as_of, skill)
+            log.step(f"Point-in-time technical data as of {as_of} from TECH_ tables: latest bar {payload['today']['trade_date']}, "
+                     f"{len(payload['daily_bars'])} daily / {len(payload['weekly_bars'])} weekly bars, trend {payload['trend']['primary_trend']}/"
+                     f"{payload['trend']['intermediate_trend']}/{payload['trend']['short_trend']}, {len(payload['levels'])} levels, "
+                     f"{len(payload['pivots'])} pivots, {len(payload['signals'])} signals, {len(payload['patterns'])} patterns - nothing fetched or calculated")
+        else:
+            payload, references = point_in_time_bundle(raw, prices_df, as_of, skill)
+            n_stmt = sum(1 for r in references if r["type"] == "statement")
+            log.step(f"Point-in-time data as of {as_of}: price through {payload['price']['as_of']}, {n_stmt} statement "
+                     f"periods visible, {len(payload['fundamentals'])} derived fundamentals")
         log.step(f"Querying Claude ({env_diagnostics()['claude']['provider']}, model '{os.environ.get('ANTHROPIC_MODEL', DEFAULT_CLAUDE_MODEL)}') ...")
         analysis, response = run_skill_with_claude(skill, payload, log)
         warnings = validate_verdict(analysis)
@@ -2469,6 +2508,651 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         conn.close()
     return {"done": stopped or (counts["pending"] == 0 and counts["running"] == 0), "stopped": stopped,
             "decision": decision, "counts": counts}
+
+
+# ---------------------------------------------------------------------------
+# Technical-analysis data for skills with `data_source: tech` (John Murphy).
+# Everything the agent needs is computed once per symbol from stored prices and written to the
+# TECH_ tables; runs read those tables only, filtered to the analysis date. Pivots, levels and
+# patterns carry the date they became known, so nothing newer than "today" leaks into a run.
+# ---------------------------------------------------------------------------
+TECH_PARAMS = {
+    "sma": [5, 10, 20, 50, 100, 200], "ema": [12, 26], "macd": [12, 26, 9], "rsi": 14, "stochastic": [14, 3],
+    "bollinger": [20, 2], "atr": 14, "adx": 14, "obv_sma": 20, "volume_sma": 20, "pivot_window": 5,
+    "level_cluster_pct": 1.5, "level_lookback_days": 250, "volume_spike_ratio": 1.5, "divergence_lookback": 40,
+}
+TECH_TABLES = ("TECH_PRICE_DAILY", "TECH_PRICE_WEEKLY", "TECH_INDICATOR_DAILY", "TECH_TREND_DAILY", "TECH_PIVOT",
+               "TECH_LEVEL", "TECH_SIGNAL", "TECH_PATTERN", "TECH_LOAD")
+INDICATOR_COLUMNS = (
+    "sma5", "sma10", "sma20", "sma50", "sma100", "sma200", "ema12", "ema26", "macd", "macd_signal", "macd_hist", "rsi14",
+    "stoch_k", "stoch_d", "bb_upper", "bb_middle", "bb_lower", "bb_pct_b", "bb_bandwidth", "atr14", "obv", "obv_sma20",
+    "volume_sma20", "volume_ratio", "roc10", "adx14", "plus_di14", "minus_di14", "high_52w", "low_52w",
+    "pct_from_52w_high", "pct_from_52w_low", "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_1y", "volatility_20d",
+)
+TREND_COLUMNS = ("primary_trend", "intermediate_trend", "short_trend", "trend_strength", "structure", "higher_highs",
+                 "higher_lows", "lower_highs", "lower_lows", "sma200_slope_pct", "sma50_slope_pct", "price_vs_sma200_pct",
+                 "price_vs_sma50_pct", "days_above_sma200")
+
+ENSURE_TECH_SQL = """
+IF OBJECT_ID('dbo.TECH_PRICE_DAILY', 'U') IS NULL
+CREATE TABLE dbo.TECH_PRICE_DAILY (
+    symbol NVARCHAR(20) NOT NULL, trade_date DATE NOT NULL,
+    [open] DECIMAL(18,4) NULL, high DECIMAL(18,4) NULL, low DECIMAL(18,4) NULL, [close] DECIMAL(18,4) NULL,
+    adj_close DECIMAL(18,4) NULL, volume BIGINT NULL,
+    CONSTRAINT PK_TECH_PRICE_DAILY PRIMARY KEY (symbol, trade_date));
+IF OBJECT_ID('dbo.TECH_PRICE_WEEKLY', 'U') IS NULL
+CREATE TABLE dbo.TECH_PRICE_WEEKLY (
+    symbol NVARCHAR(20) NOT NULL, week_end DATE NOT NULL,
+    [open] DECIMAL(18,4) NULL, high DECIMAL(18,4) NULL, low DECIMAL(18,4) NULL, [close] DECIMAL(18,4) NULL, volume BIGINT NULL,
+    CONSTRAINT PK_TECH_PRICE_WEEKLY PRIMARY KEY (symbol, week_end));
+IF OBJECT_ID('dbo.TECH_INDICATOR_DAILY', 'U') IS NULL
+CREATE TABLE dbo.TECH_INDICATOR_DAILY (
+    symbol NVARCHAR(20) NOT NULL, trade_date DATE NOT NULL,
+    sma5 DECIMAL(18,4) NULL, sma10 DECIMAL(18,4) NULL, sma20 DECIMAL(18,4) NULL, sma50 DECIMAL(18,4) NULL,
+    sma100 DECIMAL(18,4) NULL, sma200 DECIMAL(18,4) NULL, ema12 DECIMAL(18,4) NULL, ema26 DECIMAL(18,4) NULL,
+    macd DECIMAL(18,4) NULL, macd_signal DECIMAL(18,4) NULL, macd_hist DECIMAL(18,4) NULL, rsi14 DECIMAL(9,2) NULL,
+    stoch_k DECIMAL(9,2) NULL, stoch_d DECIMAL(9,2) NULL, bb_upper DECIMAL(18,4) NULL, bb_middle DECIMAL(18,4) NULL,
+    bb_lower DECIMAL(18,4) NULL, bb_pct_b DECIMAL(9,3) NULL, bb_bandwidth DECIMAL(9,2) NULL, atr14 DECIMAL(18,4) NULL,
+    obv BIGINT NULL, obv_sma20 BIGINT NULL, volume_sma20 BIGINT NULL, volume_ratio DECIMAL(9,2) NULL, roc10 DECIMAL(9,2) NULL,
+    adx14 DECIMAL(9,2) NULL, plus_di14 DECIMAL(9,2) NULL, minus_di14 DECIMAL(9,2) NULL, high_52w DECIMAL(18,4) NULL,
+    low_52w DECIMAL(18,4) NULL, pct_from_52w_high DECIMAL(9,2) NULL, pct_from_52w_low DECIMAL(9,2) NULL,
+    ret_1w DECIMAL(9,2) NULL, ret_1m DECIMAL(9,2) NULL, ret_3m DECIMAL(9,2) NULL, ret_6m DECIMAL(9,2) NULL, ret_1y DECIMAL(9,2) NULL,
+    volatility_20d DECIMAL(9,2) NULL,
+    CONSTRAINT PK_TECH_INDICATOR_DAILY PRIMARY KEY (symbol, trade_date));
+IF OBJECT_ID('dbo.TECH_TREND_DAILY', 'U') IS NULL
+CREATE TABLE dbo.TECH_TREND_DAILY (
+    symbol NVARCHAR(20) NOT NULL, trade_date DATE NOT NULL,
+    primary_trend NVARCHAR(10) NOT NULL, intermediate_trend NVARCHAR(10) NOT NULL, short_trend NVARCHAR(10) NOT NULL,
+    trend_strength NVARCHAR(10) NOT NULL, structure NVARCHAR(120) NOT NULL,
+    higher_highs INT NOT NULL, higher_lows INT NOT NULL, lower_highs INT NOT NULL, lower_lows INT NOT NULL,
+    sma200_slope_pct DECIMAL(9,2) NULL, sma50_slope_pct DECIMAL(9,2) NULL, price_vs_sma200_pct DECIMAL(9,2) NULL,
+    price_vs_sma50_pct DECIMAL(9,2) NULL, days_above_sma200 INT NULL,
+    CONSTRAINT PK_TECH_TREND_DAILY PRIMARY KEY (symbol, trade_date));
+IF OBJECT_ID('dbo.TECH_PIVOT', 'U') IS NULL
+CREATE TABLE dbo.TECH_PIVOT (
+    symbol NVARCHAR(20) NOT NULL, pivot_date DATE NOT NULL, pivot_type NVARCHAR(4) NOT NULL,
+    price DECIMAL(18,4) NOT NULL, confirmed_date DATE NOT NULL, window INT NOT NULL,
+    CONSTRAINT PK_TECH_PIVOT PRIMARY KEY (symbol, pivot_date, pivot_type));
+IF OBJECT_ID('dbo.TECH_LEVEL', 'U') IS NULL
+CREATE TABLE dbo.TECH_LEVEL (
+    symbol NVARCHAR(20) NOT NULL, as_of_date DATE NOT NULL, level_type NVARCHAR(12) NOT NULL, rank INT NOT NULL,
+    price DECIMAL(18,4) NOT NULL, touches INT NULL, last_touch_date DATE NULL, distance_pct DECIMAL(9,2) NOT NULL,
+    CONSTRAINT PK_TECH_LEVEL PRIMARY KEY (symbol, as_of_date, level_type, rank));
+IF OBJECT_ID('dbo.TECH_SIGNAL', 'U') IS NULL
+CREATE TABLE dbo.TECH_SIGNAL (
+    symbol NVARCHAR(20) NOT NULL, signal_date DATE NOT NULL, signal_type NVARCHAR(30) NOT NULL,
+    direction NVARCHAR(8) NOT NULL, description NVARCHAR(300) NOT NULL, value DECIMAL(18,4) NULL,
+    CONSTRAINT PK_TECH_SIGNAL PRIMARY KEY (symbol, signal_date, signal_type));
+IF OBJECT_ID('dbo.TECH_PATTERN', 'U') IS NULL
+CREATE TABLE dbo.TECH_PATTERN (
+    symbol NVARCHAR(20) NOT NULL, pattern_type NVARCHAR(30) NOT NULL, direction NVARCHAR(8) NOT NULL,
+    start_date DATE NOT NULL, end_date DATE NOT NULL, confirmed_date DATE NOT NULL,
+    neckline DECIMAL(18,4) NOT NULL, target DECIMAL(18,4) NOT NULL, description NVARCHAR(400) NOT NULL,
+    CONSTRAINT PK_TECH_PATTERN PRIMARY KEY (symbol, pattern_type, end_date));
+IF OBJECT_ID('dbo.TECH_LOAD', 'U') IS NULL
+CREATE TABLE dbo.TECH_LOAD (
+    symbol NVARCHAR(20) NOT NULL PRIMARY KEY, computed_at DATETIME2 NOT NULL, first_trade_date DATE NOT NULL,
+    last_trade_date DATE NOT NULL, price_rows INT NOT NULL, parameters NVARCHAR(MAX) NOT NULL, counts NVARCHAR(MAX) NOT NULL);
+"""
+
+
+def _f(v, nd=4):
+    return num(v, nd)
+
+
+def _i(v):
+    try:
+        return None if v is None or v != v else int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _label_trend(price, ma, slope, flat_pct=0.5):
+    if ma is None or ma != ma or slope is None or slope != slope:
+        return "unknown"
+    if price > ma and slope > flat_pct / 4:
+        return "up"
+    if price < ma and slope < -flat_pct / 4:
+        return "down"
+    return "sideways"
+
+
+def compute_technicals(df) -> dict:
+    """All TECH_ table contents from a daily OHLCV frame (columns date, open, high, low, close, adj_close, volume).
+    Every per-day value uses only data up to that day; forward-looking facts carry a confirmation date."""
+    import numpy as np
+    import pandas as pd
+
+    P = TECH_PARAMS
+    df = df.reset_index(drop=True)
+    dates = df["date"].astype(str).tolist()
+    close, high, low, vol = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float), df["volume"].astype(float)
+    n = len(df)
+    ind = pd.DataFrame(index=df.index)
+
+    for p in P["sma"]:
+        ind[f"sma{p}"] = close.rolling(p).mean()
+    ind["ema12"] = close.ewm(span=12, adjust=False).mean()
+    ind["ema26"] = close.ewm(span=26, adjust=False).mean()
+    macd = ind["ema12"] - ind["ema26"]
+    macd.iloc[:25] = np.nan
+    signal = macd.ewm(span=9, adjust=False).mean()
+    signal.iloc[:33] = np.nan
+    ind["macd"], ind["macd_signal"], ind["macd_hist"] = macd, signal, macd - signal
+    ind["rsi14"] = compute_rsi(close, P["rsi"])
+    low14, high14 = low.rolling(14).min(), high.rolling(14).max()
+    ind["stoch_k"] = (close - low14) / (high14 - low14).replace(0, np.nan) * 100
+    ind["stoch_d"] = ind["stoch_k"].rolling(3).mean()
+    mid, std = close.rolling(20).mean(), close.rolling(20).std(ddof=0)
+    ind["bb_upper"], ind["bb_middle"], ind["bb_lower"] = mid + 2 * std, mid, mid - 2 * std
+    ind["bb_pct_b"] = (close - ind["bb_lower"]) / (ind["bb_upper"] - ind["bb_lower"]).replace(0, np.nan)
+    ind["bb_bandwidth"] = (ind["bb_upper"] - ind["bb_lower"]) / mid.replace(0, np.nan) * 100
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    ind["atr14"] = atr
+    direction = np.sign(close.diff()).fillna(0)
+    ind["obv"] = (direction * vol.fillna(0)).cumsum()
+    ind["obv_sma20"] = ind["obv"].rolling(20).mean()
+    ind["volume_sma20"] = vol.rolling(20).mean()
+    ind["volume_ratio"] = vol / ind["volume_sma20"].replace(0, np.nan)
+    ind["roc10"] = close.pct_change(10) * 100
+    up_move, down_move = high.diff(), -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    atr_w = tr.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean().replace(0, np.nan)
+    ind["plus_di14"] = 100 * plus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / atr_w
+    ind["minus_di14"] = 100 * minus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / atr_w
+    dx = 100 * (ind["plus_di14"] - ind["minus_di14"]).abs() / (ind["plus_di14"] + ind["minus_di14"]).replace(0, np.nan)
+    ind["adx14"] = dx.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    ind["high_52w"] = high.rolling(252, min_periods=20).max()
+    ind["low_52w"] = low.rolling(252, min_periods=20).min()
+    ind["pct_from_52w_high"] = (close / ind["high_52w"] - 1) * 100
+    ind["pct_from_52w_low"] = (close / ind["low_52w"] - 1) * 100
+    for key, k in (("ret_1w", 5), ("ret_1m", 21), ("ret_3m", 63), ("ret_6m", 126), ("ret_1y", 252)):
+        ind[key] = close.pct_change(k) * 100
+    ind["volatility_20d"] = close.pct_change().rolling(20).std() * np.sqrt(252) * 100
+
+    # Pivots (confirmed `window` bars later)
+    w = P["pivot_window"]
+    pivots = []  # dicts with idx, conf_idx
+    hv, lv = high.values, low.values
+    for i in range(w, n - w):
+        if hv[i] == hv[i - w: i + w + 1].max():
+            pivots.append({"idx": i, "type": "high", "price": float(hv[i]), "conf_idx": i + w})
+        if lv[i] == lv[i - w: i + w + 1].min():
+            pivots.append({"idx": i, "type": "low", "price": float(lv[i]), "conf_idx": i + w})
+    pivots.sort(key=lambda p: (p["idx"], p["type"]))
+
+    # Trend per day (structure uses pivots known by that day, last 60 bars)
+    sma200_slope = ind["sma200"].pct_change(20) * 100
+    sma50_slope = ind["sma50"].pct_change(10) * 100
+    sma20_slope = ind["sma20"].pct_change(5) * 100
+    trend_rows = []
+    above_run = 0
+    for i in range(n):
+        c = float(close.iloc[i])
+        s200 = ind["sma200"].iloc[i]
+        if s200 == s200:
+            above_run = above_run + 1 if (c > s200 and above_run >= 0) else (above_run - 1 if (c < s200 and above_run <= 0) else (1 if c > s200 else -1))
+        else:
+            above_run = 0
+        known = [p for p in pivots if p["conf_idx"] <= i and p["idx"] >= i - 60]
+        highs = [p["price"] for p in known if p["type"] == "high"]
+        lows = [p["price"] for p in known if p["type"] == "low"]
+        hh = sum(1 for a, b in zip(highs, highs[1:]) if b > a)
+        lh = sum(1 for a, b in zip(highs, highs[1:]) if b < a)
+        hl = sum(1 for a, b in zip(lows, lows[1:]) if b > a)
+        ll = sum(1 for a, b in zip(lows, lows[1:]) if b < a)
+        if hh + hl > lh + ll and hh + hl >= 2:
+            structure = "higher highs and higher lows (uptrend structure)"
+        elif lh + ll > hh + hl and lh + ll >= 2:
+            structure = "lower highs and lower lows (downtrend structure)"
+        elif known:
+            structure = "mixed swings (no clear structure)"
+        else:
+            structure = "insufficient confirmed swings"
+        adx = ind["adx14"].iloc[i]
+        strength = "unknown" if adx != adx else "strong" if adx >= 40 else "moderate" if adx >= 25 else "weak"
+        trend_rows.append({
+            "trade_date": dates[i],
+            "primary_trend": _label_trend(c, s200, sma200_slope.iloc[i]),
+            "intermediate_trend": _label_trend(c, ind["sma50"].iloc[i], sma50_slope.iloc[i]),
+            "short_trend": _label_trend(c, ind["sma20"].iloc[i], sma20_slope.iloc[i]),
+            "trend_strength": strength, "structure": structure,
+            "higher_highs": hh, "higher_lows": hl, "lower_highs": lh, "lower_lows": ll,
+            "sma200_slope_pct": _f(sma200_slope.iloc[i], 2), "sma50_slope_pct": _f(sma50_slope.iloc[i], 2),
+            "price_vs_sma200_pct": _f((c / s200 - 1) * 100, 2) if s200 == s200 else None,
+            "price_vs_sma50_pct": _f((c / ind["sma50"].iloc[i] - 1) * 100, 2) if ind["sma50"].iloc[i] == ind["sma50"].iloc[i] else None,
+            "days_above_sma200": above_run if s200 == s200 else None,
+        })
+
+    # Levels as of each day: clusters of confirmed pivots in the lookback, Fibonacci of the last major swing
+    tol, lookback = P["level_cluster_pct"] / 100, P["level_lookback_days"]
+    level_rows = []
+    for i in range(n):
+        c = float(close.iloc[i])
+        known = [p for p in pivots if p["conf_idx"] <= i and p["idx"] >= i - lookback]
+        if not known:
+            continue
+        clusters = []
+        for p in sorted(known, key=lambda p: p["price"]):
+            if clusters and p["price"] - clusters[-1]["prices"][-1] <= c * tol:
+                clusters[-1]["prices"].append(p["price"])
+                clusters[-1]["last_idx"] = max(clusters[-1]["last_idx"], p["idx"])
+            else:
+                clusters.append({"prices": [p["price"]], "last_idx": p["idx"]})
+        levels = [{"price": sum(cl["prices"]) / len(cl["prices"]), "touches": len(cl["prices"]), "last_idx": cl["last_idx"]} for cl in clusters]
+        support = sorted([l for l in levels if l["price"] < c], key=lambda l: (-l["touches"], c - l["price"]))[:3]
+        resistance = sorted([l for l in levels if l["price"] > c], key=lambda l: (-l["touches"], l["price"] - c))[:3]
+        for kind, lst in (("support", sorted(support, key=lambda l: -l["price"])), ("resistance", sorted(resistance, key=lambda l: l["price"]))):
+            for rank, l in enumerate(lst, 1):
+                level_rows.append({"as_of_date": dates[i], "level_type": kind, "rank": rank, "price": _f(l["price"]),
+                                   "touches": l["touches"], "last_touch_date": dates[l["last_idx"]],
+                                   "distance_pct": _f((l["price"] / c - 1) * 100, 2)})
+        recent = [p for p in known if p["idx"] >= i - 120]
+        if recent:
+            hi = max((p for p in recent if p["type"] == "high"), key=lambda p: p["price"], default=None)
+            lo = min((p for p in recent if p["type"] == "low"), key=lambda p: p["price"], default=None)
+            if hi and lo and hi["price"] > lo["price"]:
+                rng = hi["price"] - lo["price"]
+                up_swing = hi["idx"] > lo["idx"]
+                for key, r in (("fib_382", 0.382), ("fib_500", 0.5), ("fib_618", 0.618)):
+                    price = hi["price"] - rng * r if up_swing else lo["price"] + rng * r
+                    level_rows.append({"as_of_date": dates[i], "level_type": key, "rank": 1, "price": _f(price), "touches": None,
+                                       "last_touch_date": None, "distance_pct": _f((price / c - 1) * 100, 2)})
+                for key, p in (("swing_high", hi), ("swing_low", lo)):
+                    level_rows.append({"as_of_date": dates[i], "level_type": key, "rank": 1, "price": _f(p["price"]), "touches": None,
+                                       "last_touch_date": dates[p["idx"]], "distance_pct": _f((p["price"] / c - 1) * 100, 2)})
+
+    # Signals (events on the day they occur)
+    sig = []
+
+    def cross(a, b, i):
+        """+1 if a crossed above b on day i, -1 if below, else 0 (needs both days defined)."""
+        pa, pb, ca, cb = a.iloc[i - 1], b.iloc[i - 1], a.iloc[i], b.iloc[i]
+        if any(v != v for v in (pa, pb, ca, cb)):
+            return 0
+        return 1 if pa <= pb and ca > cb else -1 if pa >= pb and ca < cb else 0
+
+    def level_cross(s, thr, i):
+        p, c_ = s.iloc[i - 1], s.iloc[i]
+        if p != p or c_ != c_:
+            return 0
+        return 1 if p <= thr < c_ else -1 if p >= thr > c_ else 0
+
+    prior_high_252 = high.rolling(252, min_periods=60).max().shift(1)
+    prior_low_252 = low.rolling(252, min_periods=60).min().shift(1)
+    last_div = {"bullish": -100, "bearish": -100}
+    L = P["divergence_lookback"]
+    for i in range(1, n):
+        d = dates[i]
+        c = float(close.iloc[i])
+        x = cross(ind["sma50"], ind["sma200"], i)
+        if x == 1: sig.append((d, "golden_cross", "bullish", "50-day average crossed above the 200-day average", _f(ind["sma50"].iloc[i])))
+        if x == -1: sig.append((d, "death_cross", "bearish", "50-day average crossed below the 200-day average", _f(ind["sma50"].iloc[i])))
+        x = cross(ind["sma20"], ind["sma50"], i)
+        if x == 1: sig.append((d, "sma20_50_cross_up", "bullish", "20-day average crossed above the 50-day average", _f(ind["sma20"].iloc[i])))
+        if x == -1: sig.append((d, "sma20_50_cross_down", "bearish", "20-day average crossed below the 50-day average", _f(ind["sma20"].iloc[i])))
+        x = cross(close, ind["sma200"], i)
+        if x == 1: sig.append((d, "price_above_sma200", "bullish", "Close crossed above the 200-day average", _f(ind["sma200"].iloc[i])))
+        if x == -1: sig.append((d, "price_below_sma200", "bearish", "Close crossed below the 200-day average", _f(ind["sma200"].iloc[i])))
+        x = cross(ind["macd"], ind["macd_signal"], i)
+        if x == 1: sig.append((d, "macd_cross_up", "bullish", "MACD line crossed above its signal line", _f(ind["macd"].iloc[i])))
+        if x == -1: sig.append((d, "macd_cross_down", "bearish", "MACD line crossed below its signal line", _f(ind["macd"].iloc[i])))
+        r = ind["rsi14"]
+        if level_cross(r, 70, i) == 1: sig.append((d, "rsi_overbought", "bearish", "RSI rose above 70 (overbought)", _f(r.iloc[i], 2)))
+        if level_cross(r, 70, i) == -1: sig.append((d, "rsi_exit_overbought", "bearish", "RSI fell back below 70", _f(r.iloc[i], 2)))
+        if level_cross(r, 30, i) == -1: sig.append((d, "rsi_oversold", "bullish", "RSI fell below 30 (oversold)", _f(r.iloc[i], 2)))
+        if level_cross(r, 30, i) == 1: sig.append((d, "rsi_exit_oversold", "bullish", "RSI rose back above 30", _f(r.iloc[i], 2)))
+        k = ind["stoch_k"]
+        if level_cross(k, 80, i) == 1: sig.append((d, "stoch_overbought", "bearish", "Stochastic %K rose above 80", _f(k.iloc[i], 2)))
+        if level_cross(k, 20, i) == -1: sig.append((d, "stoch_oversold", "bullish", "Stochastic %K fell below 20", _f(k.iloc[i], 2)))
+        if cross(close, ind["bb_upper"], i) == 1: sig.append((d, "bb_breakout_up", "bullish", "Close moved above the upper Bollinger Band", _f(ind["bb_upper"].iloc[i])))
+        if cross(close, ind["bb_lower"], i) == -1: sig.append((d, "bb_breakout_down", "bearish", "Close moved below the lower Bollinger Band", _f(ind["bb_lower"].iloc[i])))
+        ph, pl = prior_high_252.iloc[i], prior_low_252.iloc[i]
+        if ph == ph and c > ph and float(close.iloc[i - 1]) <= ph:
+            sig.append((d, "high_52w_breakout", "bullish", f"Close {c:.2f} above the prior 52-week high {ph:.2f}", _f(ph)))
+        if pl == pl and c < pl and float(close.iloc[i - 1]) >= pl:
+            sig.append((d, "low_52w_breakdown", "bearish", f"Close {c:.2f} below the prior 52-week low {pl:.2f}", _f(pl)))
+        vr, pvr = ind["volume_ratio"].iloc[i], ind["volume_ratio"].iloc[i - 1]
+        if vr == vr and vr >= P["volume_spike_ratio"] and not (pvr == pvr and pvr >= P["volume_spike_ratio"]):
+            up = c >= float(close.iloc[i - 1])
+            sig.append((d, "volume_spike", "bullish" if up else "bearish", f"Volume {vr:.1f}x its 20-day average on an {'up' if up else 'down'} day", _f(vr, 2)))
+        if i >= L and r.iloc[i] == r.iloc[i]:
+            win_c, win_r = close.iloc[i - L:i], r.iloc[i - L:i]
+            if c >= win_c.max() and r.iloc[i] < win_r.max() - 5 and i - last_div["bearish"] > 10:
+                sig.append((d, "bearish_divergence", "bearish", f"New {L}-day high in price while RSI ({r.iloc[i]:.0f}) is below its prior peak ({win_r.max():.0f})", _f(r.iloc[i], 2)))
+                last_div["bearish"] = i
+            if c <= win_c.min() and r.iloc[i] > win_r.min() + 5 and i - last_div["bullish"] > 10:
+                sig.append((d, "bullish_divergence", "bullish", f"New {L}-day low in price while RSI ({r.iloc[i]:.0f}) is above its prior trough ({win_r.min():.0f})", _f(r.iloc[i], 2)))
+                last_div["bullish"] = i
+    signal_rows = [{"signal_date": a, "signal_type": b, "direction": c_, "description": d_, "value": v} for a, b, c_, d_, v in sig]
+
+    # Patterns from confirmed pivots, confirmed by a close beyond the neckline
+    patterns = []
+    cv = close.values
+
+    def first_close_beyond(start_idx, level, below, max_bars=60):
+        for j in range(start_idx, min(n, start_idx + max_bars)):
+            if (below and cv[j] < level) or (not below and cv[j] > level):
+                return j
+        return None
+
+    highs = [p for p in pivots if p["type"] == "high"]
+    lows = [p for p in pivots if p["type"] == "low"]
+    for a, b in zip(highs, highs[1:]):
+        if b["idx"] - a["idx"] < 15 or abs(b["price"] - a["price"]) / a["price"] > 0.03:
+            continue
+        between = [p for p in lows if a["idx"] < p["idx"] < b["idx"]]
+        if not between:
+            continue
+        neck = min(p["price"] for p in between)
+        j = first_close_beyond(max(b["conf_idx"], b["idx"] + 1), neck, below=True)
+        if j is None:
+            continue
+        height = max(a["price"], b["price"]) - neck
+        patterns.append({"pattern_type": "double_top", "direction": "bearish", "start_date": dates[a["idx"]], "end_date": dates[b["idx"]],
+                         "confirmed_date": dates[j], "neckline": _f(neck), "target": _f(neck - height),
+                         "description": f"Two peaks at {a['price']:.2f} and {b['price']:.2f}; neckline {neck:.2f} broken on a close of {cv[j]:.2f}"})
+    for a, b in zip(lows, lows[1:]):
+        if b["idx"] - a["idx"] < 15 or abs(b["price"] - a["price"]) / a["price"] > 0.03:
+            continue
+        between = [p for p in highs if a["idx"] < p["idx"] < b["idx"]]
+        if not between:
+            continue
+        neck = max(p["price"] for p in between)
+        j = first_close_beyond(max(b["conf_idx"], b["idx"] + 1), neck, below=False)
+        if j is None:
+            continue
+        height = neck - min(a["price"], b["price"])
+        patterns.append({"pattern_type": "double_bottom", "direction": "bullish", "start_date": dates[a["idx"]], "end_date": dates[b["idx"]],
+                         "confirmed_date": dates[j], "neckline": _f(neck), "target": _f(neck + height),
+                         "description": f"Two troughs at {a['price']:.2f} and {b['price']:.2f}; neckline {neck:.2f} broken on a close of {cv[j]:.2f}"})
+    for s1, head, s2 in zip(highs, highs[1:], highs[2:]):
+        if not (head["price"] > s1["price"] and head["price"] > s2["price"]) or abs(s1["price"] - s2["price"]) / s1["price"] > 0.10:
+            continue
+        l1 = [p for p in lows if s1["idx"] < p["idx"] < head["idx"]]
+        l2 = [p for p in lows if head["idx"] < p["idx"] < s2["idx"]]
+        if not l1 or not l2:
+            continue
+        neck = (min(p["price"] for p in l1) + min(p["price"] for p in l2)) / 2
+        j = first_close_beyond(max(s2["conf_idx"], s2["idx"] + 1), neck, below=True)
+        if j is None:
+            continue
+        height = head["price"] - neck
+        patterns.append({"pattern_type": "head_and_shoulders", "direction": "bearish", "start_date": dates[s1["idx"]], "end_date": dates[s2["idx"]],
+                         "confirmed_date": dates[j], "neckline": _f(neck), "target": _f(neck - height),
+                         "description": f"Shoulders {s1['price']:.2f} / {s2['price']:.2f}, head {head['price']:.2f}; neckline {neck:.2f} broken on {dates[j]}"})
+    for s1, head, s2 in zip(lows, lows[1:], lows[2:]):
+        if not (head["price"] < s1["price"] and head["price"] < s2["price"]) or abs(s1["price"] - s2["price"]) / s1["price"] > 0.10:
+            continue
+        h1 = [p for p in highs if s1["idx"] < p["idx"] < head["idx"]]
+        h2 = [p for p in highs if head["idx"] < p["idx"] < s2["idx"]]
+        if not h1 or not h2:
+            continue
+        neck = (max(p["price"] for p in h1) + max(p["price"] for p in h2)) / 2
+        j = first_close_beyond(max(s2["conf_idx"], s2["idx"] + 1), neck, below=False)
+        if j is None:
+            continue
+        height = neck - head["price"]
+        patterns.append({"pattern_type": "inverse_head_and_shoulders", "direction": "bullish", "start_date": dates[s1["idx"]], "end_date": dates[s2["idx"]],
+                         "confirmed_date": dates[j], "neckline": _f(neck), "target": _f(neck + height),
+                         "description": f"Shoulders {s1['price']:.2f} / {s2['price']:.2f}, head {head['price']:.2f}; neckline {neck:.2f} broken on {dates[j]}"})
+    seen, pattern_rows = set(), []
+    for p in patterns:
+        key = (p["pattern_type"], p["end_date"])
+        if key not in seen:
+            seen.add(key)
+            pattern_rows.append(p)
+
+    # Weekly bars
+    wk = df.copy()
+    wk["dt"] = pd.to_datetime(wk["date"])
+    wk = wk.set_index("dt").resample("W-FRI").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["close"])
+    weekly_rows = [{"week_end": idx.date().isoformat(), "open": _f(r.open), "high": _f(r.high), "low": _f(r.low), "close": _f(r.close), "volume": _i(r.volume)}
+                   for idx, r in wk.iterrows()]
+
+    daily_rows = [{"trade_date": dates[i], "open": _f(df["open"].iloc[i]), "high": _f(hv[i]), "low": _f(lv[i]), "close": _f(cv[i]),
+                   "adj_close": _f(df["adj_close"].iloc[i]) if "adj_close" in df else None, "volume": _i(vol.iloc[i])} for i in range(n)]
+    indicator_rows = []
+    for i in range(n):
+        row = {"trade_date": dates[i]}
+        for col in INDICATOR_COLUMNS:
+            v = ind[col].iloc[i]
+            row[col] = _i(v) if col in ("obv", "obv_sma20", "volume_sma20") else _f(v, 2 if col in ("rsi14", "stoch_k", "stoch_d", "bb_bandwidth", "volume_ratio", "roc10", "adx14", "plus_di14", "minus_di14", "pct_from_52w_high", "pct_from_52w_low", "ret_1w", "ret_1m", "ret_3m", "ret_6m", "ret_1y", "volatility_20d") else 3 if col == "bb_pct_b" else 4)
+        indicator_rows.append(row)
+    pivot_rows = [{"pivot_date": dates[p["idx"]], "pivot_type": p["type"], "price": _f(p["price"]), "confirmed_date": dates[p["conf_idx"]], "window": w}
+                  for p in pivots if p["conf_idx"] < n]
+    return {"daily": daily_rows, "weekly": weekly_rows, "indicators": indicator_rows, "trend": trend_rows, "pivots": pivot_rows,
+            "levels": level_rows, "signals": signal_rows, "patterns": pattern_rows}
+
+
+def bulk_insert(cur, table: str, columns: tuple, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    chunk = max(1, 2000 // len(columns))
+    cols = ", ".join(f"[{c}]" for c in columns)
+    ph = "(" + ", ".join(["%s"] * len(columns)) + ")"
+    for i in range(0, len(rows), chunk):
+        part = rows[i:i + chunk]
+        cur.execute(f"INSERT INTO dbo.{table} ({cols}) VALUES " + ", ".join([ph] * len(part)),
+                    tuple(r.get(c) for r in part for c in columns))
+    return len(rows)
+
+
+def prepare_technicals(symbol: str, log: "RunLog | None" = None) -> dict:
+    """Compute every TECH_ table for a symbol from stored prices (downloading them first only if missing/stale)."""
+    import pandas as pd
+
+    def say(msg, level="info"):
+        if log:
+            log.step(msg, level)
+
+    prices = stored_prices(symbol)
+    if prices:
+        say(f"Prices: {len(prices)} stored daily rows ({prices[0]['trade_date']} to {prices[-1]['trade_date']}); not downloaded again")
+    else:
+        rows = fetch_history(symbol)
+        save_prices(symbol, rows)
+        prices = [r.model_dump(mode="json") for r in rows]
+        say(f"Prices: {len(prices)} daily rows downloaded and stored ({prices[0]['trade_date']} to {prices[-1]['trade_date']})")
+    df = pd.DataFrame(prices)
+    df["date"] = df["trade_date"].astype(str)
+    for c in ("open", "high", "low", "close", "adj_close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    t0 = time.monotonic()
+    t = compute_technicals(df)
+    say(f"Computed in {time.monotonic() - t0:.1f} s: {len(t['indicators'])} indicator rows, {len(t['trend'])} trend rows, "
+        f"{len(t['weekly'])} weekly bars, {len(t['pivots'])} confirmed pivots, {len(t['levels'])} level rows, "
+        f"{len(t['signals'])} signals, {len(t['patterns'])} patterns")
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_TECH_SQL)
+        for table in TECH_TABLES:
+            cur.execute(f"DELETE FROM dbo.{table} WHERE symbol = %s", (symbol,))
+        for r in t["daily"] + t["weekly"] + t["indicators"] + t["trend"] + t["pivots"] + t["levels"] + t["signals"] + t["patterns"]:
+            r["symbol"] = symbol
+        counts = {
+            "TECH_PRICE_DAILY": bulk_insert(cur, "TECH_PRICE_DAILY", ("symbol", "trade_date", "open", "high", "low", "close", "adj_close", "volume"), t["daily"]),
+            "TECH_PRICE_WEEKLY": bulk_insert(cur, "TECH_PRICE_WEEKLY", ("symbol", "week_end", "open", "high", "low", "close", "volume"), t["weekly"]),
+            "TECH_INDICATOR_DAILY": bulk_insert(cur, "TECH_INDICATOR_DAILY", ("symbol", "trade_date") + INDICATOR_COLUMNS, t["indicators"]),
+            "TECH_TREND_DAILY": bulk_insert(cur, "TECH_TREND_DAILY", ("symbol", "trade_date") + TREND_COLUMNS, t["trend"]),
+            "TECH_PIVOT": bulk_insert(cur, "TECH_PIVOT", ("symbol", "pivot_date", "pivot_type", "price", "confirmed_date", "window"), t["pivots"]),
+            "TECH_LEVEL": bulk_insert(cur, "TECH_LEVEL", ("symbol", "as_of_date", "level_type", "rank", "price", "touches", "last_touch_date", "distance_pct"), t["levels"]),
+            "TECH_SIGNAL": bulk_insert(cur, "TECH_SIGNAL", ("symbol", "signal_date", "signal_type", "direction", "description", "value"), t["signals"]),
+            "TECH_PATTERN": bulk_insert(cur, "TECH_PATTERN", ("symbol", "pattern_type", "direction", "start_date", "end_date", "confirmed_date", "neckline", "target", "description"), t["patterns"]),
+        }
+        computed_at = datetime.now(timezone.utc)
+        cur.execute(
+            "INSERT INTO dbo.TECH_LOAD (symbol, computed_at, first_trade_date, last_trade_date, price_rows, parameters, counts) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (symbol, computed_at, t["daily"][0]["trade_date"], t["daily"][-1]["trade_date"], len(t["daily"]), json.dumps(TECH_PARAMS), json.dumps(counts)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    say(f"Stored in {len(TECH_TABLES)} TECH_ tables: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    return {"symbol": symbol, "computed_at": computed_at.isoformat(), "first_trade_date": t["daily"][0]["trade_date"],
+            "last_trade_date": t["daily"][-1]["trade_date"], "price_rows": len(t["daily"]), "counts": counts, "parameters": TECH_PARAMS}
+
+
+def tech_status(symbol: str) -> dict:
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_TECH_SQL)
+        conn.commit()
+        cur.execute("SELECT computed_at, first_trade_date, last_trade_date, price_rows, counts FROM dbo.TECH_LOAD WHERE symbol = %s", (symbol,))
+        row = cur.fetchone()
+        latest_price = None
+        if table_exists(cur):
+            cur.execute(f"SELECT MAX(trade_date) FROM {TABLE} WHERE symbol = %s", (symbol,))
+            latest_price = cur.fetchone()[0]
+    finally:
+        conn.close()
+    if not row:
+        return {"symbol": symbol, "available": False, "latest_price_date": latest_price.isoformat() if latest_price else None}
+    computed_at, first, last, rows, counts = row
+    stale = bool(latest_price and last < latest_price)
+    return {"symbol": symbol, "available": True, "fresh": not stale, "computed_at": computed_at.isoformat(),
+            "first_trade_date": first.isoformat(), "last_trade_date": last.isoformat(), "price_rows": rows,
+            "latest_price_date": latest_price.isoformat() if latest_price else None, "counts": json.loads(counts or "{}"),
+            "tables": list(TECH_TABLES)}
+
+
+def ensure_technicals(symbol: str, log: "RunLog | None" = None) -> dict:
+    st = tech_status(symbol)
+    if st["available"] and st["fresh"]:
+        if log:
+            log.step(f"Technical data for {symbol} ready in TECH_ tables (computed {st['computed_at'][:19]} UTC, prices to {st['last_trade_date']}); nothing recomputed")
+        return st
+    if log:
+        log.step(f"Technical data for {symbol} {'is stale (prices newer than ' + st['last_trade_date'] + ')' if st['available'] else 'not found'}; computing TECH_ tables")
+    prepare_technicals(symbol, log)
+    return tech_status(symbol)
+
+
+def _rows(cur, sql, params=(), columns=None):
+    cur.execute(sql, params)
+    cols = columns or [d[0] for d in cur.description]
+    out = []
+    for r in cur.fetchall():
+        d = {}
+        for k, v in zip(cols, r):
+            if hasattr(v, "isoformat"):
+                v = v.isoformat()
+            elif isinstance(v, Decimal):
+                v = float(v)
+            d[k] = v
+        out.append(d)
+    return out
+
+
+def load_tech_bundle(symbol: str, as_of: date, skill: dict | None = None) -> tuple[dict, list[dict]]:
+    """Point-in-time technical payload read from the TECH_ tables only (rows dated <= as_of; pivots and
+    patterns only once confirmed). Returns (payload, references)."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT computed_at, first_trade_date, last_trade_date FROM dbo.TECH_LOAD WHERE symbol = %s", (symbol,))
+        load = cur.fetchone()
+        if not load:
+            raise HTTPException(status_code=422, detail=f"No technical data for {symbol}. Click 'Prepare technical data' first.")
+        daily = _rows(cur, "SELECT TOP 60 trade_date, [open], high, low, [close], volume FROM dbo.TECH_PRICE_DAILY "
+                           "WHERE symbol = %s AND trade_date <= %s ORDER BY trade_date DESC", (symbol, as_of))[::-1]
+        if not daily:
+            raise HTTPException(status_code=422, detail=f"No technical data for {symbol} on or before {as_of}.")
+        today = daily[-1]
+        weekly = _rows(cur, "SELECT TOP 52 week_end, [open], high, low, [close], volume FROM dbo.TECH_PRICE_WEEKLY "
+                            "WHERE symbol = %s AND week_end <= %s ORDER BY week_end DESC", (symbol, as_of))[::-1]
+        ind = _rows(cur, f"SELECT TOP 1 trade_date, {', '.join(INDICATOR_COLUMNS)} FROM dbo.TECH_INDICATOR_DAILY "
+                         f"WHERE symbol = %s AND trade_date <= %s ORDER BY trade_date DESC", (symbol, as_of))
+        hist_cols = ("trade_date", "close", "sma20", "sma50", "sma200", "rsi14", "stoch_k", "macd", "macd_signal", "macd_hist", "obv", "volume_ratio", "adx14")
+        hist = _rows(cur, "SELECT TOP 30 i.trade_date, p.[close], i.sma20, i.sma50, i.sma200, i.rsi14, i.stoch_k, i.macd, i.macd_signal, "
+                          "i.macd_hist, i.obv, i.volume_ratio, i.adx14 FROM dbo.TECH_INDICATOR_DAILY i JOIN dbo.TECH_PRICE_DAILY p "
+                          "ON p.symbol = i.symbol AND p.trade_date = i.trade_date WHERE i.symbol = %s AND i.trade_date <= %s "
+                          "ORDER BY i.trade_date DESC", (symbol, as_of), hist_cols)[::-1]
+        trend = _rows(cur, f"SELECT TOP 1 trade_date, {', '.join(TREND_COLUMNS)} FROM dbo.TECH_TREND_DAILY "
+                           f"WHERE symbol = %s AND trade_date <= %s ORDER BY trade_date DESC", (symbol, as_of))
+        pivots = _rows(cur, "SELECT TOP 20 pivot_date, pivot_type, price, confirmed_date FROM dbo.TECH_PIVOT "
+                            "WHERE symbol = %s AND confirmed_date <= %s ORDER BY pivot_date DESC", (symbol, as_of))[::-1]
+        levels = _rows(cur, "SELECT level_type, price, touches, last_touch_date, distance_pct, rank FROM dbo.TECH_LEVEL "
+                            "WHERE symbol = %s AND as_of_date = (SELECT MAX(as_of_date) FROM dbo.TECH_LEVEL WHERE symbol = %s AND as_of_date <= %s) "
+                            "ORDER BY level_type, rank", (symbol, symbol, as_of))
+        signals = _rows(cur, "SELECT signal_date, signal_type, direction, description, value FROM dbo.TECH_SIGNAL "
+                             "WHERE symbol = %s AND signal_date <= %s AND signal_date >= %s ORDER BY signal_date",
+                        (symbol, as_of, as_of - timedelta(days=120)))
+        patterns = _rows(cur, "SELECT pattern_type, direction, start_date, end_date, confirmed_date, neckline, target, description "
+                              "FROM dbo.TECH_PATTERN WHERE symbol = %s AND confirmed_date <= %s AND confirmed_date >= %s ORDER BY confirmed_date",
+                         (symbol, as_of, as_of - timedelta(days=250)))
+        cur.execute("SELECT MIN(trade_date), COUNT(*) FROM dbo.TECH_PRICE_DAILY WHERE symbol = %s AND trade_date <= %s", (symbol, as_of))
+        first, ndays = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM dbo.TECH_PIVOT WHERE symbol = %s AND confirmed_date <= %s", (symbol, as_of))
+        npiv = cur.fetchone()[0]
+        profile = {}
+        cur.execute(f"SELECT summary_json, bundle_json FROM {SYMBOL_DATA_TABLE} WHERE symbol = %s", (symbol,)) if table_exists(cur) else None
+        row = cur.fetchone() if cur.description else None
+        if row and row[1]:
+            prof = json.loads(row[1]).get("profile", {})
+            profile = {k: prof[k] for k in ("longName", "sector", "industry", "currency") if k in prof}
+    finally:
+        conn.close()
+
+    computed_at = load[0].isoformat()
+    payload = {
+        "symbol": symbol,
+        "analysis_date": as_of.isoformat(),
+        "profile": profile,
+        "today": {k: today[k] for k in ("trade_date", "open", "high", "low", "close", "volume")},
+        "daily_bars": daily,
+        "weekly_bars": weekly,
+        "indicators": ind[0] if ind else {"trade_date": today["trade_date"]},
+        "indicator_history": hist,
+        "trend": trend[0] if trend else {"trade_date": today["trade_date"], "primary_trend": "unknown", "intermediate_trend": "unknown",
+                                        "short_trend": "unknown", "trend_strength": "unknown", "structure": "insufficient data",
+                                        "higher_highs": 0, "higher_lows": 0, "lower_highs": 0, "lower_lows": 0},
+        "pivots": pivots,
+        "levels": levels,
+        "signals": signals,
+        "patterns": patterns,
+        "data_coverage": {"first_trade_date": first.isoformat() if first else today["trade_date"], "trading_days_available": ndays,
+                          "computed_at": computed_at, "weeks_available": len(weekly), "pivots_known": npiv, "signals_in_window": len(signals)},
+        "source_note": (f"POINT-IN-TIME TECHNICAL DATA. Today is {as_of.isoformat()}; the latest bar is {today['trade_date']}. "
+                        f"Every value comes from the TECH_ tables computed on {computed_at[:19]} UTC from stored daily prices; nothing was "
+                        f"fetched or calculated for this run. Only rows dated on or before today are included; swing pivots and patterns "
+                        f"appear only from their confirmation date. You have no knowledge of anything after today."),
+    }
+    references = [
+        {"type": "table", "title": "TECH_PRICE_DAILY", "detail": f"{ndays} daily bars {payload['data_coverage']['first_trade_date']} to {today['trade_date']}; last 60 supplied", "used_for": "price action, current price, volume"},
+        {"type": "table", "title": "TECH_PRICE_WEEKLY", "detail": f"{len(weekly)} completed weeks supplied (<= {as_of})", "used_for": "primary trend, weekly structure"},
+        {"type": "table", "title": "TECH_INDICATOR_DAILY", "detail": f"row for {payload['indicators'].get('trade_date')} plus {len(hist)}-day history", "used_for": "moving averages, MACD, RSI, stochastics, Bollinger, ATR, OBV, ADX, 52-week range, returns"},
+        {"type": "table", "title": "TECH_TREND_DAILY", "detail": f"row for {payload['trend'].get('trade_date')}", "used_for": "primary / intermediate / short trend, strength, swing structure"},
+        {"type": "table", "title": "TECH_PIVOT", "detail": f"{npiv} swings confirmed by {as_of}; last {len(pivots)} supplied", "used_for": "swing highs/lows, structure"},
+        {"type": "table", "title": "TECH_LEVEL", "detail": f"{len(levels)} levels as of the latest trading day <= {as_of}", "used_for": "support, resistance, Fibonacci, swing extremes"},
+        {"type": "table", "title": "TECH_SIGNAL", "detail": f"{len(signals)} events in the 120 days to {as_of}", "used_for": "crossovers, zone entries, breakouts, volume spikes, divergences"},
+        {"type": "table", "title": "TECH_PATTERN", "detail": f"{len(patterns)} patterns confirmed in the 250 days to {as_of}", "used_for": "reversal patterns and measured-move targets"},
+        {"type": "table", "title": "TECH_LOAD", "detail": f"computed {computed_at[:19]} UTC from {load[1]} to {load[2]}", "used_for": "provenance"},
+    ]
+    return payload, references
+
+
+class TechPrepareRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+
+
+@app.get("/api/py/tech/{symbol}")
+def tech_data_status(symbol: str):
+    return tech_status(normalize_symbol(symbol))
+
+
+@app.post("/api/py/tech/prepare")
+def tech_prepare(req: TechPrepareRequest):
+    symbol = normalize_symbol(req.symbol)
+    log = RunLog("x", "y")
+    result = prepare_technicals(symbol, log)
+    return {**result, "log": log.entries}
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",
