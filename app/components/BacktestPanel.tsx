@@ -370,18 +370,28 @@ export default function BacktestPanel() {
     window.history.replaceState(null, "", `${window.location.pathname}?${q}`);
   }, [skillId, symbol, bt?.backtest_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // When a symbol is selected, show its most recent run for this skill (live if it is still going).
+  // When the symbol or skill changes, refresh the data-bundle status and the list of previous runs.
+  // A run is only shown on request (Load last run / a run link / ?bt= in the URL), never automatically.
   useEffect(() => {
     const sym = symbol.trim();
-    const t = setTimeout(async () => {
+    const t = setTimeout(() => {
       loadDataStatus(sym);
-      const list = await loadPrevious(sym, skillId);
-      const matches = bt && bt.symbol === sym && bt.skill_id === skillId;
-      if (!matches && !running && !creating && list.length > 0) openPrevious(list[0].backtest_id);
-      else if (!matches && !running && !creating) setBt(null);
+      loadPrevious(sym, skillId);
     }, 400);
     return () => clearTimeout(t);
-  }, [symbol, skillId, loadPrevious, loadDataStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [symbol, skillId, loadPrevious, loadDataStatus]);
+
+  async function loadLastRun() {
+    const sym = symbol.trim();
+    if (!sym || !skillId) return;
+    setError(null);
+    const list = previous.length ? previous : await loadPrevious(sym, skillId);
+    if (list.length === 0) {
+      setError(`No previous run of ${skillId} for ${sym}.`);
+      return;
+    }
+    await openPrevious(list[0].backtest_id);
+  }
 
   // Live status: poll the backtest while any Monday is pending or running (even if another tab drives it).
   const active = !!bt && bt.counts.pending + bt.counts.running > 0;
@@ -540,6 +550,15 @@ export default function BacktestPanel() {
         <button type="submit" className="btn" disabled={creating || running || !symbol.trim() || !skillId}>
           {creating ? "Preparing…" : `Run first ${weeks} Monday${weeks === 1 ? "" : "s"} of ${year}`}
         </button>
+        <button
+          type="button"
+          className="btn ghost"
+          disabled={creating || running || !symbol.trim() || !skillId || previous.length === 0}
+          title={previous.length ? `Load run #${previous[0].backtest_id} (${previous[0].year}, ${previous[0].done}/${previous[0].total} done)` : "No previous run for this symbol and skill"}
+          onClick={loadLastRun}
+        >
+          Load last run
+        </button>
       </form>
       <p className="msg hint">
         {skill ? <>{skill.name}: </> : null}
@@ -588,7 +607,7 @@ export default function BacktestPanel() {
 
       {previous.length > 0 && !running && (
         <p className="msg hint">
-          {previous.length === 1 ? "Showing the latest run" : "Runs"} for {symbol.trim()}:{" "}
+          Previous runs for {symbol.trim()}:{" "}
           {previous.slice(0, 6).map((p, i) => (
             <span key={p.backtest_id}>
               {i > 0 && " · "}
