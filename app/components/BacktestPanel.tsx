@@ -223,7 +223,7 @@ function YearCalendar({ bt }: { bt: Backtest }) {
         <span><i className="cal-key" /> no run</span>
         <span><i className="cal-key sched" /> scheduled</span>
         <span><i className="cal-key running" /> running</span>
-        <span><i className="cal-key done" /> completed — click for the report</span>
+        <span><i className="cal-key done" /> completed — shows the verdict (B buy · H hold · S sell); click for the report</span>
         <span><i className="cal-key failed" /> failed</span>
         <span><i className="cal-key cancelled" /> cancelled</span>
       </div>
@@ -242,12 +242,14 @@ function YearCalendar({ bt }: { bt: Backtest }) {
                 const title = dec
                   ? `${date}: ${dec.status}${dec.recommendation ? ` · ${dec.recommendation}` : ""}${dec.headline ? ` · ${dec.headline}` : ""}${dec.error ? ` · ${dec.error}` : ""}`
                   : date;
+                // Completed Mondays show the verdict letter (B / H / S) instead of the day number.
+                const label = dec?.status === "done" && dec.recommendation ? dec.recommendation[0] : String(day);
                 return (
                   <span key={date} className={`cal-day ${cls}`} title={title}>
                     {clickable ? (
-                      <Link href={`/agent/backtest/decision?bt=${bt.backtest_id}&id=${dec.decision_id}`}>{day}</Link>
+                      <Link href={`/agent/backtest/decision?bt=${bt.backtest_id}&id=${dec.decision_id}`}>{label}</Link>
                     ) : (
-                      day
+                      label
                     )}
                   </span>
                 );
