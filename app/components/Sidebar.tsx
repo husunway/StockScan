@@ -25,7 +25,12 @@ const items: Item[] = [
       { href: "/agent", label: "Skill library" },
     ],
   },
-  { href: "/diagnosis", label: "Diagnosis", icon: "⚙" },
+  {
+    href: "/diagnosis",
+    label: "Diagnosis",
+    icon: "⚙",
+    children: [{ href: "/diagnosis/runs", label: "Run history" }],
+  },
 ];
 
 // A child link is active when its path matches and, if it carries a query (e.g. ?skill=x),

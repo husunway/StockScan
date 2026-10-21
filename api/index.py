@@ -2100,6 +2100,71 @@ def agent_diagnostics():
     return info
 
 
+@app.get("/api/py/agent/runs")
+def list_runs(limit: int = 200):
+    """Every backtest run with its agent, timing, Monday range, counts, overall status and failure reasons."""
+    limit = max(1, min(limit, 1000))
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        ensure_backtest_tables(cur)
+        conn.commit()
+        cur.execute(
+            f"SELECT TOP {limit} b.backtest_id, b.skill_id, b.skill_version, b.symbol, b.[year], b.created_at, b.status, "
+            f"MIN(d.as_of_date), MAX(d.as_of_date), MIN(d.started_at), MAX(d.finished_at), COUNT(d.decision_id), "
+            f"SUM(CASE WHEN d.status = 'done' THEN 1 ELSE 0 END), SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN d.status = 'cancelled' THEN 1 ELSE 0 END), SUM(CASE WHEN d.status = 'pending' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN d.status = 'running' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN d.recommendation = 'BUY' THEN 1 ELSE 0 END), SUM(CASE WHEN d.recommendation = 'HOLD' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN d.recommendation = 'SELL' THEN 1 ELSE 0 END), SUM(ISNULL(d.input_tokens, 0)), SUM(ISNULL(d.output_tokens, 0)) "
+            f"FROM {BACKTESTS_TABLE} b LEFT JOIN {DECISIONS_TABLE} d ON d.backtest_id = b.backtest_id "
+            f"GROUP BY b.backtest_id, b.skill_id, b.skill_version, b.symbol, b.[year], b.created_at, b.status "
+            f"ORDER BY b.created_at DESC"
+        )
+        rows = cur.fetchall()
+        ids = [r[0] for r in rows]
+        failures: dict[int, list] = {}
+        if ids:
+            cur.execute(
+                f"SELECT backtest_id, as_of_date, status, error, decision_id FROM {DECISIONS_TABLE} "
+                f"WHERE backtest_id IN ({', '.join('%s' for _ in ids)}) AND error IS NOT NULL ORDER BY as_of_date",
+                tuple(ids),
+            )
+            for bid, as_of, status, error, did in cur.fetchall():
+                failures.setdefault(bid, []).append({"as_of_date": as_of.isoformat(), "status": status, "error": error, "decision_id": did})
+    finally:
+        conn.close()
+
+    runs = []
+    for r in rows:
+        (bid, skill_id, version, symbol, year, created, bstatus, first, last, started, finished, total,
+         done, failed, cancelled, pending, running, buy, hold, sell, tin, tout) = r
+        done, failed, cancelled, pending, running = (x or 0 for x in (done, failed, cancelled, pending, running))
+        if (bstatus or "active") == "stopped":
+            overall = "stopped"
+        elif failed:
+            overall = "failed"
+        elif pending or running:
+            overall = "in progress"
+        elif total and done == total:
+            overall = "success"
+        else:
+            overall = "partial"
+        duration = (finished - started).total_seconds() if started and finished else None
+        runs.append({
+            "backtest_id": bid, "skill_id": skill_id, "skill_version": version, "symbol": symbol, "year": year,
+            "created_at": created.isoformat(), "started_at": started.isoformat() if started else None,
+            "finished_at": finished.isoformat() if finished else None, "duration_s": round(duration) if duration is not None else None,
+            "first_monday": first.isoformat() if first else None, "last_monday": last.isoformat() if last else None,
+            "status": overall, "backtest_status": bstatus or "active",
+            "counts": {"total": total, "done": done, "failed": failed, "cancelled": cancelled, "pending": pending, "running": running},
+            "verdicts": {"BUY": buy or 0, "HOLD": hold or 0, "SELL": sell or 0},
+            "tokens": {"input": tin or 0, "output": tout or 0},
+            "failures": failures.get(bid, []),
+        })
+    return {"runs": runs}
+
+
 @app.post("/api/py/agent/backtest")
 def create_backtest(req: BacktestRequest):
     require_claude()

@@ -344,6 +344,17 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 }
 .diag-item .stat-label { display: inline-flex; align-items: center; gap: 6px; }
 .diag-item strong { font-size: 0.9rem; }
+/* Run history */
+.status-pill { padding: 2px 9px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; color: #fff; background: var(--muted); white-space: nowrap; }
+.status-pill.good { background: #0ca30c; }
+.status-pill.bad { background: #d03b3b; }
+.status-pill.warn { background: #c98500; }
+.status-pill.info { background: var(--accent); }
+.fail-list { margin: 0; padding-left: 16px; font-size: 0.82rem; }
+.fail-list li { margin: 2px 0; }
+.row-open td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.row-detail td { background: var(--bg); padding: 10px 12px 14px; }
+.run-detail .table { font-size: 0.82rem; }
 .resume-hint { color: var(--text); background: var(--surface); border: 1px solid var(--border); border-left: 4px solid #c98500; border-radius: 8px; padding: 8px 12px; }
 .hello-reply { color: var(--text); font-style: italic; }
 .hello-reply strong { font-style: normal; }
