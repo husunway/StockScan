@@ -23,173 +23,860 @@
     "TECH_LOAD": "audit: when the symbol's technical data was computed, from which price range, with which parameters"
   },
   "parameters": {
-    "sma": [5, 10, 20, 50, 100, 200], "ema": [12, 26], "macd": [12, 26, 9], "rsi": 14, "stochastic": [14, 3],
-    "bollinger": [20, 2], "atr": 14, "adx": 14, "obv_sma": 20, "volume_sma": 20, "pivot_window": 5,
-    "level_cluster_pct": 1.5, "level_lookback_days": 250, "volume_spike_ratio": 1.5
+    "sma": [
+      5,
+      10,
+      20,
+      50,
+      100,
+      200
+    ],
+    "ema": [
+      12,
+      26
+    ],
+    "macd": [
+      12,
+      26,
+      9
+    ],
+    "rsi": 14,
+    "stochastic": [
+      14,
+      3
+    ],
+    "bollinger": [
+      20,
+      2
+    ],
+    "atr": 14,
+    "adx": 14,
+    "obv_sma": 20,
+    "volume_sma": 20,
+    "pivot_window": 5,
+    "level_cluster_pct": 1.5,
+    "level_lookback_days": 250,
+    "volume_spike_ratio": 1.5
   },
   "input": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["symbol", "analysis_date", "today", "daily_bars", "weekly_bars", "indicators", "indicator_history", "trend", "pivots", "levels", "signals", "patterns", "data_coverage", "source_note"],
+    "required": [
+      "symbol",
+      "analysis_date",
+      "today",
+      "daily_bars",
+      "weekly_bars",
+      "indicators",
+      "indicator_history",
+      "trend",
+      "pivots",
+      "levels",
+      "signals",
+      "patterns",
+      "data_coverage",
+      "source_note"
+    ],
     "properties": {
-      "symbol": { "type": "string" },
-      "analysis_date": { "type": "string", "format": "date", "description": "'Today' for the agent. Nothing after this date is supplied." },
+      "symbol": {
+        "type": "string"
+      },
+      "analysis_date": {
+        "type": "string",
+        "format": "date",
+        "description": "'Today' for the agent. Nothing after this date is supplied."
+      },
       "profile": {
-        "type": "object", "additionalProperties": true,
+        "type": "object",
+        "additionalProperties": true,
         "description": "Optional: name, sector, industry, currency from the symbol's data bundle when one exists."
       },
       "today": {
-        "type": "object", "additionalProperties": false,
+        "type": "object",
+        "additionalProperties": false,
         "description": "The latest daily bar on or before the analysis date (TECH_PRICE_DAILY).",
         "properties": {
-          "trade_date": { "type": "string", "format": "date" }, "open": { "type": "number" }, "high": { "type": "number" },
-          "low": { "type": "number" }, "close": { "type": "number", "description": "The 'current price' for the verdict." },
-          "volume": { "type": ["integer", "null"] }
+          "trade_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "open": {
+            "type": "number"
+          },
+          "high": {
+            "type": "number"
+          },
+          "low": {
+            "type": "number"
+          },
+          "close": {
+            "type": "number",
+            "description": "The 'current price' for the verdict."
+          },
+          "volume": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
         },
-        "required": ["trade_date", "open", "high", "low", "close", "volume"]
+        "required": [
+          "trade_date",
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume"
+        ]
       },
       "daily_bars": {
-        "type": "array", "description": "Last 60 trading days up to today (TECH_PRICE_DAILY), oldest first.",
-        "items": { "$ref": "#/$defs/bar" }
+        "type": "array",
+        "description": "Last 60 trading days up to today (TECH_PRICE_DAILY), oldest first.",
+        "items": {
+          "$ref": "#/$defs/bar"
+        }
       },
       "weekly_bars": {
-        "type": "array", "description": "Last 52 completed weeks up to today (TECH_PRICE_WEEKLY), oldest first.",
-        "items": { "$ref": "#/$defs/weeklyBar" }
+        "type": "array",
+        "description": "Last 52 completed weeks up to today (TECH_PRICE_WEEKLY), oldest first.",
+        "items": {
+          "$ref": "#/$defs/weeklyBar"
+        }
       },
       "indicators": {
-        "type": "object", "additionalProperties": false,
+        "type": "object",
+        "additionalProperties": false,
         "description": "TECH_INDICATOR_DAILY row for today. Null when not enough history (e.g. sma200 in the first 200 days).",
         "properties": {
-          "trade_date": { "type": "string", "format": "date" },
-          "sma5": { "type": ["number", "null"] }, "sma10": { "type": ["number", "null"] }, "sma20": { "type": ["number", "null"] },
-          "sma50": { "type": ["number", "null"] }, "sma100": { "type": ["number", "null"] }, "sma200": { "type": ["number", "null"] },
-          "ema12": { "type": ["number", "null"] }, "ema26": { "type": ["number", "null"] },
-          "macd": { "type": ["number", "null"] }, "macd_signal": { "type": ["number", "null"] }, "macd_hist": { "type": ["number", "null"] },
-          "rsi14": { "type": ["number", "null"], "description": "0-100; >70 overbought, <30 oversold" },
-          "stoch_k": { "type": ["number", "null"] }, "stoch_d": { "type": ["number", "null"] },
-          "bb_upper": { "type": ["number", "null"] }, "bb_middle": { "type": ["number", "null"] }, "bb_lower": { "type": ["number", "null"] },
-          "bb_pct_b": { "type": ["number", "null"], "description": "(close - lower) / (upper - lower)" },
-          "bb_bandwidth": { "type": ["number", "null"], "description": "(upper - lower) / middle * 100; low = squeeze" },
-          "atr14": { "type": ["number", "null"], "description": "Average true range in price units; use for stop distance" },
-          "obv": { "type": ["number", "null"] }, "obv_sma20": { "type": ["number", "null"] },
-          "volume_sma20": { "type": ["number", "null"] }, "volume_ratio": { "type": ["number", "null"], "description": "today's volume / 20-day average" },
-          "roc10": { "type": ["number", "null"], "description": "10-day rate of change, percent" },
-          "adx14": { "type": ["number", "null"], "description": ">25 trending, <20 range-bound" },
-          "plus_di14": { "type": ["number", "null"] }, "minus_di14": { "type": ["number", "null"] },
-          "high_52w": { "type": ["number", "null"] }, "low_52w": { "type": ["number", "null"] },
-          "pct_from_52w_high": { "type": ["number", "null"] }, "pct_from_52w_low": { "type": ["number", "null"] },
-          "ret_1w": { "type": ["number", "null"] }, "ret_1m": { "type": ["number", "null"] }, "ret_3m": { "type": ["number", "null"] },
-          "ret_6m": { "type": ["number", "null"] }, "ret_1y": { "type": ["number", "null"] },
-          "volatility_20d": { "type": ["number", "null"], "description": "annualized, percent" }
+          "trade_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "sma5": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sma10": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sma20": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sma50": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sma100": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sma200": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ema12": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ema26": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "macd": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "macd_signal": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "macd_hist": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rsi14": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "0-100; >70 overbought, <30 oversold"
+          },
+          "stoch_k": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "stoch_d": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "bb_upper": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "bb_middle": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "bb_lower": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "bb_pct_b": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "(close - lower) / (upper - lower)"
+          },
+          "bb_bandwidth": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "(upper - lower) / middle * 100; low = squeeze"
+          },
+          "atr14": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Average true range in price units; use for stop distance"
+          },
+          "obv": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "obv_sma20": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "volume_sma20": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "volume_ratio": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "today's volume / 20-day average"
+          },
+          "roc10": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "10-day rate of change, percent"
+          },
+          "adx14": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": ">25 trending, <20 range-bound"
+          },
+          "plus_di14": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "minus_di14": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "high_52w": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "low_52w": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pct_from_52w_high": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pct_from_52w_low": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ret_1w": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ret_1m": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ret_3m": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ret_6m": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ret_1y": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "volatility_20d": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "annualized, percent"
+          }
         },
-        "required": ["trade_date"]
+        "required": [
+          "trade_date"
+        ]
       },
       "indicator_history": {
-        "type": "array", "description": "Last 30 trading days of the key oscillators and averages (TECH_INDICATOR_DAILY), oldest first, for reading divergences and crossovers.",
+        "type": "array",
+        "description": "Last 30 trading days of the key oscillators and averages (TECH_INDICATOR_DAILY), oldest first, for reading divergences and crossovers.",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "trade_date": { "type": "string", "format": "date" }, "close": { "type": "number" },
-            "sma20": { "type": ["number", "null"] }, "sma50": { "type": ["number", "null"] }, "sma200": { "type": ["number", "null"] },
-            "rsi14": { "type": ["number", "null"] }, "stoch_k": { "type": ["number", "null"] }, "macd": { "type": ["number", "null"] },
-            "macd_signal": { "type": ["number", "null"] }, "macd_hist": { "type": ["number", "null"] }, "obv": { "type": ["number", "null"] },
-            "volume_ratio": { "type": ["number", "null"] }, "adx14": { "type": ["number", "null"] }
+            "trade_date": {
+              "type": "string",
+              "format": "date"
+            },
+            "close": {
+              "type": "number"
+            },
+            "sma20": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "sma50": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "sma200": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "rsi14": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "stoch_k": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "macd": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "macd_signal": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "macd_hist": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "obv": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "volume_ratio": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "adx14": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
           },
-          "required": ["trade_date", "close"]
+          "required": [
+            "trade_date",
+            "close"
+          ]
         }
       },
       "trend": {
-        "type": "object", "additionalProperties": false,
+        "type": "object",
+        "additionalProperties": false,
         "description": "TECH_TREND_DAILY row for today.",
         "properties": {
-          "trade_date": { "type": "string", "format": "date" },
-          "primary_trend": { "type": "string", "enum": ["up", "down", "sideways", "unknown"], "description": "200-day average: price position and slope" },
-          "intermediate_trend": { "type": "string", "enum": ["up", "down", "sideways", "unknown"], "description": "50-day average" },
-          "short_trend": { "type": "string", "enum": ["up", "down", "sideways", "unknown"], "description": "20-day average" },
-          "trend_strength": { "type": "string", "enum": ["strong", "moderate", "weak", "unknown"], "description": "from ADX: >=40 strong, 25-40 moderate, <25 weak" },
-          "structure": { "type": "string", "description": "swing structure over the last 60 days, e.g. 'higher highs and higher lows'" },
-          "higher_highs": { "type": "integer" }, "higher_lows": { "type": "integer" }, "lower_highs": { "type": "integer" }, "lower_lows": { "type": "integer" },
-          "sma200_slope_pct": { "type": ["number", "null"], "description": "20-day change of the 200-day average, percent" },
-          "sma50_slope_pct": { "type": ["number", "null"] },
-          "price_vs_sma200_pct": { "type": ["number", "null"] }, "price_vs_sma50_pct": { "type": ["number", "null"] },
-          "days_above_sma200": { "type": ["integer", "null"], "description": "consecutive days closing above (positive) or below (negative) the 200-day average" }
+          "trade_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "primary_trend": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "sideways",
+              "unknown"
+            ],
+            "description": "200-day average: price position and slope"
+          },
+          "intermediate_trend": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "sideways",
+              "unknown"
+            ],
+            "description": "50-day average"
+          },
+          "short_trend": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "sideways",
+              "unknown"
+            ],
+            "description": "20-day average"
+          },
+          "trend_strength": {
+            "type": "string",
+            "enum": [
+              "strong",
+              "moderate",
+              "weak",
+              "unknown"
+            ],
+            "description": "from ADX: >=40 strong, 25-40 moderate, <25 weak"
+          },
+          "structure": {
+            "type": "string",
+            "description": "swing structure over the last 60 days, e.g. 'higher highs and higher lows'"
+          },
+          "higher_highs": {
+            "type": "integer"
+          },
+          "higher_lows": {
+            "type": "integer"
+          },
+          "lower_highs": {
+            "type": "integer"
+          },
+          "lower_lows": {
+            "type": "integer"
+          },
+          "sma200_slope_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "20-day change of the 200-day average, percent"
+          },
+          "sma50_slope_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "price_vs_sma200_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "price_vs_sma50_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "days_above_sma200": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "consecutive days closing above (positive) or below (negative) the 200-day average"
+          }
         },
-        "required": ["trade_date", "primary_trend", "intermediate_trend", "short_trend", "trend_strength", "structure"]
+        "required": [
+          "trade_date",
+          "primary_trend",
+          "intermediate_trend",
+          "short_trend",
+          "trend_strength",
+          "structure"
+        ]
       },
       "pivots": {
-        "type": "array", "description": "Last 20 confirmed swing highs/lows (TECH_PIVOT) known by today, oldest first.",
+        "type": "array",
+        "description": "Last 20 confirmed swing highs/lows (TECH_PIVOT) known by today, oldest first.",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "pivot_date": { "type": "string", "format": "date" }, "pivot_type": { "type": "string", "enum": ["high", "low"] },
-            "price": { "type": "number" }, "confirmed_date": { "type": "string", "format": "date" }
+            "pivot_date": {
+              "type": "string",
+              "format": "date"
+            },
+            "pivot_type": {
+              "type": "string",
+              "enum": [
+                "high",
+                "low"
+              ]
+            },
+            "price": {
+              "type": "number"
+            },
+            "confirmed_date": {
+              "type": "string",
+              "format": "date"
+            }
           },
-          "required": ["pivot_date", "pivot_type", "price", "confirmed_date"]
+          "required": [
+            "pivot_date",
+            "pivot_type",
+            "price",
+            "confirmed_date"
+          ]
         }
       },
       "levels": {
-        "type": "array", "description": "TECH_LEVEL rows as of today: support and resistance clusters (touch counts), Fibonacci retracements of the last major swing, and the swing extremes.",
+        "type": "array",
+        "description": "TECH_LEVEL rows as of today: support and resistance clusters (touch counts), Fibonacci retracements of the last major swing, and the swing extremes.",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "level_type": { "type": "string", "enum": ["support", "resistance", "fib_382", "fib_500", "fib_618", "swing_high", "swing_low"] },
-            "price": { "type": "number" }, "touches": { "type": ["integer", "null"] },
-            "last_touch_date": { "type": ["string", "null"] }, "distance_pct": { "type": "number", "description": "(level / close - 1) * 100" },
-            "rank": { "type": "integer", "description": "1 = strongest / nearest" }
+            "level_type": {
+              "type": "string",
+              "enum": [
+                "support",
+                "resistance",
+                "fib_382",
+                "fib_500",
+                "fib_618",
+                "swing_high",
+                "swing_low"
+              ]
+            },
+            "price": {
+              "type": "number"
+            },
+            "touches": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "last_touch_date": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "distance_pct": {
+              "type": "number",
+              "description": "(level / close - 1) * 100"
+            },
+            "rank": {
+              "type": "integer",
+              "description": "1 = strongest / nearest"
+            }
           },
-          "required": ["level_type", "price", "distance_pct", "rank"]
+          "required": [
+            "level_type",
+            "price",
+            "distance_pct",
+            "rank"
+          ]
         }
       },
       "signals": {
-        "type": "array", "description": "TECH_SIGNAL events in the last 120 days up to today, oldest first.",
+        "type": "array",
+        "description": "TECH_SIGNAL events in the last 120 days up to today, oldest first.",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "signal_date": { "type": "string", "format": "date" },
-            "signal_type": { "type": "string", "description": "golden_cross, death_cross, sma20_50_cross_up/down, price_above_sma200, price_below_sma200, macd_cross_up/down, rsi_overbought, rsi_oversold, rsi_exit_overbought, rsi_exit_oversold, stoch_overbought, stoch_oversold, bb_breakout_up/down, high_52w_breakout, low_52w_breakdown, volume_spike, bullish_divergence, bearish_divergence" },
-            "direction": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
-            "description": { "type": "string" }, "value": { "type": ["number", "null"] }
+            "signal_date": {
+              "type": "string",
+              "format": "date"
+            },
+            "signal_type": {
+              "type": "string",
+              "description": "golden_cross, death_cross, sma20_50_cross_up/down, price_above_sma200, price_below_sma200, macd_cross_up/down, rsi_overbought, rsi_oversold, rsi_exit_overbought, rsi_exit_oversold, stoch_overbought, stoch_oversold, bb_breakout_up/down, high_52w_breakout, low_52w_breakdown, volume_spike, bullish_divergence, bearish_divergence"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "bullish",
+                "bearish",
+                "neutral"
+              ]
+            },
+            "description": {
+              "type": "string"
+            },
+            "value": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
           },
-          "required": ["signal_date", "signal_type", "direction", "description"]
+          "required": [
+            "signal_date",
+            "signal_type",
+            "direction",
+            "description"
+          ]
         }
       },
       "patterns": {
-        "type": "array", "description": "TECH_PATTERN rows confirmed on or before today (last 250 days).",
+        "type": "array",
+        "description": "TECH_PATTERN rows confirmed on or before today (last 250 days).",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "pattern_type": { "type": "string", "enum": ["double_top", "double_bottom", "head_and_shoulders", "inverse_head_and_shoulders"] },
-            "direction": { "type": "string", "enum": ["bullish", "bearish"] },
-            "start_date": { "type": "string", "format": "date" }, "end_date": { "type": "string", "format": "date" },
-            "confirmed_date": { "type": "string", "format": "date", "description": "first close beyond the neckline" },
-            "neckline": { "type": "number" }, "target": { "type": "number", "description": "measured move from the neckline" },
-            "description": { "type": "string" }
+            "pattern_type": {
+              "type": "string",
+              "enum": [
+                "double_top",
+                "double_bottom",
+                "head_and_shoulders",
+                "inverse_head_and_shoulders"
+              ]
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "bullish",
+                "bearish"
+              ]
+            },
+            "start_date": {
+              "type": "string",
+              "format": "date"
+            },
+            "end_date": {
+              "type": "string",
+              "format": "date"
+            },
+            "confirmed_date": {
+              "type": "string",
+              "format": "date",
+              "description": "first close beyond the neckline"
+            },
+            "neckline": {
+              "type": "number"
+            },
+            "target": {
+              "type": "number",
+              "description": "measured move from the neckline"
+            },
+            "description": {
+              "type": "string"
+            }
           },
-          "required": ["pattern_type", "direction", "start_date", "end_date", "confirmed_date", "neckline", "target", "description"]
+          "required": [
+            "pattern_type",
+            "direction",
+            "start_date",
+            "end_date",
+            "confirmed_date",
+            "neckline",
+            "target",
+            "description"
+          ]
         }
       },
       "data_coverage": {
-        "type": "object", "additionalProperties": false,
+        "type": "object",
+        "additionalProperties": false,
         "description": "What history exists for the symbol by today (from TECH_LOAD and the row filters).",
         "properties": {
-          "first_trade_date": { "type": "string" }, "trading_days_available": { "type": "integer" },
-          "computed_at": { "type": "string", "description": "when the TECH_ tables were computed (UTC)" },
-          "weeks_available": { "type": "integer" }, "pivots_known": { "type": "integer" }, "signals_in_window": { "type": "integer" }
+          "first_trade_date": {
+            "type": "string"
+          },
+          "trading_days_available": {
+            "type": "integer"
+          },
+          "computed_at": {
+            "type": "string",
+            "description": "when the TECH_ tables were computed (UTC)"
+          },
+          "weeks_available": {
+            "type": "integer"
+          },
+          "pivots_known": {
+            "type": "integer"
+          },
+          "signals_in_window": {
+            "type": "integer"
+          }
         },
-        "required": ["first_trade_date", "trading_days_available", "computed_at"]
+        "required": [
+          "first_trade_date",
+          "trading_days_available",
+          "computed_at"
+        ]
       },
-      "source_note": { "type": "string" }
+      "source_note": {
+        "type": "string"
+      }
     },
     "$defs": {
       "bar": {
-        "type": "object", "additionalProperties": false,
-        "properties": { "trade_date": { "type": "string" }, "open": { "type": "number" }, "high": { "type": "number" }, "low": { "type": "number" }, "close": { "type": "number" }, "volume": { "type": ["integer", "null"] } },
-        "required": ["trade_date", "open", "high", "low", "close", "volume"]
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "trade_date": {
+            "type": "string"
+          },
+          "open": {
+            "type": "number"
+          },
+          "high": {
+            "type": "number"
+          },
+          "low": {
+            "type": "number"
+          },
+          "close": {
+            "type": "number"
+          },
+          "volume": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "trade_date",
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume"
+        ]
       },
       "weeklyBar": {
-        "type": "object", "additionalProperties": false,
-        "properties": { "week_end": { "type": "string" }, "open": { "type": "number" }, "high": { "type": "number" }, "low": { "type": "number" }, "close": { "type": "number" }, "volume": { "type": ["integer", "null"] } },
-        "required": ["week_end", "open", "high", "low", "close", "volume"]
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "week_end": {
+            "type": "string"
+          },
+          "open": {
+            "type": "number"
+          },
+          "high": {
+            "type": "number"
+          },
+          "low": {
+            "type": "number"
+          },
+          "close": {
+            "type": "number"
+          },
+          "volume": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "week_end",
+          "open",
+          "high",
+          "low",
+          "close",
+          "volume"
+        ]
       }
     }
   },
@@ -197,108 +884,333 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "recommendation": { "type": "string", "enum": ["BUY", "HOLD", "SELL"] },
-      "conviction": { "type": "string", "enum": ["high", "medium", "low"] },
-      "headline": { "type": "string", "description": "One-sentence conclusion with the main technical reason." },
-      "currency": { "type": "string" },
-      "current_price": { "type": "number", "description": "today.close" },
-      "buy_below_price": { "type": "number", "description": "Top of the entry zone at which reward is still at least twice the risk." },
-      "target_price": { "type": ["number", "null"] },
-      "stop_price": { "type": ["number", "null"] },
-      "target_rationale": { "type": "string", "description": "Method: measured move, next resistance, Fibonacci extension - with the level used." },
-      "stop_rationale": { "type": "string", "description": "Which support or swing low it sits under and the ATR distance." },
-      "time_horizon": { "type": "string" },
-      "summary": { "type": "string" },
+      "recommendation": {
+        "type": "string",
+        "enum": [
+          "BUY",
+          "HOLD",
+          "SELL"
+        ]
+      },
+      "conviction": {
+        "type": "string",
+        "enum": [
+          "high",
+          "medium",
+          "low"
+        ]
+      },
+      "headline": {
+        "type": "string",
+        "description": "One-sentence conclusion with the main technical reason."
+      },
+      "currency": {
+        "type": "string"
+      },
+      "current_price": {
+        "type": "number",
+        "description": "today.close"
+      },
+      "buy_below_price": {
+        "type": "number",
+        "description": "Top of the entry zone at which reward is still at least twice the risk."
+      },
+      "target_price": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "stop_price": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "target_rationale": {
+        "type": "string",
+        "description": "Method: measured move, next resistance, Fibonacci extension - with the level used."
+      },
+      "stop_rationale": {
+        "type": "string",
+        "description": "Which support or swing low it sits under and the ATR distance."
+      },
+      "time_horizon": {
+        "type": "string"
+      },
+      "summary": {
+        "type": "string"
+      },
       "trend_assessment": {
-        "type": "object", "additionalProperties": false,
+        "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "primary": { "type": "string", "enum": ["up", "down", "sideways"] },
-          "intermediate": { "type": "string", "enum": ["up", "down", "sideways"] },
-          "minor": { "type": "string", "enum": ["up", "down", "sideways"] },
-          "dow_phase": { "type": "string", "enum": ["accumulation", "public participation", "distribution", "unclear"] },
-          "strength": { "type": "string", "description": "ADX reading and its meaning" },
-          "volume_confirms": { "type": "boolean" },
-          "evidence": { "type": "string" }
+          "primary": {
+            "type": "string",
+            "description": "up, down or sideways"
+          },
+          "intermediate": {
+            "type": "string",
+            "description": "up, down or sideways"
+          },
+          "minor": {
+            "type": "string",
+            "description": "up, down or sideways"
+          },
+          "dow_phase": {
+            "type": "string",
+            "description": "accumulation, public participation, distribution or unclear"
+          },
+          "volume_confirms": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Averages, slopes, swing structure, ADX strength and volume behaviour supporting the classification."
+          }
         },
-        "required": ["primary", "intermediate", "minor", "dow_phase", "strength", "volume_confirms", "evidence"]
+        "required": [
+          "primary",
+          "intermediate",
+          "minor",
+          "dow_phase",
+          "volume_confirms",
+          "evidence"
+        ]
       },
       "key_levels": {
         "type": "array",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "type": { "type": "string", "enum": ["support", "resistance", "fibonacci", "moving_average", "swing", "round_number", "breakout"] },
-            "price": { "type": "number" }, "significance": { "type": "string" }, "source": { "type": "string" }
+            "type": {
+              "type": "string",
+              "description": "support, resistance, fibonacci, moving_average, swing, round_number or breakout"
+            },
+            "price": {
+              "type": "number"
+            },
+            "source": {
+              "type": "string"
+            }
           },
-          "required": ["type", "price", "significance", "source"]
+          "required": [
+            "type",
+            "price",
+            "source"
+          ]
         }
       },
       "indicator_readings": {
         "type": "array",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "indicator": { "type": "string" }, "value": { "type": "string" },
-            "reading": { "type": "string", "enum": ["bullish", "bearish", "neutral", "overbought", "oversold", "divergence"] },
-            "implication": { "type": "string" }, "source": { "type": "string" }
+            "indicator": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            },
+            "reading": {
+              "type": "string",
+              "description": "bullish, bearish, neutral, overbought, oversold or divergence"
+            },
+            "source": {
+              "type": "string"
+            }
           },
-          "required": ["indicator", "value", "reading", "implication", "source"]
-        }
+          "required": [
+            "indicator",
+            "value",
+            "reading",
+            "source"
+          ]
+        },
+        "description": "One entry per indicator used (include ADX/trend strength, RSI, stochastics, MACD, OBV, Bollinger). Put the implication in the summary or a section."
       },
       "patterns_identified": {
         "type": "array",
         "items": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "pattern": { "type": "string" }, "status": { "type": "string", "enum": ["confirmed", "forming", "inferred", "failed"] },
-            "implication": { "type": "string" }, "target": { "type": ["number", "null"] }, "source": { "type": "string" }
+            "pattern": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "description": "confirmed, forming, inferred or failed"
+            },
+            "target": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
           },
-          "required": ["pattern", "status", "implication", "target", "source"]
+          "required": [
+            "pattern",
+            "status",
+            "target",
+            "source"
+          ]
         }
       },
       "trade_plan": {
-        "type": "object", "additionalProperties": false,
+        "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "entry_zone": { "type": "string" }, "stop_basis": { "type": "string" }, "target_method": { "type": "string" },
-          "risk_pct": { "type": ["number", "null"], "description": "(current - stop) / current * 100" },
-          "reward_pct": { "type": ["number", "null"], "description": "(target - current) / current * 100" },
-          "reward_to_risk": { "type": ["number", "null"] },
-          "invalidation": { "type": "string", "description": "What price action would prove the thesis wrong." }
+          "entry_zone": {
+            "type": "string"
+          },
+          "stop_basis": {
+            "type": "string"
+          },
+          "target_method": {
+            "type": "string"
+          },
+          "reward_to_risk": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "invalidation": {
+            "type": "string",
+            "description": "What price action would prove the thesis wrong."
+          }
         },
-        "required": ["entry_zone", "stop_basis", "target_method", "risk_pct", "reward_pct", "reward_to_risk", "invalidation"]
+        "required": [
+          "entry_zone",
+          "stop_basis",
+          "target_method",
+          "reward_to_risk",
+          "invalidation"
+        ]
       },
       "checklist": {
         "type": "array",
         "items": {
-          "type": "object", "additionalProperties": false,
-          "properties": { "criterion": { "type": "string" }, "verdict": { "type": "string", "enum": ["pass", "fail", "unclear"] }, "evidence": { "type": "string" } },
-          "required": ["criterion", "verdict", "evidence"]
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "criterion": {
+              "type": "string"
+            },
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "pass",
+                "fail",
+                "unclear"
+              ]
+            },
+            "evidence": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "criterion",
+            "verdict",
+            "evidence"
+          ]
         }
       },
       "sections": {
         "type": "array",
         "items": {
-          "type": "object", "additionalProperties": false,
-          "properties": { "title": { "type": "string" }, "content": { "type": "string" } },
-          "required": ["title", "content"]
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "content"
+          ]
         }
       },
       "key_metrics": {
         "type": "array",
         "items": {
-          "type": "object", "additionalProperties": false,
-          "properties": { "name": { "type": "string" }, "value": { "type": "string" }, "assessment": { "type": "string" }, "source": { "type": "string" } },
-          "required": ["name", "value", "assessment", "source"]
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            },
+            "assessment": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "value",
+            "assessment",
+            "source"
+          ]
         }
       },
-      "risks": { "type": "array", "items": { "type": "string" } },
-      "assumptions": { "type": "array", "items": { "type": "string" } },
-      "data_gaps": { "type": "array", "items": { "type": "string" } }
+      "risks": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "assumptions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "data_gaps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
     },
     "required": [
-      "recommendation", "conviction", "headline", "currency", "current_price", "buy_below_price", "target_price", "stop_price",
-      "target_rationale", "stop_rationale", "time_horizon", "summary", "trend_assessment", "key_levels", "indicator_readings",
-      "patterns_identified", "trade_plan", "checklist", "sections", "key_metrics", "risks", "assumptions", "data_gaps"
+      "recommendation",
+      "conviction",
+      "headline",
+      "currency",
+      "current_price",
+      "buy_below_price",
+      "target_price",
+      "stop_price",
+      "target_rationale",
+      "stop_rationale",
+      "time_horizon",
+      "summary",
+      "trend_assessment",
+      "key_levels",
+      "indicator_readings",
+      "patterns_identified",
+      "trade_plan",
+      "checklist",
+      "sections",
+      "key_metrics",
+      "risks",
+      "assumptions",
+      "data_gaps"
     ]
   },
   "output_rules_enforced_by_server": [

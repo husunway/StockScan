@@ -26,27 +26,94 @@
   "input": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["symbol", "analysis_date", "price", "fundamentals", "annual_statements", "source_note"],
+    "required": [
+      "symbol",
+      "analysis_date",
+      "price",
+      "fundamentals",
+      "annual_statements",
+      "source_note"
+    ],
     "properties": {
-      "symbol": { "type": "string", "description": "Ticker as used by Yahoo Finance, upper case." },
-      "analysis_date": { "type": "string", "format": "date", "description": "Date the analysis is run; 'today' for horizons and staleness." },
-      "source_note": { "type": "string", "description": "Provenance note for fundamentals and statements." },
+      "symbol": {
+        "type": "string",
+        "description": "Ticker as used by Yahoo Finance, upper case."
+      },
+      "analysis_date": {
+        "type": "string",
+        "format": "date",
+        "description": "Date the analysis is run; 'today' for horizons and staleness."
+      },
+      "source_note": {
+        "type": "string",
+        "description": "Provenance note for fundamentals and statements."
+      },
       "price": {
         "type": "object",
         "description": "Snapshot derived from daily closes. Drawdown and volatility are useful as a market-implied stress signal; the rest is context.",
         "additionalProperties": false,
-        "required": ["as_of", "last_close", "high_52w", "low_52w", "source"],
+        "required": [
+          "as_of",
+          "last_close",
+          "high_52w",
+          "low_52w",
+          "source"
+        ],
         "properties": {
-          "as_of": { "type": "string", "format": "date" },
-          "last_close": { "type": "number", "description": "Last daily close; the 'current price' for the verdict." },
-          "high_52w": { "type": "number" },
-          "low_52w": { "type": "number" },
-          "ma200": { "type": ["number", "null"], "description": "200-day simple moving average; null if fewer than 200 rows." },
-          "pct_vs_ma200": { "type": ["number", "null"] },
-          "return_1y_pct": { "type": ["number", "null"] },
-          "annualized_volatility_pct": { "type": ["number", "null"], "description": "Realized volatility; higher values suggest the market already prices more risk." },
-          "max_drawdown_1y_pct": { "type": ["number", "null"], "description": "Largest peak-to-trough decline in the last year (<= 0); a realized stress reference for stop_price." },
-          "source": { "type": "string", "enum": ["database", "yahoo"] }
+          "as_of": {
+            "type": "string",
+            "format": "date"
+          },
+          "last_close": {
+            "type": "number",
+            "description": "Last daily close; the 'current price' for the verdict."
+          },
+          "high_52w": {
+            "type": "number"
+          },
+          "low_52w": {
+            "type": "number"
+          },
+          "ma200": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "200-day simple moving average; null if fewer than 200 rows."
+          },
+          "pct_vs_ma200": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "return_1y_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "annualized_volatility_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Realized volatility; higher values suggest the market already prices more risk."
+          },
+          "max_drawdown_1y_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Largest peak-to-trough decline in the last year (<= 0); a realized stress reference for stop_price."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "database",
+              "yahoo"
+            ]
+          }
         }
       },
       "fundamentals": {
@@ -54,107 +121,311 @@
         "description": "Yahoo Finance quote-summary fields. Only fields Yahoo returned are present. The API gathers exactly these keys for this skill.",
         "additionalProperties": false,
         "properties": {
-          "longName": { "type": "string" },
-          "sector": { "type": "string", "description": "Financial Services triggers the ROTCE / tangible-book framing." },
-          "industry": { "type": "string" },
-          "country": { "type": "string" },
-          "currency": { "type": "string", "description": "Trading currency; all output prices use this." },
-          "financialCurrency": { "type": "string", "description": "Reporting currency of the statements." },
-          "marketCap": { "type": "number" },
-          "enterpriseValue": { "type": "number" },
-          "currentPrice": { "type": "number" },
-          "trailingPE": { "type": "number", "description": "Price / trailing EPS - the starting point for the normalized-earnings multiple check." },
-          "forwardPE": { "type": "number", "description": "Analyst-estimate based; context only." },
-          "priceToBook": { "type": "number", "description": "For financials, compare with return on equity relative to cost of equity." },
-          "enterpriseToEbitda": { "type": "number" },
-          "trailingEps": { "type": "number" },
-          "forwardEps": { "type": "number" },
-          "returnOnEquity": { "type": "number", "description": "Fraction. For financials, the proxy for return on tangible common equity when tangible book is not supplied." },
-          "returnOnAssets": { "type": "number", "description": "Fraction; for banks, a leverage-neutral profitability check." },
-          "debtToEquity": { "type": "number", "description": "PERCENTAGE (e.g. 45.2). Core leverage input." },
-          "currentRatio": { "type": "number", "description": "Current assets / current liabilities. Liquidity." },
-          "quickRatio": { "type": "number", "description": "(Current assets - inventory) / current liabilities. Stricter liquidity." },
-          "totalDebt": { "type": "number", "description": "Short + long-term debt, financial currency." },
-          "totalCash": { "type": "number", "description": "Cash and short-term investments. totalDebt - totalCash = net debt." },
-          "totalCashPerShare": { "type": "number" },
-          "ebitda": { "type": "number", "description": "Trailing EBITDA; with Interest Expense gives coverage." },
-          "ebitdaMargins": { "type": "number", "description": "Fraction." },
-          "freeCashflow": { "type": "number", "description": "Trailing free cash flow; FCF / marketCap = FCF yield." },
-          "operatingCashflow": { "type": "number" },
-          "totalRevenue": { "type": "number" },
-          "revenueGrowth": { "type": "number", "description": "Latest quarter YoY, fraction." },
-          "earningsGrowth": { "type": "number", "description": "Latest quarter YoY, fraction." },
-          "grossMargins": { "type": "number", "description": "Fraction." },
-          "operatingMargins": { "type": "number", "description": "Fraction. Compare with the annual series to judge where in the cycle current margins sit." },
-          "profitMargins": { "type": "number", "description": "Fraction." },
-          "netIncomeToCommon": { "type": "number", "description": "Trailing net income attributable to common shareholders." },
-          "dividendYield": { "type": "number", "description": "See conventions.ratios." },
-          "payoutRatio": { "type": "number", "description": "Dividends / earnings, fraction. Dividend cover = 1 / payoutRatio." },
-          "sharesOutstanding": { "type": "number" },
-          "bookValue": { "type": "number", "description": "Book value PER SHARE." },
-          "beta": { "type": "number", "description": "Context only." },
-          "fiftyTwoWeekHigh": { "type": "number" },
-          "fiftyTwoWeekLow": { "type": "number" },
-          "heldPercentInsiders": { "type": "number", "description": "Fraction; alignment signal." },
-          "fullTimeEmployees": { "type": "number", "description": "With revenue gives revenue per employee, a productivity/cost-discipline check." },
-          "auditRisk": { "type": "number", "description": "Governance risk score 1-10 (10 = highest risk)." },
-          "boardRisk": { "type": "number", "description": "Governance risk score 1-10." },
-          "compensationRisk": { "type": "number", "description": "Governance risk score 1-10." },
-          "shareHolderRightsRisk": { "type": "number", "description": "Governance risk score 1-10." },
-          "overallRisk": { "type": "number", "description": "Overall governance risk score 1-10." },
-          "longBusinessSummary": { "type": "string", "description": "Company description; primary input for the competitive-position and risk-identification judgments." }
+          "longName": {
+            "type": "string"
+          },
+          "sector": {
+            "type": "string",
+            "description": "Financial Services triggers the ROTCE / tangible-book framing."
+          },
+          "industry": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string",
+            "description": "Trading currency; all output prices use this."
+          },
+          "financialCurrency": {
+            "type": "string",
+            "description": "Reporting currency of the statements."
+          },
+          "marketCap": {
+            "type": "number"
+          },
+          "enterpriseValue": {
+            "type": "number"
+          },
+          "currentPrice": {
+            "type": "number"
+          },
+          "trailingPE": {
+            "type": "number",
+            "description": "Price / trailing EPS - the starting point for the normalized-earnings multiple check."
+          },
+          "forwardPE": {
+            "type": "number",
+            "description": "Analyst-estimate based; context only."
+          },
+          "priceToBook": {
+            "type": "number",
+            "description": "For financials, compare with return on equity relative to cost of equity."
+          },
+          "enterpriseToEbitda": {
+            "type": "number"
+          },
+          "trailingEps": {
+            "type": "number"
+          },
+          "forwardEps": {
+            "type": "number"
+          },
+          "returnOnEquity": {
+            "type": "number",
+            "description": "Fraction. For financials, the proxy for return on tangible common equity when tangible book is not supplied."
+          },
+          "returnOnAssets": {
+            "type": "number",
+            "description": "Fraction; for banks, a leverage-neutral profitability check."
+          },
+          "debtToEquity": {
+            "type": "number",
+            "description": "PERCENTAGE (e.g. 45.2). Core leverage input."
+          },
+          "currentRatio": {
+            "type": "number",
+            "description": "Current assets / current liabilities. Liquidity."
+          },
+          "quickRatio": {
+            "type": "number",
+            "description": "(Current assets - inventory) / current liabilities. Stricter liquidity."
+          },
+          "totalDebt": {
+            "type": "number",
+            "description": "Short + long-term debt, financial currency."
+          },
+          "totalCash": {
+            "type": "number",
+            "description": "Cash and short-term investments. totalDebt - totalCash = net debt."
+          },
+          "totalCashPerShare": {
+            "type": "number"
+          },
+          "ebitda": {
+            "type": "number",
+            "description": "Trailing EBITDA; with Interest Expense gives coverage."
+          },
+          "ebitdaMargins": {
+            "type": "number",
+            "description": "Fraction."
+          },
+          "freeCashflow": {
+            "type": "number",
+            "description": "Trailing free cash flow; FCF / marketCap = FCF yield."
+          },
+          "operatingCashflow": {
+            "type": "number"
+          },
+          "totalRevenue": {
+            "type": "number"
+          },
+          "revenueGrowth": {
+            "type": "number",
+            "description": "Latest quarter YoY, fraction."
+          },
+          "earningsGrowth": {
+            "type": "number",
+            "description": "Latest quarter YoY, fraction."
+          },
+          "grossMargins": {
+            "type": "number",
+            "description": "Fraction."
+          },
+          "operatingMargins": {
+            "type": "number",
+            "description": "Fraction. Compare with the annual series to judge where in the cycle current margins sit."
+          },
+          "profitMargins": {
+            "type": "number",
+            "description": "Fraction."
+          },
+          "netIncomeToCommon": {
+            "type": "number",
+            "description": "Trailing net income attributable to common shareholders."
+          },
+          "dividendYield": {
+            "type": "number",
+            "description": "See conventions.ratios."
+          },
+          "payoutRatio": {
+            "type": "number",
+            "description": "Dividends / earnings, fraction. Dividend cover = 1 / payoutRatio."
+          },
+          "sharesOutstanding": {
+            "type": "number"
+          },
+          "bookValue": {
+            "type": "number",
+            "description": "Book value PER SHARE."
+          },
+          "beta": {
+            "type": "number",
+            "description": "Context only."
+          },
+          "fiftyTwoWeekHigh": {
+            "type": "number"
+          },
+          "fiftyTwoWeekLow": {
+            "type": "number"
+          },
+          "heldPercentInsiders": {
+            "type": "number",
+            "description": "Fraction; alignment signal."
+          },
+          "fullTimeEmployees": {
+            "type": "number",
+            "description": "With revenue gives revenue per employee, a productivity/cost-discipline check."
+          },
+          "auditRisk": {
+            "type": "number",
+            "description": "Governance risk score 1-10 (10 = highest risk)."
+          },
+          "boardRisk": {
+            "type": "number",
+            "description": "Governance risk score 1-10."
+          },
+          "compensationRisk": {
+            "type": "number",
+            "description": "Governance risk score 1-10."
+          },
+          "shareHolderRightsRisk": {
+            "type": "number",
+            "description": "Governance risk score 1-10."
+          },
+          "overallRisk": {
+            "type": "number",
+            "description": "Overall governance risk score 1-10."
+          },
+          "longBusinessSummary": {
+            "type": "string",
+            "description": "Company description; primary input for the competitive-position and risk-identification judgments."
+          }
         }
       },
       "annual_statements": {
         "type": "object",
         "description": "Selected line items from the annual statements, each as {fiscal year: value}. A row is absent if Yahoo did not report it; a year is null if that year is missing. The API gathers exactly these rows for this skill.",
         "additionalProperties": false,
-        "required": ["income", "balance", "cashflow"],
+        "required": [
+          "income",
+          "balance",
+          "cashflow"
+        ],
         "properties": {
           "income": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "Total Revenue": { "$ref": "#/$defs/yearSeries" },
-              "Gross Profit": { "$ref": "#/$defs/yearSeries" },
-              "Operating Income": { "$ref": "#/$defs/yearSeries", "description": "With Interest Expense gives interest coverage by year." },
-              "EBITDA": { "$ref": "#/$defs/yearSeries" },
-              "Pretax Income": { "$ref": "#/$defs/yearSeries" },
-              "Tax Provision": { "$ref": "#/$defs/yearSeries" },
-              "Net Income": { "$ref": "#/$defs/yearSeries", "description": "Series used to judge through-the-cycle (normalized) earnings." },
-              "Diluted EPS": { "$ref": "#/$defs/yearSeries" },
-              "Interest Expense": { "$ref": "#/$defs/yearSeries", "description": "Denominator of interest coverage." }
+              "Total Revenue": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Gross Profit": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Operating Income": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "With Interest Expense gives interest coverage by year."
+              },
+              "EBITDA": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Pretax Income": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Tax Provision": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Net Income": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Series used to judge through-the-cycle (normalized) earnings."
+              },
+              "Diluted EPS": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Interest Expense": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Denominator of interest coverage."
+              }
             }
           },
           "balance": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "Total Debt": { "$ref": "#/$defs/yearSeries" },
-              "Long Term Debt": { "$ref": "#/$defs/yearSeries" },
-              "Net Debt": { "$ref": "#/$defs/yearSeries", "description": "Debt less cash; negative = net cash." },
-              "Current Assets": { "$ref": "#/$defs/yearSeries" },
-              "Current Liabilities": { "$ref": "#/$defs/yearSeries" },
-              "Working Capital": { "$ref": "#/$defs/yearSeries" },
-              "Stockholders Equity": { "$ref": "#/$defs/yearSeries" },
-              "Tangible Book Value": { "$ref": "#/$defs/yearSeries", "description": "Equity less intangibles; the base for return on tangible equity (financials)." },
-              "Cash And Cash Equivalents": { "$ref": "#/$defs/yearSeries" },
-              "Total Assets": { "$ref": "#/$defs/yearSeries", "description": "Equity / Total Assets is a simple leverage ratio for banks." },
-              "Ordinary Shares Number": { "$ref": "#/$defs/yearSeries", "description": "Falling = buybacks, rising = dilution." }
+              "Total Debt": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Long Term Debt": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Net Debt": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Debt less cash; negative = net cash."
+              },
+              "Current Assets": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Current Liabilities": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Working Capital": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Stockholders Equity": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Tangible Book Value": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Equity less intangibles; the base for return on tangible equity (financials)."
+              },
+              "Cash And Cash Equivalents": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Total Assets": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Equity / Total Assets is a simple leverage ratio for banks."
+              },
+              "Ordinary Shares Number": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Falling = buybacks, rising = dilution."
+              }
             }
           },
           "cashflow": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "Operating Cash Flow": { "$ref": "#/$defs/yearSeries" },
-              "Capital Expenditure": { "$ref": "#/$defs/yearSeries", "description": "Negative as reported." },
-              "Free Cash Flow": { "$ref": "#/$defs/yearSeries" },
-              "Depreciation And Amortization": { "$ref": "#/$defs/yearSeries" },
-              "Issuance Of Debt": { "$ref": "#/$defs/yearSeries", "description": "Positive = new borrowing." },
-              "Repayment Of Debt": { "$ref": "#/$defs/yearSeries", "description": "Negative = debt repaid. Issuance + Repayment = net borrowing." },
-              "Repurchase Of Capital Stock": { "$ref": "#/$defs/yearSeries", "description": "Negative = cash spent on buybacks." },
-              "Cash Dividends Paid": { "$ref": "#/$defs/yearSeries", "description": "Negative = cash paid out." }
+              "Operating Cash Flow": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Capital Expenditure": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Negative as reported."
+              },
+              "Free Cash Flow": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Depreciation And Amortization": {
+                "$ref": "#/$defs/yearSeries"
+              },
+              "Issuance Of Debt": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Positive = new borrowing."
+              },
+              "Repayment Of Debt": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Negative = debt repaid. Issuance + Repayment = net borrowing."
+              },
+              "Repurchase Of Capital Stock": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Negative = cash spent on buybacks."
+              },
+              "Cash Dividends Paid": {
+                "$ref": "#/$defs/yearSeries",
+                "description": "Negative = cash paid out."
+              }
             }
           }
         }
@@ -164,8 +435,15 @@
       "yearSeries": {
         "type": "object",
         "description": "Fiscal-year keyed values in the financial currency.",
-        "propertyNames": { "pattern": "^[0-9]{4}$" },
-        "additionalProperties": { "type": ["number", "null"] }
+        "propertyNames": {
+          "pattern": "^[0-9]{4}$"
+        },
+        "additionalProperties": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
       }
     }
   },
@@ -173,50 +451,155 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "recommendation": { "type": "string", "enum": ["BUY", "HOLD", "SELL"] },
-      "conviction": { "type": "string", "enum": ["high", "medium", "low"] },
-      "headline": { "type": "string", "description": "One-sentence conclusion stating the recommendation and the main reason." },
-      "currency": { "type": "string" },
-      "current_price": { "type": "number" },
-      "intrinsic_value_low": { "type": "number", "description": "Low fair-value estimate (through-the-cycle earnings x conservative multiple)." },
-      "intrinsic_value_base": { "type": "number", "description": "Base fair-value estimate." },
-      "intrinsic_value_high": { "type": "number", "description": "High fair-value estimate." },
-      "margin_of_safety_pct": { "type": "number", "description": "(intrinsic_value_base - current_price) / intrinsic_value_base * 100" },
-      "required_margin_of_safety_pct": { "type": "number", "description": "20% for a fortress balance sheet, 30% or more otherwise." },
-      "buy_below_price": { "type": "number" },
-      "target_price": { "type": ["number", "null"] },
-      "stop_price": { "type": ["number", "null"] },
-      "target_rationale": { "type": "string" },
-      "stop_rationale": { "type": "string" },
-      "time_horizon": { "type": "string" },
-      "summary": { "type": "string", "description": "Two to four paragraphs: verdict, balance-sheet grade, through-the-cycle earnings and stress-test result, valuation, what would change the view." },
+      "recommendation": {
+        "type": "string",
+        "enum": [
+          "BUY",
+          "HOLD",
+          "SELL"
+        ]
+      },
+      "conviction": {
+        "type": "string",
+        "enum": [
+          "high",
+          "medium",
+          "low"
+        ]
+      },
+      "headline": {
+        "type": "string",
+        "description": "One-sentence conclusion stating the recommendation and the main reason."
+      },
+      "currency": {
+        "type": "string"
+      },
+      "current_price": {
+        "type": "number"
+      },
+      "intrinsic_value_low": {
+        "type": "number",
+        "description": "Low fair-value estimate (through-the-cycle earnings x conservative multiple)."
+      },
+      "intrinsic_value_base": {
+        "type": "number",
+        "description": "Base fair-value estimate."
+      },
+      "intrinsic_value_high": {
+        "type": "number",
+        "description": "High fair-value estimate."
+      },
+      "margin_of_safety_pct": {
+        "type": "number",
+        "description": "(intrinsic_value_base - current_price) / intrinsic_value_base * 100"
+      },
+      "required_margin_of_safety_pct": {
+        "type": "number",
+        "description": "20% for a fortress balance sheet, 30% or more otherwise."
+      },
+      "buy_below_price": {
+        "type": "number"
+      },
+      "target_price": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "stop_price": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "target_rationale": {
+        "type": "string"
+      },
+      "stop_rationale": {
+        "type": "string"
+      },
+      "time_horizon": {
+        "type": "string"
+      },
+      "summary": {
+        "type": "string",
+        "description": "Two to four paragraphs: verdict, balance-sheet grade, through-the-cycle earnings and stress-test result, valuation, what would change the view."
+      },
       "balance_sheet": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "grade": { "type": "string", "enum": ["fortress", "solid", "adequate", "stretched", "fragile"] },
-          "liquidity": { "type": "string", "description": "Assessment with the figures used." },
-          "leverage": { "type": "string" },
-          "interest_coverage": { "type": "string" },
-          "capital_return_discipline": { "type": "string", "description": "Buybacks, dividends and net borrowing judged together." }
+          "grade": {
+            "type": "string",
+            "enum": [
+              "fortress",
+              "solid",
+              "adequate",
+              "stretched",
+              "fragile"
+            ]
+          },
+          "liquidity": {
+            "type": "string",
+            "description": "Assessment with the figures used."
+          },
+          "leverage": {
+            "type": "string"
+          },
+          "interest_coverage": {
+            "type": "string"
+          },
+          "capital_return_discipline": {
+            "type": "string",
+            "description": "Buybacks, dividends and net borrowing judged together."
+          }
         },
-        "required": ["grade", "liquidity", "leverage", "interest_coverage", "capital_return_discipline"]
+        "required": [
+          "grade",
+          "liquidity",
+          "leverage",
+          "interest_coverage",
+          "capital_return_discipline"
+        ]
       },
       "stress_test": {
         "type": "array",
-        "minItems": 3,
         "items": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "scenario": { "type": "string", "enum": ["base", "recession", "severe"] },
-            "assumptions": { "type": "string" },
-            "earnings_impact_pct": { "type": "number", "description": "Change in normalized earnings vs base, percent (base = 0)." },
-            "price_impact_pct": { "type": "number", "description": "Estimated change in share price vs current, percent." },
-            "survives_without_capital_raise": { "type": "boolean" }
+            "scenario": {
+              "type": "string",
+              "enum": [
+                "base",
+                "recession",
+                "severe"
+              ]
+            },
+            "assumptions": {
+              "type": "string"
+            },
+            "earnings_impact_pct": {
+              "type": "number",
+              "description": "Change in normalized earnings vs base, percent (base = 0)."
+            },
+            "price_impact_pct": {
+              "type": "number",
+              "description": "Estimated change in share price vs current, percent."
+            },
+            "survives_without_capital_raise": {
+              "type": "boolean"
+            }
           },
-          "required": ["scenario", "assumptions", "earnings_impact_pct", "price_impact_pct", "survives_without_capital_raise"]
-        }
+          "required": [
+            "scenario",
+            "assumptions",
+            "earnings_impact_pct",
+            "price_impact_pct",
+            "survives_without_capital_raise"
+          ]
+        },
+        "description": "At least three scenarios: base, recession, severe (the server warns when fewer are returned)."
       },
       "checklist": {
         "type": "array",
@@ -224,11 +607,26 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "criterion": { "type": "string" },
-            "verdict": { "type": "string", "enum": ["pass", "fail", "unclear"] },
-            "evidence": { "type": "string" }
+            "criterion": {
+              "type": "string"
+            },
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "pass",
+                "fail",
+                "unclear"
+              ]
+            },
+            "evidence": {
+              "type": "string"
+            }
           },
-          "required": ["criterion", "verdict", "evidence"]
+          "required": [
+            "criterion",
+            "verdict",
+            "evidence"
+          ]
         }
       },
       "sections": {
@@ -236,8 +634,18 @@
         "items": {
           "type": "object",
           "additionalProperties": false,
-          "properties": { "title": { "type": "string" }, "content": { "type": "string" } },
-          "required": ["title", "content"]
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "content"
+          ]
         }
       },
       "key_metrics": {
@@ -246,38 +654,112 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "name": { "type": "string" },
-            "value": { "type": "string" },
-            "assessment": { "type": "string" },
-            "source": { "type": "string" }
+            "name": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            },
+            "assessment": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
           },
-          "required": ["name", "value", "assessment", "source"]
+          "required": [
+            "name",
+            "value",
+            "assessment",
+            "source"
+          ]
         }
       },
       "valuation": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "method": { "type": "string", "description": "e.g. normalized earnings x fair multiple; ROTCE vs cost of equity on tangible book for financials; FCF yield cross-check." },
-          "normalized_earnings": { "type": "string", "description": "Through-the-cycle earnings used, with how it was derived from the reported years." },
-          "fair_multiple": { "type": "number", "description": "Multiple applied to normalized earnings (or P/TBV for financials)." },
-          "cost_of_equity_pct": { "type": "number" },
-          "fcf_yield_pct": { "type": ["number", "null"], "description": "Free cash flow / market cap, percent, if computable." },
-          "notes": { "type": "string" }
+          "method": {
+            "type": "string",
+            "description": "e.g. normalized earnings x fair multiple; ROTCE vs cost of equity on tangible book for financials; FCF yield cross-check."
+          },
+          "normalized_earnings": {
+            "type": "string",
+            "description": "Through-the-cycle earnings used, with how it was derived from the reported years."
+          },
+          "fair_multiple": {
+            "type": "number",
+            "description": "Multiple applied to normalized earnings (or P/TBV for financials)."
+          },
+          "cost_of_equity_pct": {
+            "type": "number"
+          },
+          "fcf_yield_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Free cash flow / market cap, percent, if computable."
+          },
+          "notes": {
+            "type": "string"
+          }
         },
-        "required": ["method", "normalized_earnings", "fair_multiple", "cost_of_equity_pct", "fcf_yield_pct", "notes"]
+        "required": [
+          "method",
+          "normalized_earnings",
+          "fair_multiple",
+          "cost_of_equity_pct",
+          "fcf_yield_pct",
+          "notes"
+        ]
       },
-      "risks": { "type": "array", "items": { "type": "string" } },
-      "assumptions": { "type": "array", "items": { "type": "string" } },
-      "data_gaps": { "type": "array", "items": { "type": "string" } }
+      "risks": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "assumptions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "data_gaps": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
     },
     "required": [
-      "recommendation", "conviction", "headline", "currency", "current_price",
-      "intrinsic_value_low", "intrinsic_value_base", "intrinsic_value_high",
-      "margin_of_safety_pct", "required_margin_of_safety_pct", "buy_below_price",
-      "target_price", "stop_price", "target_rationale", "stop_rationale", "time_horizon",
-      "summary", "balance_sheet", "stress_test", "checklist", "sections", "key_metrics", "valuation",
-      "risks", "assumptions", "data_gaps"
+      "recommendation",
+      "conviction",
+      "headline",
+      "currency",
+      "current_price",
+      "intrinsic_value_low",
+      "intrinsic_value_base",
+      "intrinsic_value_high",
+      "margin_of_safety_pct",
+      "required_margin_of_safety_pct",
+      "buy_below_price",
+      "target_price",
+      "stop_price",
+      "target_rationale",
+      "stop_rationale",
+      "time_horizon",
+      "summary",
+      "balance_sheet",
+      "stress_test",
+      "checklist",
+      "sections",
+      "key_metrics",
+      "valuation",
+      "risks",
+      "assumptions",
+      "data_gaps"
     ]
   },
   "output_rules_enforced_by_server": [

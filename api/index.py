@@ -850,6 +850,8 @@ def validate_verdict(a: dict) -> list[str]:
             warnings.append("Target price for a SELL is not below the current price.")
         if a.get("stop_price") is not None:
             warnings.append("A stop price was given for a SELL recommendation.")
+    if isinstance(a.get("stress_test"), list) and len(a["stress_test"]) < 3:
+        warnings.append(f"Only {len(a['stress_test'])} stress-test scenario(s) returned; the skill requires base, recession and severe.")
     return warnings
 
 
@@ -1014,12 +1016,31 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
     text_chars = 0
     thinking_events = 0
     events = 0
-    try:
+    grammar_fallback = False
+
+    def open_stream(req):
         if provider == "foundry":
             # Foundry has no server-side refusal fallback; plain Messages API.
-            manager = client.messages.stream(**request)
-        else:
-            manager = client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request)
+            return client.messages.stream(**req)
+        return client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **req)
+
+    try:
+        try:
+            manager = open_stream(request)
+            manager.__enter__()
+        except anthropic.BadRequestError as e:
+            if "grammar" not in str(e.message).lower():
+                raise
+            # The JSON-schema grammar is too large for structured outputs: ask for the JSON in text instead.
+            grammar_fallback = True
+            say(f"Structured-output grammar rejected by the API ({str(e.message)[:120]}); retrying without the grammar - "
+                "the schema is sent in the prompt and the JSON is parsed from the reply", "warn")
+            fallback_request = dict(request)
+            fallback_request["output_config"] = {"effort": effort}
+            fallback_request["messages"] = [{"role": "user", "content": user_text + "\n\nReturn ONLY a single JSON object (no prose, "
+                                             "no code fences) that conforms exactly to this JSON Schema:\n" + json.dumps(schema)}]
+            manager = open_stream(fallback_request)
+            manager.__enter__()
         with manager as stream:
             for event in stream:
                 events += 1
@@ -1074,11 +1095,24 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
         raise HTTPException(status_code=502, detail=why)
     if response.stop_reason == "max_tokens":
         raise HTTPException(status_code=502, detail="The analysis was cut off (max_tokens); please retry.")
-    text = next((b.text for b in response.content if b.type == "text"), "")
+    text = "".join(b.text for b in response.content if b.type == "text")
     try:
-        return json.loads(text), response
-    except ValueError as e:
-        raise HTTPException(status_code=502, detail="The model did not return valid JSON.") from e
+        analysis = json.loads(text)
+    except ValueError:
+        # Fallback replies may wrap the object in prose or fences: take the outermost {...}.
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise HTTPException(status_code=502, detail="The model did not return valid JSON.")
+        try:
+            analysis = json.loads(text[start:end + 1])
+        except ValueError as e:
+            raise HTTPException(status_code=502, detail=f"The model did not return valid JSON ({e}).") from e
+    if grammar_fallback:
+        missing = [k for k in schema.get("required", []) if k not in analysis]
+        if missing:
+            raise HTTPException(status_code=502, detail=f"The model's JSON is missing required fields: {', '.join(missing[:8])}")
+        say(f"Parsed JSON from the reply; all {len(schema.get('required', []))} required fields present")
+    return analysis, response
 
 
 @app.get("/api/py/agent/skills")

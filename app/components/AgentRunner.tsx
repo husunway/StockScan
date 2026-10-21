@@ -14,11 +14,11 @@ type Analysis = {
   headline: string;
   currency: string;
   current_price: number;
-  intrinsic_value_low: number;
-  intrinsic_value_base: number;
-  intrinsic_value_high: number;
-  margin_of_safety_pct: number;
-  required_margin_of_safety_pct: number;
+  intrinsic_value_low?: number;
+  intrinsic_value_base?: number;
+  intrinsic_value_high?: number;
+  margin_of_safety_pct?: number;
+  required_margin_of_safety_pct?: number;
   buy_below_price: number;
   target_price: number | null;
   stop_price: number | null;
@@ -201,9 +201,13 @@ export default function AgentRunner() {
                   {result.symbol}: {a.headline}
                 </h2>
                 <p className="verdict-meta">
-                  {result.skill.name} · Conviction <strong>{a.conviction}</strong> · Horizon {a.time_horizon} ·
-                  Margin of safety <strong>{pct(a.margin_of_safety_pct)}</strong> (required{" "}
-                  {a.required_margin_of_safety_pct.toFixed(0)}%)
+                  {result.skill.name} · Conviction <strong>{a.conviction}</strong> · Horizon {a.time_horizon}
+                  {typeof a.margin_of_safety_pct === "number" && (
+                    <>
+                      {" "}· Margin of safety <strong>{pct(a.margin_of_safety_pct)}</strong>
+                      {typeof a.required_margin_of_safety_pct === "number" && <> (required {a.required_margin_of_safety_pct.toFixed(0)}%)</>}
+                    </>
+                  )}
                 </p>
               </div>
             </div>
@@ -212,13 +216,15 @@ export default function AgentRunner() {
                 <span className="stat-label">Current price</span>
                 <span className="stat-value">{money(a.current_price, ccy)}</span>
               </div>
-              <div className="stat">
-                <span className="stat-label">Intrinsic value (base)</span>
-                <span className="stat-value">{money(a.intrinsic_value_base, ccy)}</span>
-                <span className="tile-note">
-                  Range {money(a.intrinsic_value_low, ccy)} – {money(a.intrinsic_value_high, ccy)}
-                </span>
-              </div>
+              {typeof a.intrinsic_value_base === "number" && (
+                <div className="stat">
+                  <span className="stat-label">Intrinsic value (base)</span>
+                  <span className="stat-value">{money(a.intrinsic_value_base, ccy)}</span>
+                  <span className="tile-note">
+                    Range {money(a.intrinsic_value_low, ccy)} – {money(a.intrinsic_value_high, ccy)}
+                  </span>
+                </div>
+              )}
               <div className="stat">
                 <span className="stat-label">Buy below</span>
                 <span className="stat-value">{money(a.buy_below_price, ccy)}</span>
