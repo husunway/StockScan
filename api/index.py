@@ -1214,6 +1214,7 @@ CREATE TABLE {DECISIONS_TABLE} (
     report_pathname      NVARCHAR(400)  NULL,
     report_url           NVARCHAR(1000) NULL,
     log_json             NVARCHAR(MAX)  NULL,
+    report_html_pathname NVARCHAR(400)  NULL,
     CONSTRAINT UQ_agent_decisions UNIQUE (backtest_id, as_of_date)
 );
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_symbol')
@@ -1223,6 +1224,7 @@ IF COL_LENGTH('{DECISIONS_TABLE}', 'report_pathname') IS NULL ALTER TABLE {DECIS
 IF COL_LENGTH('{DECISIONS_TABLE}', 'report_url') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_url NVARCHAR(1000) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'log_json') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'log_json') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
+IF COL_LENGTH('{DECISIONS_TABLE}', 'report_html_pathname') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_html_pathname NVARCHAR(400) NULL;
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'status') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD status NVARCHAR(10) NOT NULL CONSTRAINT DF_agent_backtests_status DEFAULT 'active';
 """
 DECISION_STATUSES = ("pending", "running", "done", "failed", "cancelled")
@@ -1232,7 +1234,7 @@ DECISION_COLUMNS = (
     "current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low", "intrinsic_value_base",
     "intrinsic_value_high", "margin_of_safety_pct", "headline", "summary", "warnings_json", "model",
     "input_tokens", "output_tokens", "error", "started_at", "finished_at",
-    "references_json", "report_pathname", "report_url", "log_json",
+    "references_json", "report_pathname", "report_url", "log_json", "report_html_pathname",
 )
 STATEMENT_NAMES = {"income": "Income statement", "balance": "Balance sheet", "cashflow": "Cash flow statement"}
 
@@ -2062,6 +2064,7 @@ def _decision_dict(row) -> dict:
     d["references"] = json.loads(d.pop("references_json") or "[]")
     d["log"] = json.loads(d.pop("log_json") or "[]")
     d["report_stored"] = bool(d.get("report_pathname"))
+    d["report_html_stored"] = bool(d.get("report_html_pathname"))
     return d
 
 
@@ -2459,6 +2462,7 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
     payload = None
     references: list[dict] = []
     report: dict = {}
+    html_report: dict = {}
     try:
         if skill.get("data_source") == "tech":
             payload, references = load_tech_bundle(symbol, as_of, skill)
@@ -2484,12 +2488,18 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         pdf_bytes = build_decision_pdf(skill, symbol, as_of.isoformat(), analysis, references,
                                        {"model": response.model, "generated_at": generated_at, "warnings": warnings})
         log.add(f"PDF generated: {len(pdf_bytes) / 1024:.1f} KB")
+        log.step("Generating HTML report (interactive chart + evidence) ...")
+        chart = load_chart_data(symbol, as_of)
+        html_text = build_decision_html(skill, symbol, as_of.isoformat(), analysis, references,
+                                        {"model": response.model, "generated_at": generated_at, "warnings": warnings}, chart)
+        log.add(f"HTML report generated: {len(html_text) / 1024:.0f} KB, chart from {chart.get('source')} with {len(chart.get('bars', []))} bars")
         if blob_configured():
             pathname = report_pathname(skill_id, symbol, as_of.isoformat(), decision_id)
-            log.step(f"Uploading PDF to Vercel Blob ({blob_access()}): {pathname}")
+            log.step(f"Uploading PDF and HTML reports to Vercel Blob ({blob_access()}): {pathname[:-4]}.{{pdf,html}}")
             try:
                 t0 = time.monotonic()
                 report = upload_report(pathname, pdf_bytes)
+                html_report = upload_html_report(pathname[:-4] + ".html", html_text)
                 log.add(f"Stored in Vercel Blob in {time.monotonic() - t0:.1f} s")
                 archive_run_json(pathname[:-4], payload, analysis, log)
             except Exception as e:  # noqa: BLE001
@@ -2520,14 +2530,14 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
                 f"buy_below_price = %s, target_price = %s, stop_price = %s, intrinsic_value_low = %s, intrinsic_value_base = %s, "
                 f"intrinsic_value_high = %s, margin_of_safety_pct = %s, headline = %s, summary = %s, input_json = %s, "
                 f"output_json = %s, warnings_json = %s, model = %s, input_tokens = %s, output_tokens = %s, "
-                f"references_json = %s, report_pathname = %s, report_url = %s, log_json = %s, "
+                f"references_json = %s, report_pathname = %s, report_url = %s, report_html_pathname = %s, log_json = %s, "
                 f"finished_at = SYSUTCDATETIME() WHERE decision_id = %s",
                 (a["recommendation"], a["conviction"], a.get("current_price"), a.get("buy_below_price"),
                  a.get("target_price"), a.get("stop_price"), a.get("intrinsic_value_low"), a.get("intrinsic_value_base"),
                  a.get("intrinsic_value_high"), a.get("margin_of_safety_pct"), (a.get("headline") or "")[:500],
                  a.get("summary"), json.dumps(payload), json.dumps(a), json.dumps(result["warnings"]),
                  result["model"], result["input_tokens"], result["output_tokens"],
-                 json.dumps(references), report.get("pathname"), report.get("url"),
+                 json.dumps(references), report.get("pathname"), report.get("url"), html_report.get("pathname"),
                  json.dumps(log.entries + [{"t": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                                             "elapsed_s": round(time.monotonic() - log._t0, 2), "level": "info",
                                             "message": "Decision saved"}]),
@@ -3187,6 +3197,320 @@ def tech_prepare(req: TechPrepareRequest):
     log = RunLog("x", "y")
     result = prepare_technicals(symbol, log)
     return {**result, "log": log.entries}
+
+
+# ---------------------------------------------------------------------------
+# Decision report, HTML version: self-contained page rendered client-side from embedded JSON.
+# For technical skills it carries an interactive candlestick chart (lightweight-charts) with the
+# indicators, levels, signals, patterns and the verdict lines, plus an evidence panel linked to the chart.
+# ---------------------------------------------------------------------------
+LIGHTWEIGHT_CHARTS_CDN = "https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"
+CHART_BARS = 250
+
+
+def load_chart_data(symbol: str, as_of: date) -> dict:
+    """Bars, indicators, levels, pivots, signals and patterns for the report chart, all dated <= as_of.
+    TECH_ tables when the symbol has them, otherwise plain bars from dbo.stock_prices."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM sys.tables WHERE name = 'TECH_LOAD'")
+        has_tech = cur.fetchone()[0] > 0
+        if has_tech:
+            cur.execute("SELECT computed_at FROM dbo.TECH_LOAD WHERE symbol = %s", (symbol,))
+            has_tech = cur.fetchone() is not None
+        if has_tech:
+            bars = _rows(cur, f"SELECT TOP {CHART_BARS} p.trade_date, p.[open], p.high, p.low, p.[close], p.volume, i.sma20, i.sma50, i.sma200, "
+                              "i.bb_upper, i.bb_lower, i.rsi14, i.macd, i.macd_signal, i.macd_hist, i.volume_sma20, i.adx14, i.obv "
+                              "FROM dbo.TECH_PRICE_DAILY p LEFT JOIN dbo.TECH_INDICATOR_DAILY i ON i.symbol = p.symbol AND i.trade_date = p.trade_date "
+                              "WHERE p.symbol = %s AND p.trade_date <= %s ORDER BY p.trade_date DESC", (symbol, as_of))[::-1]
+            levels = _rows(cur, "SELECT level_type, price, touches, last_touch_date, distance_pct, rank FROM dbo.TECH_LEVEL "
+                                "WHERE symbol = %s AND as_of_date = (SELECT MAX(as_of_date) FROM dbo.TECH_LEVEL WHERE symbol = %s AND as_of_date <= %s) "
+                                "ORDER BY level_type, rank", (symbol, symbol, as_of))
+            pivots = _rows(cur, "SELECT TOP 40 pivot_date, pivot_type, price, confirmed_date FROM dbo.TECH_PIVOT "
+                                "WHERE symbol = %s AND confirmed_date <= %s ORDER BY pivot_date DESC", (symbol, as_of))[::-1]
+            signals = _rows(cur, "SELECT signal_date, signal_type, direction, description, value FROM dbo.TECH_SIGNAL "
+                                 "WHERE symbol = %s AND signal_date <= %s AND signal_date >= %s ORDER BY signal_date",
+                            (symbol, as_of, as_of - timedelta(days=365)))
+            patterns = _rows(cur, "SELECT pattern_type, direction, start_date, end_date, confirmed_date, neckline, target, description "
+                                  "FROM dbo.TECH_PATTERN WHERE symbol = %s AND confirmed_date <= %s AND confirmed_date >= %s ORDER BY confirmed_date",
+                             (symbol, as_of, as_of - timedelta(days=365)))
+            trend = _rows(cur, f"SELECT TOP 1 trade_date, {', '.join(TREND_COLUMNS)} FROM dbo.TECH_TREND_DAILY "
+                               f"WHERE symbol = %s AND trade_date <= %s ORDER BY trade_date DESC", (symbol, as_of))
+            return {"source": "TECH_ tables", "as_of": as_of.isoformat(), "bars": bars, "levels": levels, "pivots": pivots,
+                    "signals": signals, "patterns": patterns, "trend": trend[0] if trend else None, "technical": True}
+        if not table_exists(cur):
+            return {"source": "none", "as_of": as_of.isoformat(), "bars": [], "technical": False}
+        bars = _rows(cur, f"SELECT TOP {CHART_BARS} trade_date, [open], high, low, [close], volume FROM {TABLE} "
+                          "WHERE symbol = %s AND trade_date <= %s ORDER BY trade_date DESC", (symbol, as_of))[::-1]
+        return {"source": "dbo.stock_prices", "as_of": as_of.isoformat(), "bars": bars, "levels": [], "pivots": [], "signals": [],
+                "patterns": [], "trend": None, "technical": False}
+    finally:
+        conn.close()
+
+
+REPORT_HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#f7f8fa;--surface:#fff;--text:#111827;--muted:#6b7280;--border:#e5e7eb;--accent:#2563eb;--up:#0ca30c;--down:#d03b3b;--hold:#c98500;--warn:#fab219}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0f17;--surface:#131a26;--text:#e5e7eb;--muted:#9ca3af;--border:#243042;--accent:#3b82f6}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:20px}
+h1{font-size:1.4rem;letter-spacing:-.01em}h2{font-size:1.05rem;margin:22px 0 8px}h3{font-size:.9rem;margin:12px 0 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.meta{color:var(--muted);font-size:.85rem;margin:4px 0 14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+.verdict{border-left:6px solid var(--border)}.verdict.BUY{border-left-color:var(--up)}.verdict.SELL{border-left-color:var(--down)}.verdict.HOLD{border-left-color:var(--hold)}
+.badge{display:inline-block;padding:6px 12px;border-radius:8px;color:#fff;font-weight:800;letter-spacing:.04em;background:var(--muted);vertical-align:middle;margin-right:10px}
+.BUY .badge{background:var(--up)}.SELL .badge{background:var(--down)}.HOLD .badge{background:var(--hold)}
+.headline{font-size:1.15rem;font-weight:600;display:inline}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 12px}.stat b{display:block;font-size:1.15rem}.stat span{font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.stat.target{border-color:var(--up)}.stat.stop{border-color:var(--down)}.stat.buy{border-color:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:.88rem}th,td{padding:7px 10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}th{color:var(--muted);font-size:.78rem;font-weight:600}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+p.prose{max-width:860px;margin-bottom:10px}
+ul{padding-left:20px}li{margin:3px 0}
+.pass{color:var(--up);font-weight:600}.fail{color:var(--down);font-weight:600}.unclear{color:var(--muted);font-weight:600}
+.chart-wrap{position:relative}.chart{width:100%;height:760px}
+.readout{display:flex;flex-wrap:wrap;gap:4px 14px;padding:8px 10px;border-bottom:1px solid var(--border);font-size:.8rem;color:var(--muted);min-height:34px}.readout b{color:var(--text)}
+.toggles{display:flex;flex-wrap:wrap;gap:12px;padding:8px 10px;font-size:.82rem;border-bottom:1px solid var(--border)}.toggles label{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+.key{display:inline-block;width:14px;height:3px;border-radius:2px}
+.evidence{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.ev{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 12px;cursor:pointer;transition:border-color .2s,background .2s}
+.ev:hover{border-color:var(--accent)}.ev.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--bg))}
+.ev .t{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}.ev .v{font-weight:600}.ev .s{font-size:.78rem;color:var(--muted);font-family:ui-monospace,Consolas,monospace;word-break:break-word}
+.ev.bullish{border-left:4px solid var(--up)}.ev.bearish{border-left:4px solid var(--down)}.ev.neutral{border-left:4px solid var(--border)}
+.hint{font-size:.8rem;color:var(--muted)}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:.72rem;font-weight:700;color:#fff;background:var(--muted)}.pill.bullish{background:var(--up)}.pill.bearish{background:var(--down)}
+.warn{color:var(--hold)}
+.foot{font-size:.78rem;color:var(--muted);margin-top:20px}
+@media (max-width:720px){body{padding:12px}.chart{height:620px}}
+</style>
+</head>
+<body>
+<div id="app"><p class="hint">Rendering report…</p></div>
+<script id="data" type="application/json">__DATA__</script>
+<script src="__CDN__"></script>
+<script>
+(function(){
+const D = JSON.parse(document.getElementById('data').textContent);
+const A = D.analysis || {}, C = D.chart || {bars:[]}, M = D.meta || {};
+const app = document.getElementById('app'); app.textContent = '';
+const el = (tag, attrs, ...kids) => { const e = document.createElement(tag); for (const k in attrs||{}) { if (k==='class') e.className = attrs[k]; else if (k==='style') e.style.cssText = attrs[k]; else if (k.startsWith('on')) e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); }
+  for (const kid of kids.flat()) { if (kid===null||kid===undefined) continue; e.appendChild(typeof kid==='string' ? document.createTextNode(kid) : kid); } return e; };
+const ccy = A.currency || '';
+const money = v => (v===null||v===undefined) ? '—' : Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) + (ccy ? ' ' + ccy : '');
+const pct = v => (v===null||v===undefined) ? '—' : (v>0?'+':'') + Number(v).toFixed(1) + '%';
+const paras = t => String(t||'').split(/\n{2,}/).filter(Boolean).map(p => el('p',{class:'prose'},p));
+const label = k => String(k).replace(/_/g,' ').replace(/\bpct\b/g,'%').replace(/^\w/,c=>c.toUpperCase());
+const show = v => v===null||v===undefined ? '—' : typeof v==='boolean' ? (v?'yes':'no') : typeof v==='number' ? v.toLocaleString(undefined,{maximumFractionDigits:2}) : Array.isArray(v) ? v.join(', ') : String(v);
+const table = (cols, rows, numCols) => el('table',{}, el('thead',{}, el('tr',{}, cols.map(c => el('th',{class:(numCols||[]).includes(c)?'num':''}, label(c))))),
+  el('tbody',{}, rows.map(r => el('tr',{}, cols.map(c => el('td',{class:(numCols||[]).includes(c)?'num':''}, show(r[c])))))));
+
+// ---- header + verdict
+const rec = A.recommendation || '—';
+app.append(el('h1',{}, `${D.skill.name} analysis: ${D.symbol} as of ${D.as_of}`));
+app.append(el('div',{class:'meta'}, `Skill ${D.skill.id} v${D.skill.version||'-'} · model ${M.model||''} · generated ${M.generated_at||''} UTC · point-in-time: nothing after ${D.as_of} was visible to the agent`));
+const price = A.current_price, up = A.target_price && price ? (A.target_price/price-1)*100 : null, dn = A.stop_price && price ? (A.stop_price/price-1)*100 : null;
+const v = el('div',{class:'card verdict '+rec});
+v.append(el('div',{}, el('span',{class:'badge'}, rec), el('span',{class:'headline'}, A.headline||'')));
+v.append(el('div',{class:'meta',style:'margin:6px 0 0'}, `Conviction ${A.conviction||'—'} · horizon ${A.time_horizon||'—'}` + (typeof A.margin_of_safety_pct==='number' ? ` · margin of safety ${pct(A.margin_of_safety_pct)}` : '')));
+const g = el('div',{class:'grid'});
+g.append(el('div',{class:'stat'}, el('span',{},'Price on run date'), el('b',{}, money(price))));
+if (typeof A.intrinsic_value_base==='number') g.append(el('div',{class:'stat'}, el('span',{},'Intrinsic value (base)'), el('b',{}, money(A.intrinsic_value_base)), el('small',{class:'hint'}, `range ${money(A.intrinsic_value_low)} – ${money(A.intrinsic_value_high)}`)));
+g.append(el('div',{class:'stat buy'}, el('span',{},'Buy below'), el('b',{}, money(A.buy_below_price))));
+g.append(el('div',{class:'stat target'}, el('span',{},'Target'), el('b',{}, money(A.target_price)), up!==null ? el('small',{class:'hint'}, pct(up)+' from price') : null));
+g.append(el('div',{class:'stat stop'}, el('span',{},'Stop'), el('b',{}, money(A.stop_price)), dn!==null ? el('small',{class:'hint'}, pct(dn)+' from price') : null));
+v.append(g);
+if (A.target_rationale || A.stop_rationale) v.append(el('div',{class:'hint',style:'margin-top:10px'}, A.target_rationale ? el('p',{}, el('b',{},'Target: '), A.target_rationale) : null, A.stop_rationale ? el('p',{}, el('b',{},'Stop: '), A.stop_rationale) : null));
+if (M.warnings && M.warnings.length) v.append(el('ul',{class:'warn',style:'margin-top:8px;list-style:none;padding:0'}, M.warnings.map(w => el('li',{}, '⚠ ' + w))));
+app.append(v);
+
+// ---- evidence model (what the agent cited), linked to chart objects
+const evidence = [];
+const dateRe = /\d{4}-\d{2}-\d{2}/;
+(A.key_levels||[]).forEach((l,i) => evidence.push({kind:'level', title: `${label(l.type||'level')} ${money(l.price)}`, sub: l.significance||'', source: l.source||'', price: l.price, tone: /support|fib|swing_low/i.test(l.type||'')?'bullish':/resist|swing_high/i.test(l.type||'')?'bearish':'neutral', id:'lvl'+i}));
+(A.indicator_readings||[]).forEach((r,i) => evidence.push({kind:'indicator', title: `${r.indicator}: ${r.value}`, sub: r.reading + (r.implication ? ' — ' + r.implication : ''), source: r.source||'', tone: /bull|oversold/.test(r.reading||'')?'bullish':/bear|overbought|diverg/.test(r.reading||'')?'bearish':'neutral', date: (String(r.source||'').match(dateRe)||[])[0], pane: /rsi|stoch/i.test(r.indicator||'')?'rsi':/macd/i.test(r.indicator||'')?'macd':/volume|obv/i.test(r.indicator||'')?'volume':'price', id:'ind'+i}));
+(A.patterns_identified||[]).forEach((p,i) => evidence.push({kind:'pattern', title: `${p.pattern} (${p.status})`, sub: (p.implication||'') + (p.target ? ` · target ${money(p.target)}` : ''), source: p.source||'', tone: /bottom|inverse|bull/i.test(p.pattern||'')?'bullish':/top|head|bear/i.test(p.pattern||'')?'bearish':'neutral', price: p.target, date: (String(p.source||'').match(dateRe)||[])[0], id:'pat'+i}));
+(A.key_metrics||[]).forEach((m,i) => evidence.push({kind:'metric', title: `${m.name}: ${m.value}`, sub: m.assessment||'', source: m.source||'', tone:'neutral', date: (String(m.source||'').match(dateRe)||[])[0], id:'met'+i}));
+
+// ---- chart
+let chart = null, focusFns = {};
+if (C.bars && C.bars.length && window.LightweightCharts) {
+  const LW = window.LightweightCharts;
+  const card = el('div',{class:'card',style:'padding:0;overflow:hidden'});
+  app.append(el('h2',{}, 'Price chart' + (C.technical ? ' with technical indicators' : '')), card);
+  const css = getComputedStyle(document.documentElement), cv = n => css.getPropertyValue(n).trim();
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const COL = { up:'#0ca30c', down:'#d03b3b', upSoft:'rgba(12,163,12,.45)', downSoft:'rgba(208,59,59,.45)', ma20: dark?'#199e70':'#1baf7a', ma50: dark?'#d55181':'#e87ba4', ma200:'#008300', bb:'#898781', rsi: dark?'#9085e9':'#6250d6', macd: dark?'#3987e5':'#2a78d6', sig: dark?'#d95926':'#eb6834', accent: cv('--accent') };
+  const readout = el('div',{class:'readout'}); const toggles = el('div',{class:'toggles'}); const wrap = el('div',{class:'chart'});
+  card.append(toggles, readout, wrap);
+  const bars = C.bars.map(b => ({time:b.trade_date, open:+b.open, high:+b.high, low:+b.low, close:+b.close, volume:b.volume==null?0:+b.volume, sma20:b.sma20, sma50:b.sma50, sma200:b.sma200, bb_upper:b.bb_upper, bb_lower:b.bb_lower, rsi14:b.rsi14, macd:b.macd, macd_signal:b.macd_signal, macd_hist:b.macd_hist, volume_sma20:b.volume_sma20}));
+  const byDate = new Map(bars.map(b => [b.time, b]));
+  const series = pts => pts.filter(p => p.value!==null && p.value!==undefined && !Number.isNaN(+p.value)).map(p => ({time:p.time, value:+p.value}));
+  const hasInd = C.technical && bars.some(b => b.sma20!=null);
+  const panes = hasInd ? 4 : 2;
+  const ch = LW.createChart(wrap, { autoSize:true, layout:{ background:{type:LW.ColorType.Solid, color:cv('--surface')}, textColor:cv('--muted'), panes:{separatorColor:cv('--border'), separatorHoverColor:cv('--border'), enableResize:false} },
+    grid:{ vertLines:{color:cv('--border')}, horzLines:{color:cv('--border')} }, crosshair:{mode:LW.CrosshairMode.Normal}, rightPriceScale:{borderColor:cv('--border')}, timeScale:{borderColor:cv('--border'), rightOffset:6} });
+  chart = ch;
+  const hidden = {priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false};
+  const candles = ch.addSeries(LW.CandlestickSeries, {upColor:COL.up, downColor:COL.down, wickUpColor:COL.up, wickDownColor:COL.down, borderVisible:false}, 0);
+  candles.setData(bars.map(b => ({time:b.time, open:b.open, high:b.high, low:b.low, close:b.close})));
+  const tracked = [];
+  const layers = {};
+  const addLine = (name, key, color, pane, opts) => { const s = ch.addSeries(LW.LineSeries, Object.assign({color, lineWidth:2}, hidden, opts||{}), pane); s.setData(series(bars.map(b => ({time:b.time, value:b[key]})))); tracked.push({key:name, s, color, fmt:v=>v.toFixed(2)}); return s; };
+  if (hasInd) {
+    layers.ma = [addLine('SMA20','sma20',COL.ma20,0), addLine('SMA50','sma50',COL.ma50,0), addLine('SMA200','sma200',COL.ma200,0)];
+    layers.bb = [addLine('BB upper','bb_upper',COL.bb,0,{lineWidth:1,lineStyle:LW.LineStyle.Dotted}), addLine('BB lower','bb_lower',COL.bb,0,{lineWidth:1,lineStyle:LW.LineStyle.Dotted})];
+  }
+  const vol = ch.addSeries(LW.HistogramSeries, {priceFormat:{type:'volume'}, priceLineVisible:false, lastValueVisible:false}, 1);
+  vol.setData(bars.map(b => ({time:b.time, value:b.volume, color:b.close>=b.open?COL.upSoft:COL.downSoft})));
+  tracked.push({key:'Volume', s:vol, color:cv('--muted'), fmt:v=>v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':String(v)});
+  if (hasInd) {
+    addLine('Vol MA20','volume_sma20',cv('--muted'),1,{lineWidth:1});
+    const rsi = addLine('RSI','rsi14',COL.rsi,2,{autoscaleInfoProvider:()=>({priceRange:{minValue:0,maxValue:100}})});
+    [70,30].forEach(p => rsi.createPriceLine({price:p, color:cv('--muted'), lineWidth:1, lineStyle:LW.LineStyle.Dashed, axisLabelVisible:false, title:String(p)}));
+    const hist = ch.addSeries(LW.HistogramSeries, {priceLineVisible:false, lastValueVisible:false}, 3);
+    hist.setData(series(bars.map(b => ({time:b.time, value:b.macd_hist}))).map(p => ({time:p.time, value:p.value, color:p.value>=0?COL.upSoft:COL.downSoft})));
+    tracked.push({key:'Hist', s:hist, color:cv('--muted'), fmt:v=>v.toFixed(3)});
+    addLine('MACD','macd',COL.macd,3); addLine('Signal','macd_signal',COL.sig,3);
+  }
+  ch.panes().forEach((p,i) => p.setStretchFactor([3,.8,.9,1][i] || 1));
+
+  // Verdict lines + agent key levels + TECH levels
+  const priceLines = [];
+  const pl = (price, color, title, style, width) => { if (price===null||price===undefined) return null; const l = candles.createPriceLine({price:+price, color, lineWidth:width||1, lineStyle:style, axisLabelVisible:true, title}); priceLines.push(l); return l; };
+  layers.verdict = [pl(A.target_price, COL.up, 'Target', LW.LineStyle.Dashed, 2), pl(A.stop_price, COL.down, 'Stop', LW.LineStyle.Dashed, 2), pl(A.buy_below_price, COL.accent, 'Buy below', LW.LineStyle.Dotted, 1)].filter(Boolean);
+  const levelLines = {};
+  evidence.filter(e => e.kind==='level' && e.price!=null).forEach(e => { levelLines[e.id] = pl(e.price, e.tone==='bullish'?COL.up:e.tone==='bearish'?COL.down:cv('--muted'), e.title.split(' ')[0], LW.LineStyle.Solid, 1); });
+  layers.agentLevels = Object.values(levelLines);
+  layers.techLevels = (C.levels||[]).filter(l => ['support','resistance'].includes(l.level_type)).map(l => pl(l.price, l.level_type==='support'?'rgba(12,163,12,.45)':'rgba(208,59,59,.45)', `${l.level_type==='support'?'S':'R'}${l.rank} ×${l.touches||1}`, LW.LineStyle.LargeDashed, 1));
+  layers.fib = (C.levels||[]).filter(l => l.level_type.startsWith('fib')).map(l => pl(l.price, 'rgba(201,133,0,.6)', l.level_type.replace('fib_','Fib ').replace('382','38.2%').replace('500','50%').replace('618','61.8%'), LW.LineStyle.Dotted, 1));
+  // Patterns: neckline segment + target line
+  layers.patterns = [];
+  (C.patterns||[]).forEach(p => { const seg = ch.addSeries(LW.LineSeries, Object.assign({color:p.direction==='bearish'?COL.down:COL.up, lineWidth:2, lineStyle:LW.LineStyle.LargeDashed}, hidden), 0);
+    seg.setData([{time:p.start_date, value:+p.neckline},{time:p.confirmed_date, value:+p.neckline}]); layers.patterns.push(seg); layers.patterns.push(pl(p.target, p.direction==='bearish'?COL.down:COL.up, `${p.pattern_type.replace(/_/g,' ')} target`, LW.LineStyle.SparseDotted, 1)); });
+  // Signal markers
+  const SHORT = {golden_cross:'GC', death_cross:'DC', sma20_50_cross_up:'20/50↑', sma20_50_cross_down:'20/50↓', price_above_sma200:'>200', price_below_sma200:'<200', macd_cross_up:'MACD↑', macd_cross_down:'MACD↓', rsi_overbought:'RSI>70', rsi_oversold:'RSI<30', rsi_exit_overbought:'RSI<70', rsi_exit_oversold:'RSI>30', stoch_overbought:'%K>80', stoch_oversold:'%K<20', bb_breakout_up:'BB↑', bb_breakout_down:'BB↓', high_52w_breakout:'52w high', low_52w_breakdown:'52w low', volume_spike:'Vol', bullish_divergence:'Bull div', bearish_divergence:'Bear div'};
+  const sigByDate = new Map();
+  (C.signals||[]).forEach(s => { if (!sigByDate.has(s.signal_date)) sigByDate.set(s.signal_date, []); sigByDate.get(s.signal_date).push(s); });
+  const markers = (C.signals||[]).filter(s => byDate.has(s.signal_date)).map(s => ({time:s.signal_date, position:s.direction==='bearish'?'aboveBar':'belowBar', shape:s.direction==='bearish'?'arrowDown':s.direction==='bullish'?'arrowUp':'circle', color:s.direction==='bearish'?COL.down:s.direction==='bullish'?COL.up:cv('--muted'), text:SHORT[s.signal_type]||s.signal_type, size:0.8}));
+  (C.patterns||[]).forEach(p => { if (byDate.has(p.confirmed_date)) markers.push({time:p.confirmed_date, position:p.direction==='bearish'?'aboveBar':'belowBar', shape:'square', color:p.direction==='bearish'?COL.down:COL.up, text:p.pattern_type.replace(/_/g,' '), size:1}); });
+  const last = bars[bars.length-1]; markers.push({time:last.time, position:'aboveBar', shape:'circle', color:COL.accent, text:'today', size:1});
+  markers.sort((a,b) => a.time<b.time?-1:a.time>b.time?1:0);
+  const markerApi = LW.createSeriesMarkers(candles, markers);
+  layers.signals = markerApi;
+
+  // Toggles
+  const applyVis = (items, on) => items.forEach(i => { if (!i) return; if (i.applyOptions) i.applyOptions({visible:on}); });
+  const tg = (name, key, color, on) => { const cb = el('input',{type:'checkbox'}); cb.checked = on!==false; cb.addEventListener('change', () => { const items = layers[key]||[]; if (key==='signals') markerApi.setMarkers(cb.checked?markers:[]); else if (['verdict','agentLevels','techLevels','fib'].includes(key)) items.forEach(l => l && l.applyOptions({lineVisible:cb.checked, axisLabelVisible:cb.checked})); else applyVis(items, cb.checked); }); toggles.append(el('label',{}, cb, el('i',{class:'key',style:'background:'+color}), name)); };
+  if (hasInd) { tg('SMA 20/50/200','ma',COL.ma50); tg('Bollinger','bb',COL.bb); }
+  tg('Target / stop / buy-below','verdict',COL.up); if (layers.agentLevels.length) tg("Agent's key levels",'agentLevels',cv('--muted'));
+  if (layers.techLevels.length) { tg('Support / resistance (TECH)','techLevels','rgba(208,59,59,.6)'); }
+  if (layers.fib.length) tg('Fibonacci','fib','rgba(201,133,0,.8)', false);
+  if (markers.length) tg('Signals & patterns','signals',COL.accent);
+  if (layers.fib.length) layers.fib.forEach(l => l.applyOptions({lineVisible:false, axisLabelVisible:false}));
+
+  // Hover readout
+  const setReadout = (time, items) => { readout.textContent=''; readout.append(el('b',{}, time)); items.forEach(i => readout.append(el('span',{}, i.color ? el('i',{class:'key',style:'background:'+i.color+';margin-right:4px'}) : null, i.key+' ', el('b',{}, i.value)))); const sg = sigByDate.get(time); if (sg) sg.forEach(s => readout.append(el('span',{class:'pill '+s.direction}, (SHORT[s.signal_type]||s.signal_type)+': '+s.description))); };
+  const readAt = time => { const b = byDate.get(time); if (!b) return; const items = [{key:'O',value:b.open.toFixed(2)},{key:'H',value:b.high.toFixed(2)},{key:'L',value:b.low.toFixed(2)},{key:'C',value:b.close.toFixed(2),color:b.close>=b.open?COL.up:COL.down}];
+    tracked.forEach(t => { const d = t.s.data().find(x => x.time===time); if (d && d.value!==undefined) items.push({key:t.key, value:t.fmt(d.value), color:t.color}); }); setReadout(time, items); };
+  ch.subscribeCrosshairMove(p => { if (p.time) readAt(String(p.time)); else readAt(last.time); });
+  readAt(last.time);
+  ch.timeScale().fitContent();
+
+  // Evidence focus: jump to a date and flash the related line
+  const flash = line => { if (!line) return; const o = {lineWidth:4}; line.applyOptions(o); setTimeout(() => line.applyOptions({lineWidth: layers.verdict.includes(line)?2:1}), 1600); };
+  const goto = date => { if (!date) return; const idx = bars.findIndex(b => b.time>=date); if (idx<0) return; ch.timeScale().setVisibleLogicalRange({from:Math.max(0,idx-40), to:Math.min(bars.length+3, idx+25)}); readAt(bars[idx].time); };
+  evidence.forEach(e => { focusFns[e.id] = () => { if (e.kind==='level') flash(levelLines[e.id]); if (e.date) goto(e.date); else if (e.kind==='pattern') { const p = (C.patterns||[]).find(x => e.title.toLowerCase().includes(x.pattern_type.replace(/_/g,' '))); if (p) goto(p.confirmed_date); } else if (e.kind==='level') goto(last.time); }; });
+}
+
+// ---- evidence panel
+if (evidence.length) {
+  app.append(el('h2',{}, 'Evidence behind the decision'), el('p',{class:'hint'}, chart ? 'Click an item to jump the chart to its date and highlight the related line or marker.' : 'Each item names the data it came from.'));
+  const grid = el('div',{class:'evidence'});
+  evidence.forEach(e => { const card = el('div',{class:'ev '+e.tone, id:e.id}, el('div',{class:'t'}, e.kind), el('div',{class:'v'}, e.title), e.sub ? el('div',{}, e.sub) : null, e.source ? el('div',{class:'s'}, e.source) : null);
+    card.addEventListener('click', () => { document.querySelectorAll('.ev.active').forEach(x => x.classList.remove('active')); card.classList.add('active'); if (focusFns[e.id]) focusFns[e.id](); if (chart) document.querySelector('.chart-wrap, .chart')?.scrollIntoView({behavior:'smooth', block:'nearest'}); });
+    grid.append(card); });
+  app.append(el('div',{class:'card'}, grid));
+}
+
+// ---- narrative + structured blocks
+app.append(el('h2',{}, 'Summary and justification'), ...paras(A.summary));
+if (A.trend_assessment) { const t = A.trend_assessment; app.append(el('h2',{}, 'Trend assessment'), el('div',{class:'card'}, table(['item','value'], Object.entries(t).map(([k,v]) => ({item:label(k), value:v}))))); }
+if (A.trade_plan) app.append(el('h2',{}, 'Trade plan'), el('div',{class:'card'}, table(['item','value'], Object.entries(A.trade_plan).map(([k,v]) => ({item:label(k), value:v})))));
+if (A.balance_sheet) app.append(el('h2',{}, 'Balance sheet: '+(A.balance_sheet.grade||'')), el('div',{class:'card'}, table(['item','value'], Object.entries(A.balance_sheet).filter(([k])=>k!=='grade').map(([k,v]) => ({item:label(k), value:v})))));
+if (A.stress_test && A.stress_test.length) app.append(el('h2',{}, 'Stress test'), el('div',{class:'card'}, table(['scenario','assumptions','earnings_impact_pct','price_impact_pct','survives_without_capital_raise'], A.stress_test, ['earnings_impact_pct','price_impact_pct'])));
+if (A.checklist && A.checklist.length) { app.append(el('h2',{}, 'Checklist'), el('div',{class:'card'}, el('table',{}, el('thead',{}, el('tr',{}, el('th',{},'Criterion'), el('th',{},'Verdict'), el('th',{},'Evidence'))), el('tbody',{}, A.checklist.map(c => el('tr',{}, el('td',{}, c.criterion), el('td',{class:c.verdict}, (c.verdict==='pass'?'✓ ':c.verdict==='fail'?'✗ ':'? ')+c.verdict), el('td',{}, c.evidence))))))); }
+(A.sections||[]).forEach(s => app.append(el('h2',{}, s.title), ...paras(s.content)));
+if (A.valuation && Object.keys(A.valuation).length) app.append(el('h2',{}, 'Valuation inputs'), el('div',{class:'card'}, table(['item','value'], Object.entries(A.valuation).map(([k,v]) => ({item:label(k), value:v})))));
+if (A.key_metrics && A.key_metrics.length) app.append(el('h2',{}, 'Key metrics'), el('div',{class:'card'}, table(['name','value','assessment','source'], A.key_metrics)));
+[['Risks','risks'],['Assumptions (model judgment, not data)','assumptions'],['Data gaps','data_gaps']].forEach(([t,k]) => { if (A[k] && A[k].length) app.append(el('h2',{}, t), el('ul',{}, A[k].map(x => el('li',{}, x)))); });
+if (D.references && D.references.length) app.append(el('h2',{}, 'Data and reports referenced'), el('div',{class:'card'}, table(['title','detail','used_for'], D.references)));
+app.append(el('p',{class:'foot'}, `Model-generated analysis from stored data reconstructed as of ${D.as_of}` + (C.source ? ` (chart: ${C.source}, ${(C.bars||[]).length} bars up to ${D.as_of})` : '') + `. The model's training knowledge cannot be rewound to that date. Informational only; not investment advice. Verify before use.`));
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def build_decision_html(skill: dict, symbol: str, as_of: str, analysis: dict, references: list[dict], meta: dict, chart: dict | None) -> str:
+    import html as _html
+
+    data = {"skill": {"id": skill["id"], "name": skill["name"], "version": skill.get("version", "")}, "symbol": symbol, "as_of": as_of,
+            "analysis": analysis, "references": references, "meta": meta, "chart": chart or {"bars": [], "technical": False}}
+    payload = json.dumps(data, default=str).replace("</", "<\\/")
+    title = _html.escape(f"{skill['name']} analysis: {symbol} as of {as_of}")
+    return REPORT_HTML_TEMPLATE.replace("__TITLE__", title).replace("__DATA__", payload).replace("__CDN__", LIGHTWEIGHT_CHARTS_CDN)
+
+
+def upload_html_report(pathname: str, html_text: str) -> dict:
+    from vercel.blob.sync import put_blob
+
+    r = put_blob(pathname, html_text.encode("utf-8"), access=blob_access(), content_type="text/html; charset=utf-8", allow_overwrite=True)
+    return {"pathname": r.pathname, "url": r.url}
+
+
+@app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}/report.html")
+def decision_report_html(backtest_id: int, decision_id: int):
+    """The stored HTML report from Vercel Blob; regenerated from the stored output (and point-in-time chart data) if missing."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        ensure_backtest_tables(cur)
+        conn.commit()
+        cur.execute(
+            f"SELECT skill_id, symbol, as_of_date, output_json, references_json, warnings_json, model, finished_at, report_html_pathname "
+            f"FROM {DECISIONS_TABLE} WHERE backtest_id = %s AND decision_id = %s",
+            (backtest_id, decision_id),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    skill_id, symbol, as_of, output_json, references_json, warnings_json, model, finished_at, pathname = row
+    if not output_json:
+        raise HTTPException(status_code=404, detail="This decision has no completed analysis.")
+    html_text = None
+    if pathname and blob_configured():
+        try:
+            html_text = download_report(pathname).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            html_text = None
+    if html_text is None:
+        html_text = build_decision_html(
+            get_skill(skill_id), symbol, as_of.isoformat(), json.loads(output_json), json.loads(references_json or "[]"),
+            {"model": model, "generated_at": finished_at.isoformat() if finished_at else "", "warnings": json.loads(warnings_json or "[]")},
+            load_chart_data(symbol, as_of),
+        )
+    return Response(content=html_text, media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "private, max-age=300", "X-Frame-Options": "SAMEORIGIN"})
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",

@@ -138,8 +138,16 @@ conviction, price, buy-below, target, stop, intrinsic value, margin of safety), 
 history range, the company profile, and the derived fundamentals), and the **PDF report** embedded,
 with open/download links.
 
-The PDF (key conclusion first, then the full analysis, then the references) is built with fpdf2 after
-each Monday completes and stored in **Vercel Blob** at `reports/<skill>/<symbol>/<year>/<date>-<id>.pdf`
+Two report formats are built after each Monday completes. The **HTML report** (`…-report.html`, served
+at `/report.html` and embedded by default on the decision page) is a self-contained interactive page:
+verdict card, an **evidence panel** listing every level, indicator reading, pattern and metric the agent
+cited with its source, the narrative blocks, references - and, when the symbol has `TECH_` data, a
+candlestick chart (lightweight-charts from unpkg) with SMA 20/50/200, Bollinger Bands, volume, RSI and
+MACD panes, TECH support/resistance and Fibonacci levels, the agent's key levels, every signal as a
+marker, confirmed patterns with neckline and target, and the verdict's target/stop/buy-below lines.
+Clicking an evidence item jumps the chart to its date and flashes the related line. The chart only
+contains bars and events dated on or before the Monday. Fundamentals skills get the same report with a
+plain price chart. The **PDF** (key conclusion first, then the full analysis, then the references) is built with fpdf2 and stored in **Vercel Blob** at `reports/<skill>/<symbol>/<year>/<date>-<id>.pdf`
 (`BLOB_READ_WRITE_TOKEN`; `BLOB_ACCESS` = `private` by default, must match the store). The browser never
 reads the blob directly: `/api/py/agent/backtest/{id}/decision/{did}/report.pdf` fetches it server-side
 behind the login, and regenerates the PDF from the stored output if the blob is missing or no store is

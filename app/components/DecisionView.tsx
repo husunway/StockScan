@@ -28,6 +28,7 @@ type Decision = {
   warnings: string[];
   references: Reference[];
   report_stored: boolean;
+  report_html_stored?: boolean;
   model: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -46,7 +47,7 @@ export default function DecisionView() {
   const id = params.get("id");
   const [d, setD] = useState<Decision | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<"pdf" | "output" | "input">("pdf");
+  const [tab, setTab] = useState<"html" | "pdf" | "output" | "input">("html");
 
   useEffect(() => {
     if (!bt || !id) {
@@ -68,6 +69,7 @@ export default function DecisionView() {
   const out = d.output ?? {};
   const ccy = typeof out.currency === "string" ? out.currency : "";
   const reportUrl = `/api/py/agent/backtest/${d.backtest_id}/decision/${d.decision_id}/report.pdf`;
+  const htmlUrl = `/api/py/agent/backtest/${d.backtest_id}/decision/${d.decision_id}/report.html`;
   const upside = d.target_price && d.current_price ? (d.target_price / d.current_price - 1) * 100 : null;
   const downside = d.stop_price && d.current_price ? (d.stop_price / d.current_price - 1) * 100 : null;
 
@@ -150,11 +152,20 @@ export default function DecisionView() {
       {d.output && (
         <>
           <div className="seg" role="tablist" style={{ margin: "20px 0 10px" }}>
+            <button type="button" className={tab === "html" ? "on" : ""} onClick={() => setTab("html")}>Interactive report (HTML)</button>
             <button type="button" className={tab === "pdf" ? "on" : ""} onClick={() => setTab("pdf")}>PDF report</button>
             <button type="button" className={tab === "output" ? "on" : ""} onClick={() => setTab("output")}>Full output (JSON)</button>
             <button type="button" className={tab === "input" ? "on" : ""} onClick={() => setTab("input")}>Data the agent saw</button>
           </div>
-          {tab === "pdf" ? (
+          {tab === "html" ? (
+            <>
+              <p className="msg hint" style={{ marginTop: 0 }}>
+                <a href={htmlUrl} target="_blank" rel="noreferrer">Open in a new tab</a> ·{" "}
+                {d.report_html_stored ? "stored in Vercel Blob" : "generated on demand"} · chart and evidence use only data dated on or before {d.as_of_date}
+              </p>
+              <iframe className="pdf-frame report-frame" src={htmlUrl} title={`Interactive report ${d.symbol} ${d.as_of_date}`} />
+            </>
+          ) : tab === "pdf" ? (
             <>
               <p className="msg hint" style={{ marginTop: 0 }}>
                 <a href={reportUrl} target="_blank" rel="noreferrer">Open in a new tab</a> ·{" "}
