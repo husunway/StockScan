@@ -1225,6 +1225,8 @@ IF COL_LENGTH('{DECISIONS_TABLE}', 'report_url') IS NULL ALTER TABLE {DECISIONS_
 IF COL_LENGTH('{DECISIONS_TABLE}', 'log_json') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'log_json') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD log_json NVARCHAR(MAX) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'report_html_pathname') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD report_html_pathname NVARCHAR(400) NULL;
+IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UQ_agent_decisions') ALTER TABLE {DECISIONS_TABLE} DROP CONSTRAINT UQ_agent_decisions;
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UQ_agent_decisions_sym') ALTER TABLE {DECISIONS_TABLE} ADD CONSTRAINT UQ_agent_decisions_sym UNIQUE (backtest_id, symbol, as_of_date);
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'status') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD status NVARCHAR(10) NOT NULL CONSTRAINT DF_agent_backtests_status DEFAULT 'active';
 """
 DECISION_STATUSES = ("pending", "running", "done", "failed", "cancelled")
@@ -2409,52 +2411,10 @@ def get_decision(backtest_id: int, decision_id: int):
         conn.close()
 
 
-@app.post("/api/py/agent/backtest/{backtest_id}/step")
-def backtest_step(backtest_id: int, retry_failed: bool = False):
-    """Run the next pending Monday (one Claude call per request so it fits a serverless time limit)."""
-    log = RunLog(DECISIONS_TABLE, "decision_id")
-    log.add(f"Claude: {describe_claude()}")
-    log.add(f"Database: connecting to {describe_db()}")
-    # Phase 1: claim a decision and load what it needs, then release the connection for the model call.
-    t0 = time.monotonic()
-    conn = db_connect()
-    try:
-        cur = conn.cursor()
-        log.add(f"Database connected in {round((time.monotonic() - t0) * 1000)} ms")
-        ensure_backtest_tables(cur)
-        cur.execute(f"SELECT skill_id, symbol, raw_data FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Backtest not found")
-        skill_id, symbol, raw_json = row
-        if _backtest_status(cur, backtest_id) == "stopped":
-            return {"done": True, "stopped": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
-        statuses = "('pending', 'failed')" if retry_failed else "('pending')"
-        cur.execute(
-            f"SELECT TOP 1 decision_id, as_of_date FROM {DECISIONS_TABLE} "
-            f"WHERE backtest_id = %s AND status IN {statuses} ORDER BY as_of_date",
-            (backtest_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return {"done": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
-        decision_id, as_of = row
-        log.row_id = decision_id
-        log.add(f"Claimed Monday {as_of} (decision #{decision_id}) for {symbol}")
-        cur.execute(
-            f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, started_at = SYSUTCDATETIME(), log_json = %s "
-            f"WHERE decision_id = %s",
-            (json.dumps(log.entries), decision_id),
-        )
-        conn.commit()
-        prices_df = load_prices_df(cur, symbol)
-        log.step(f"Loaded {len(prices_df)} stored price rows ({prices_df['date'].iloc[0]} to {prices_df['date'].iloc[-1]})", cur=cur)
-        conn.commit()
-    finally:
-        conn.close()
-
-    skill = get_skill(skill_id)
-    raw = json.loads(raw_json)
+def execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: str, as_of: date, raw: dict, prices_df, log: "RunLog") -> dict:
+    """Run one claimed decision end to end: point-in-time data -> model -> validation -> PDF/HTML/Blob -> persist.
+    Shared by the weekly backtest and the S&P 500 scan."""
+    skill_id = skill["id"]
     log.add(f"Skill: {skill['path']} v{skill.get('version') or '-'}; statements from backtest #{backtest_id} "
             f"(fetched {raw.get('fetched_at', '')[:19]})")
     result: dict = {}
@@ -2546,6 +2506,59 @@ def backtest_step(backtest_id: int, retry_failed: bool = False):
         conn.commit()
         cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
         decision = _decision_dict(cur.fetchone())
+    finally:
+        conn.close()
+    return decision
+
+
+@app.post("/api/py/agent/backtest/{backtest_id}/step")
+def backtest_step(backtest_id: int, retry_failed: bool = False):
+    """Run the next pending Monday (one Claude call per request so it fits a serverless time limit)."""
+    log = RunLog(DECISIONS_TABLE, "decision_id")
+    log.add(f"Claude: {describe_claude()}")
+    log.add(f"Database: connecting to {describe_db()}")
+    # Phase 1: claim a decision and load what it needs, then release the connection for the model call.
+    t0 = time.monotonic()
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        log.add(f"Database connected in {round((time.monotonic() - t0) * 1000)} ms")
+        ensure_backtest_tables(cur)
+        cur.execute(f"SELECT skill_id, symbol, raw_data FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Backtest not found")
+        skill_id, symbol, raw_json = row
+        if _backtest_status(cur, backtest_id) == "stopped":
+            return {"done": True, "stopped": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
+        statuses = "('pending', 'failed')" if retry_failed else "('pending')"
+        cur.execute(
+            f"SELECT TOP 1 decision_id, as_of_date FROM {DECISIONS_TABLE} "
+            f"WHERE backtest_id = %s AND status IN {statuses} ORDER BY as_of_date",
+            (backtest_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"done": True, "decision": None, "counts": _decision_counts(cur, backtest_id)}
+        decision_id, as_of = row
+        log.row_id = decision_id
+        log.add(f"Claimed Monday {as_of} (decision #{decision_id}) for {symbol}")
+        cur.execute(
+            f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, started_at = SYSUTCDATETIME(), log_json = %s "
+            f"WHERE decision_id = %s",
+            (json.dumps(log.entries), decision_id),
+        )
+        conn.commit()
+        prices_df = load_prices_df(cur, symbol)
+        log.step(f"Loaded {len(prices_df)} stored price rows ({prices_df['date'].iloc[0]} to {prices_df['date'].iloc[-1]})", cur=cur)
+        conn.commit()
+    finally:
+        conn.close()
+
+    decision = execute_decision(backtest_id, decision_id, get_skill(skill_id), symbol, as_of, json.loads(raw_json), prices_df, log)
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
         counts = _decision_counts(cur, backtest_id)
         stopped = _backtest_status(cur, backtest_id) == "stopped"
     finally:
@@ -3837,6 +3850,406 @@ def universe_load_step(job_id: int):
         conn.close()
     return {"done": stopped or (counts["pending"] == 0 and counts["running"] == 0), "stopped": stopped, "processed": processed,
             "counts": counts, "log": batch_log.entries}
+
+
+# ---------------------------------------------------------------------------
+# S&P 500 scan: for each date (Mondays by default) and each constituent, a free technical pre-screen
+# from the TECH_ tables, then John Murphy -> (BUY and Monday close inside the entry zone) -> Warren
+# Buffett -> BUY -> Jamie Dimon -> BUY = "recommended by all 3". A rejection at any stage ends that
+# stock for that date, so no further model calls are spent. One model call per /step request.
+# ---------------------------------------------------------------------------
+SCAN_JOB_TABLE = "dbo.SCAN_JOB"
+SCAN_ITEM_TABLE = "dbo.SCAN_ITEM"
+SCAN_SKILLS = ("john-murphy", "warren-buffett", "jamie-dimon")
+SCAN_STAGE_SKILL = {"murphy": "john-murphy", "buffett": "warren-buffett", "dimon": "jamie-dimon"}
+SCAN_NEXT_STAGE = {"murphy": "buffett", "buffett": "dimon", "dimon": "done"}
+
+ENSURE_SCAN_SQL = f"""
+IF OBJECT_ID('{SCAN_JOB_TABLE}', 'U') IS NULL
+CREATE TABLE {SCAN_JOB_TABLE} (
+    job_id INT IDENTITY(1,1) PRIMARY KEY, created_at DATETIME2 NOT NULL CONSTRAINT DF_scan_created DEFAULT SYSUTCDATETIME(),
+    status NVARCHAR(10) NOT NULL, start_date DATE NOT NULL, end_date DATE NOT NULL, cadence NVARCHAR(10) NOT NULL,
+    options NVARCHAR(MAX) NULL, backtests NVARCHAR(MAX) NULL, log_json NVARCHAR(MAX) NULL);
+IF OBJECT_ID('{SCAN_ITEM_TABLE}', 'U') IS NULL
+CREATE TABLE {SCAN_ITEM_TABLE} (
+    job_id INT NOT NULL, as_of_date DATE NOT NULL, symbol NVARCHAR(20) NOT NULL,
+    stage NVARCHAR(10) NOT NULL, status NVARCHAR(10) NOT NULL, reason NVARCHAR(400) NULL,
+    price DECIMAL(18,4) NULL, buy_below DECIMAL(18,4) NULL, stop_price DECIMAL(18,4) NULL, target_price DECIMAL(18,4) NULL,
+    in_range BIT NULL, murphy_rec CHAR(4) NULL, buffett_rec CHAR(4) NULL, dimon_rec CHAR(4) NULL,
+    murphy_decision_id INT NULL, buffett_decision_id INT NULL, dimon_decision_id INT NULL,
+    recommended_by INT NOT NULL CONSTRAINT DF_scan_recby DEFAULT 0, ai_calls INT NOT NULL CONSTRAINT DF_scan_calls DEFAULT 0,
+    sector NVARCHAR(100) NULL, updated_at DATETIME2 NULL,
+    CONSTRAINT PK_SCAN_ITEM PRIMARY KEY (job_id, as_of_date, symbol));
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_SCAN_ITEM_status') CREATE INDEX IX_SCAN_ITEM_status ON {SCAN_ITEM_TABLE} (job_id, status, as_of_date, symbol);
+"""
+SCAN_ITEM_COLUMNS = ("as_of_date", "symbol", "stage", "status", "reason", "price", "buy_below", "stop_price", "target_price", "in_range",
+                     "murphy_rec", "buffett_rec", "dimon_rec", "murphy_decision_id", "buffett_decision_id", "dimon_decision_id",
+                     "recommended_by", "ai_calls", "sector", "updated_at")
+
+
+class ScanRequest(BaseModel):
+    start_date: date = Field(date(2026, 1, 1))
+    end_date: date | None = Field(None, description="Defaults to today")
+    cadence: str = Field("weekly", pattern="^(weekly|daily)$", description="weekly = Mondays; daily = Monday to Friday")
+    require_primary_up: bool = True
+    reject_intermediate_down: bool = True
+    min_adx: float | None = Field(None, ge=0, le=100)
+    sectors: list[str] | None = None
+    symbols: list[str] | None = None
+    max_symbols: int | None = Field(None, ge=1, le=600)
+
+
+def scan_dates(start: date, end: date, cadence: str) -> list[date]:
+    if cadence == "weekly":
+        d = start + timedelta(days=(7 - start.weekday()) % 7)  # first Monday on/after start
+        step = 7
+    else:
+        d = start
+        step = 1
+    out = []
+    while d <= end:
+        if cadence == "weekly" or d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=step)
+    return out
+
+
+def _scan_backtests(cur, job_id: int, year: int) -> dict:
+    """One agent_backtests row per skill for the scan, so each analysis is a normal decision with reports."""
+    out = {}
+    for skill_id in SCAN_SKILLS:
+        skill = get_skill(skill_id)
+        cur.execute(
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active')",
+            (skill_id, skill["version"], f"SCAN#{job_id}", year, json.dumps({"scan_job": job_id, "data_source": skill.get("data_source")})),
+        )
+        out[skill_id] = cur.fetchone()[0]
+    return out
+
+
+def _scan_counts(cur, job_id: int) -> dict:
+    cur.execute(
+        f"SELECT COUNT(*), SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN status = 'rejected' AND stage = 'prescreen' THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN murphy_rec = 'BUY' THEN 1 ELSE 0 END), SUM(CASE WHEN in_range = 1 THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN buffett_rec = 'BUY' THEN 1 ELSE 0 END), SUM(CASE WHEN recommended_by = 3 THEN 1 ELSE 0 END), SUM(ai_calls) "
+        f"FROM {SCAN_ITEM_TABLE} WHERE job_id = %s", (job_id,))
+    r = cur.fetchone()
+    k = ("total", "pending", "running", "failed", "cancelled", "prescreen_rejected", "murphy_buy", "in_range", "buffett_buy", "all3", "ai_calls")
+    return {a: (b or 0) for a, b in zip(k, r)}
+
+
+def _scan_job(cur, job_id: int) -> dict:
+    cur.execute(f"SELECT job_id, created_at, status, start_date, end_date, cadence, options, backtests, log_json FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+    cur.execute(
+        f"SELECT as_of_date, COUNT(*), SUM(CASE WHEN status IN ('pending', 'running') THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN status = 'rejected' AND stage = 'prescreen' THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN murphy_rec = 'BUY' THEN 1 ELSE 0 END), SUM(CASE WHEN in_range = 1 THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN buffett_rec = 'BUY' THEN 1 ELSE 0 END), SUM(CASE WHEN recommended_by = 3 THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) FROM {SCAN_ITEM_TABLE} WHERE job_id = %s GROUP BY as_of_date ORDER BY as_of_date",
+        (job_id,))
+    days = [{"as_of_date": r[0].isoformat(), "total": r[1], "open": r[2] or 0, "prescreen_rejected": r[3] or 0, "murphy_buy": r[4] or 0,
+             "in_range": r[5] or 0, "buffett_buy": r[6] or 0, "all3": r[7] or 0, "failed": r[8] or 0} for r in cur.fetchall()]
+    return {"job_id": row[0], "created_at": row[1].isoformat(), "status": row[2], "start_date": row[3].isoformat(), "end_date": row[4].isoformat(),
+            "cadence": row[5], "options": json.loads(row[6] or "{}"), "backtests": json.loads(row[7] or "{}"), "log": json.loads(row[8] or "[]"),
+            "counts": _scan_counts(cur, job_id), "days": days}
+
+
+def _scan_item_dict(row) -> dict:
+    d = dict(zip(SCAN_ITEM_COLUMNS, row))
+    for k in ("price", "buy_below", "stop_price", "target_price"):
+        d[k] = num(d[k], 4)
+    for k in ("as_of_date", "updated_at"):
+        d[k] = d[k].isoformat() if d[k] is not None else None
+    d["in_range"] = None if d["in_range"] is None else bool(d["in_range"])
+    return d
+
+
+@app.post("/api/py/scan")
+def scan_create(req: ScanRequest):
+    require_claude()
+    end = req.end_date or date.today()
+    if end < req.start_date:
+        raise HTTPException(status_code=422, detail="end_date is before start_date")
+    dates = scan_dates(req.start_date, end, req.cadence)
+    if not dates:
+        raise HTTPException(status_code=422, detail="No scan dates in that range")
+    log = RunLog(SCAN_JOB_TABLE, "job_id")
+    log.add(f"Claude: {describe_claude()}")
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_SCAN_SQL)
+        ensure_backtest_tables(cur)
+        universe = universe_state(cur)
+        if req.sectors:
+            wanted = {s.lower() for s in req.sectors}
+            universe = [u for u in universe if (u["sector"] or "").lower() in wanted]
+        if req.symbols:
+            wanted = {normalize_symbol(s) for s in req.symbols}
+            universe = [u for u in universe if u["symbol"] in wanted]
+        if req.max_symbols:
+            universe = universe[: req.max_symbols]
+        if not universe:
+            raise HTTPException(status_code=422, detail="No constituents match the filter (is dbo.SP500_CONSTITUENTS filled?).")
+        sector_of = {u["symbol"]: u["sector"] for u in universe}
+        symbols = [u["symbol"] for u in universe]
+        no_tech = [u["symbol"] for u in universe if not u["tech_last"]]
+        log.add(f"Universe: {len(symbols)} constituents ({len(no_tech)} without technical data - they will be rejected at pre-screen); "
+                f"{len(dates)} {req.cadence} dates {dates[0]} to {dates[-1]}")
+        log.add("Pre-screen (free, from TECH_TREND_DAILY): " + ", ".join(
+            [f"primary trend up" if req.require_primary_up else "any primary trend",
+             "intermediate not down" if req.reject_intermediate_down else "any intermediate trend"]
+            + ([f"ADX >= {req.min_adx}"] if req.min_adx is not None else [])))
+
+        cur.execute(f"INSERT INTO {SCAN_JOB_TABLE} (status, start_date, end_date, cadence, options) OUTPUT INSERTED.job_id VALUES ('active', %s, %s, %s, %s)",
+                    (req.start_date, end, req.cadence, json.dumps(req.model_dump(mode="json"))))
+        job_id = cur.fetchone()[0]
+        backtests = _scan_backtests(cur, job_id, req.start_date.year)
+        cur.execute(f"UPDATE {SCAN_JOB_TABLE} SET backtests = %s WHERE job_id = %s", (json.dumps(backtests), job_id))
+
+        items = []
+        placeholders = ", ".join("%s" for _ in symbols)
+        for d in dates:
+            cur.execute(
+                f"SELECT t.symbol, t.trade_date, t.primary_trend, t.intermediate_trend, i.adx14, p.[close] FROM dbo.TECH_TREND_DAILY t "
+                f"JOIN (SELECT symbol, MAX(trade_date) AS td FROM dbo.TECH_TREND_DAILY WHERE trade_date <= %s GROUP BY symbol) m "
+                f"ON m.symbol = t.symbol AND m.td = t.trade_date "
+                f"LEFT JOIN dbo.TECH_INDICATOR_DAILY i ON i.symbol = t.symbol AND i.trade_date = t.trade_date "
+                f"LEFT JOIN dbo.TECH_PRICE_DAILY p ON p.symbol = t.symbol AND p.trade_date = t.trade_date "
+                f"WHERE t.symbol IN ({placeholders})", (d, *symbols))
+            seen = {}
+            for sym, td, prim, inter, adx, close in cur.fetchall():
+                seen[sym] = (td, prim, inter, adx, close)
+            for sym in symbols:
+                base = {"as_of_date": d, "symbol": sym, "sector": sector_of.get(sym), "updated_at": datetime.now(timezone.utc)}
+                if sym not in seen or (d - seen[sym][0]).days > 7:
+                    items.append({**base, "stage": "prescreen", "status": "rejected", "reason": "no technical data for this date (run the S&P 500 loader)"})
+                    continue
+                td, prim, inter, adx, close = seen[sym]
+                reasons = []
+                if req.require_primary_up and prim != "up":
+                    reasons.append(f"primary trend {prim}")
+                if req.reject_intermediate_down and inter == "down":
+                    reasons.append("intermediate trend down")
+                if req.min_adx is not None and (adx is None or float(adx) < req.min_adx):
+                    reasons.append(f"ADX {float(adx):.0f} < {req.min_adx}" if adx is not None else "ADX unavailable")
+                if reasons:
+                    items.append({**base, "stage": "prescreen", "status": "rejected", "reason": "pre-screen: " + "; ".join(reasons),
+                                  "price": num(close, 4)})
+                else:
+                    items.append({**base, "stage": "murphy", "status": "pending", "price": num(close, 4)})
+        bulk_insert(cur, "SCAN_ITEM", ("job_id",) + tuple(k for k in ("as_of_date", "symbol", "stage", "status", "reason", "price", "sector", "updated_at")),
+                    [{"job_id": job_id, **it} for it in items])
+        pending = sum(1 for it in items if it["status"] == "pending")
+        log.row_id = job_id
+        log.add(f"Scan #{job_id}: {len(items)} (date, stock) pairs; {pending} pass the pre-screen and will go to John Murphy "
+                f"(= maximum stage-1 model calls); Buffett and Dimon run only after a BUY in the entry zone")
+        log.save(cur)
+        conn.commit()
+        return _scan_job(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/scan/latest")
+def scan_latest():
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_SCAN_SQL)
+        conn.commit()
+        cur.execute(f"SELECT TOP 1 job_id FROM {SCAN_JOB_TABLE} ORDER BY job_id DESC")
+        row = cur.fetchone()
+        return _scan_job(cur, row[0]) if row else None
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/scan/{job_id}")
+def scan_get(job_id: int):
+    conn = db_connect()
+    try:
+        return _scan_job(conn.cursor(), job_id)
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/scan/{job_id}/day/{as_of}")
+def scan_day(job_id: int, as_of: date, all_items: bool = False):
+    """Items for one date: by default the ones that reached a model (plus hits); all_items=true includes pre-screen rejects."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        where = "" if all_items else " AND NOT (status = 'rejected' AND stage = 'prescreen')"
+        cur.execute(f"SELECT {', '.join(SCAN_ITEM_COLUMNS)} FROM {SCAN_ITEM_TABLE} WHERE job_id = %s AND as_of_date = %s{where} "
+                    f"ORDER BY recommended_by DESC, CASE WHEN murphy_rec = 'BUY' THEN 0 ELSE 1 END, symbol", (job_id, as_of))
+        items = [_scan_item_dict(r) for r in cur.fetchall()]
+        cur.execute(f"SELECT backtests FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
+        bts = json.loads((cur.fetchone() or [None])[0] or "{}")
+        return {"job_id": job_id, "as_of_date": as_of.isoformat(), "items": items, "backtests": bts}
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/scan/{job_id}/hits")
+def scan_hits(job_id: int, min_stage: int = 3):
+    """All (date, stock) pairs recommended by at least `min_stage` agents."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT {', '.join(SCAN_ITEM_COLUMNS)} FROM {SCAN_ITEM_TABLE} WHERE job_id = %s AND recommended_by >= %s "
+                    f"ORDER BY as_of_date, symbol", (job_id, min_stage))
+        items = [_scan_item_dict(r) for r in cur.fetchall()]
+        cur.execute(f"SELECT backtests FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
+        bts = json.loads((cur.fetchone() or [None])[0] or "{}")
+        return {"job_id": job_id, "items": items, "backtests": bts}
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/scan/{job_id}/stop")
+def scan_stop(job_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {SCAN_JOB_TABLE} SET status = 'stopped' WHERE job_id = %s", (job_id,))
+        cur.execute(f"UPDATE {SCAN_ITEM_TABLE} SET status = 'cancelled', reason = 'Stopped by user' WHERE job_id = %s AND status = 'pending'", (job_id,))
+        cur.execute(f"UPDATE {SCAN_ITEM_TABLE} SET status = 'failed', reason = 'Stopped by user while running' WHERE job_id = %s AND status = 'running' "
+                    f"AND updated_at < DATEADD(minute, -6, SYSUTCDATETIME())", (job_id,))
+        conn.commit()
+        return _scan_job(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/scan/{job_id}/resume")
+def scan_resume(job_id: int, retry_failed: bool = False):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {SCAN_JOB_TABLE} SET status = 'active' WHERE job_id = %s", (job_id,))
+        statuses = "('cancelled', 'failed')" if retry_failed else "('cancelled')"
+        cur.execute(f"UPDATE {SCAN_ITEM_TABLE} SET status = 'pending', reason = NULL WHERE job_id = %s AND status IN {statuses}", (job_id,))
+        conn.commit()
+        return _scan_job(cur, job_id)
+    finally:
+        conn.close()
+
+
+def _scan_claim(cur, job_id: int):
+    """Atomically take the next pending item (safe with several workers)."""
+    cur.execute(
+        f"WITH c AS (SELECT TOP (1) * FROM {SCAN_ITEM_TABLE} WITH (UPDLOCK, READPAST) WHERE job_id = %s AND status = 'pending' "
+        f"ORDER BY as_of_date, symbol) UPDATE c SET status = 'running', updated_at = SYSUTCDATETIME() "
+        f"OUTPUT inserted.as_of_date, inserted.symbol, inserted.stage, inserted.ai_calls, inserted.murphy_decision_id, "
+        f"inserted.buffett_decision_id, inserted.dimon_decision_id, inserted.price, inserted.buy_below, inserted.stop_price",
+        (job_id,))
+    return cur.fetchone()
+
+
+@app.post("/api/py/scan/{job_id}/step")
+def scan_step(job_id: int):
+    """Run the next stage of the next pending (date, stock): exactly one model call."""
+    log = RunLog("x", "y")
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT status, backtests FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan job not found")
+        if row[0] == "stopped":
+            return {"done": True, "stopped": True, "item": None, "counts": _scan_counts(cur, job_id), "log": []}
+        backtests = json.loads(row[1] or "{}")
+        claimed = _scan_claim(cur, job_id)
+        if not claimed:
+            counts = _scan_counts(cur, job_id)
+            if counts["running"] == 0:
+                cur.execute(f"UPDATE {SCAN_JOB_TABLE} SET status = 'done' WHERE job_id = %s AND status = 'active'", (job_id,))
+            conn.commit()
+            return {"done": counts["running"] == 0, "stopped": False, "item": None, "counts": counts, "log": []}
+        conn.commit()
+        as_of, symbol, stage, ai_calls, m_id, b_id, d_id, price0, buy_below0, stop0 = claimed
+        skill_id = SCAN_STAGE_SKILL[stage]
+        skill = get_skill(skill_id)
+        bt_id = backtests[skill_id]
+        cur.execute(f"INSERT INTO {DECISIONS_TABLE} (backtest_id, skill_id, symbol, as_of_date, status, started_at, log_json) "
+                    f"OUTPUT INSERTED.decision_id VALUES (%s, %s, %s, %s, 'running', SYSUTCDATETIME(), %s)",
+                    (bt_id, skill_id, symbol, as_of, json.dumps([])))
+        decision_id = cur.fetchone()[0]
+        conn.commit()
+        log.add(f"{as_of} {symbol}: stage {stage} ({skill['name']}) -> decision #{decision_id}")
+        prices_df = load_prices_df(cur, symbol)
+    finally:
+        conn.close()
+
+    # Data for the stage: TECH tables for Murphy; the stored fundamentals bundle (downloaded once per symbol) for the others.
+    raw = {"symbol": symbol, "data_source": "tech"}
+    if skill.get("data_source") != "tech":
+        bundle = load_symbol_bundle(symbol, log=log)
+        raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
+    dlog = RunLog(DECISIONS_TABLE, "decision_id", decision_id)
+    dlog.entries = list(log.entries)
+    decision = execute_decision(bt_id, decision_id, skill, symbol, as_of, raw, prices_df, dlog)
+    log.entries = dlog.entries
+
+    update = {"ai_calls": (ai_calls or 0) + 1, f"{stage}_decision_id": decision_id, "updated_at": datetime.now(timezone.utc)}
+    rec = decision.get("recommendation")
+    if decision["status"] != "done":
+        update.update({"status": "failed", "reason": f"{skill['name']}: {decision.get('error') or 'failed'}"})
+    else:
+        update[f"{stage}_rec"] = rec
+        if stage == "murphy":
+            update.update({"price": decision.get("current_price"), "buy_below": decision.get("buy_below_price"),
+                           "stop_price": decision.get("stop_price"), "target_price": decision.get("target_price")})
+            px, bb, sp = decision.get("current_price"), decision.get("buy_below_price"), decision.get("stop_price")
+            in_range = bool(rec == "BUY" and px is not None and bb is not None and px <= bb and (sp is None or px > sp))
+            update["in_range"] = in_range
+            if rec != "BUY":
+                update.update({"status": "rejected", "reason": f"John Murphy: {rec}"})
+            elif not in_range:
+                update.update({"status": "rejected", "reason": f"John Murphy BUY but close {px} outside the entry zone (stop {sp} < price <= buy-below {bb})", "recommended_by": 1})
+            else:
+                update.update({"status": "pending", "stage": "buffett", "recommended_by": 1})
+        elif stage == "buffett":
+            if rec == "BUY":
+                update.update({"status": "pending", "stage": "dimon", "recommended_by": 2})
+            else:
+                update.update({"status": "rejected", "reason": f"Warren Buffett: {rec}", "recommended_by": 1})
+        else:  # dimon
+            if rec == "BUY":
+                update.update({"status": "done", "stage": "done", "recommended_by": 3, "reason": "Recommended by all three agents"})
+            else:
+                update.update({"status": "rejected", "reason": f"Jamie Dimon: {rec}", "recommended_by": 2})
+    log.add(f"{as_of} {symbol}: {skill['name']} -> {rec or decision.get('error')} => {update.get('status')} "
+            + (f"(next: {update['stage']})" if update.get("status") == "pending" else f"({update.get('reason', '')})"))
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        sets = ", ".join(f"{k} = %s" for k in update)
+        cur.execute(f"UPDATE {SCAN_ITEM_TABLE} SET {sets} WHERE job_id = %s AND as_of_date = %s AND symbol = %s",
+                    (*update.values(), job_id, as_of, symbol))
+        cur.execute(f"SELECT log_json FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
+        existing = json.loads(cur.fetchone()[0] or "[]")
+        brief = [e for e in log.entries if e["message"].startswith(f"{as_of} {symbol}")]
+        cur.execute(f"UPDATE {SCAN_JOB_TABLE} SET log_json = %s WHERE job_id = %s", (json.dumps((existing + brief)[-600:]), job_id))
+        counts = _scan_counts(cur, job_id)
+        cur.execute(f"SELECT {', '.join(SCAN_ITEM_COLUMNS)} FROM {SCAN_ITEM_TABLE} WHERE job_id = %s AND as_of_date = %s AND symbol = %s", (job_id, as_of, symbol))
+        item = _scan_item_dict(cur.fetchone())
+        conn.commit()
+        cur.execute(f"SELECT status FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
+        stopped = cur.fetchone()[0] == "stopped"
+    finally:
+        conn.close()
+    return {"done": stopped or (counts["pending"] == 0 and counts["running"] == 0), "stopped": stopped, "item": item,
+            "decision_id": decision_id, "backtest_id": bt_id, "counts": counts, "log": log.entries}
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",

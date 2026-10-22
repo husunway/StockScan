@@ -139,6 +139,27 @@ Each run uses roughly 10-20K input and 3-6K output tokens. `vercel.json` sets th
 think for 60-80 s before writing a 4-6K-token verdict at ~70 tokens/s, so a step can take 150-180 s.
 The default is `ANTHROPIC_EFFORT=medium`, which keeps the thinking phase to seconds; set `high` only if you accept 150 s+ steps.
 
+### S&P 500 scan (`/agent/scan`)
+
+Scans every constituent in `dbo.SP500_CONSTITUENTS` on every Monday (or weekday) in a date range through
+a three-agent funnel, cheapest first:
+
+1. **Pre-screen (free, no model):** from `TECH_TREND_DAILY` on that date - by default primary trend up and
+   intermediate trend not down (optional minimum ADX). Rejected pairs never reach a model.
+2. **John Murphy** - must say BUY, and the date's close must be inside the entry zone
+   (`stop_price < close <= buy_below_price`).
+3. **Warren Buffett** - must say BUY. 4. **Jamie Dimon** - must say BUY ⇒ *recommended by all 3*.
+
+A rejection at any stage ends that (date, stock) pair, so no further model calls are spent. Each stage is a
+normal stored decision (its own backtest row per skill, `SCAN#<job>`), so every analysis has the usual
+HTML/PDF reports. The scan is a resumable job (`dbo.SCAN_JOB` / `dbo.SCAN_ITEM`): `POST /api/py/scan`
+creates it and reports the exact number of stage-1 model calls; `POST /api/py/scan/{id}/step` runs one
+model call (claimed atomically, so the page can run 1-4 parallel workers); `/stop`, `/resume`,
+`GET /api/py/scan/{id}` (per-date aggregates), `/day/{date}` (that date's pairs), `/hits`.
+The page shows a calendar where each scanned date carries the number of all-3 hits, a per-date table with
+each agent's verdict and links to the reports, and the full hit list. Scale note: 503 stocks x 42 Mondays
+is ~21,000 stage-1 calls without the pre-screen; the pre-screen usually removes 60-80%.
+
 ### Weekly backtest (`/agent/backtest`)
 
 Runs a skill as of the **first N Mondays of a year** (N = 1-52, default 10; year default 2026, never
