@@ -345,6 +345,28 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 }
 .diag-item .stat-label { display: inline-flex; align-items: center; gap: 6px; }
 .diag-item strong { font-size: 0.9rem; }
+/* S&P 500 universe loader */
+.u-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 4px; margin-top: 10px; }
+.u-tile {
+  font: 600 0.68rem/1 ui-monospace, Consolas, monospace; padding: 7px 2px; border-radius: 5px; border: 1px solid transparent;
+  background: var(--border); color: var(--muted); cursor: pointer; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.u-tile.s-ready { background: color-mix(in srgb, #0ca30c 18%, var(--surface)); color: var(--text); border-color: #0ca30c; }
+.u-tile.s-stale { background: color-mix(in srgb, #c98500 22%, var(--surface)); color: var(--text); border-color: #c98500; }
+.u-tile.s-missing { background: var(--border); }
+.u-tile.j-pending { background: var(--bg); color: var(--text); border-color: var(--border); }
+.u-tile.j-running { background: var(--accent); color: #fff; animation: pulse 0.9s ease-in-out infinite alternate; }
+.u-tile.j-done { background: #0ca30c; color: #fff; }
+.u-tile.j-skipped { background: color-mix(in srgb, #0ca30c 18%, var(--surface)); color: var(--text); border-color: #0ca30c; }
+.u-tile.j-failed { background: #d03b3b; color: #fff; }
+.u-tile.j-cancelled { background: var(--bg); color: var(--muted); text-decoration: line-through; }
+.u-tile.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cal-key.u-ready { background: color-mix(in srgb, #0ca30c 18%, var(--surface)); outline: 1px solid #0ca30c; outline-offset: -1px; }
+.cal-key.u-stale { background: color-mix(in srgb, #c98500 22%, var(--surface)); outline: 1px solid #c98500; outline-offset: -1px; }
+.cal-key.u-skipped { background: color-mix(in srgb, #0ca30c 18%, var(--surface)); outline: 1px solid #0ca30c; outline-offset: -1px; }
+.u-detail { margin: 8px 0; padding: 10px 14px; }
+.single textarea { font: inherit; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
+
 /* Run history */
 .status-pill { padding: 2px 9px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; color: #fff; background: var(--muted); white-space: nowrap; }
 .status-pill.good { background: #0ca30c; }

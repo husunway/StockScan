@@ -108,12 +108,12 @@ def normalize_symbol(raw: str) -> str:
     return symbol
 
 
-def fetch_history(symbol: str) -> list[PriceRow]:
+def fetch_history(symbol: str, start: "date | None" = None) -> list[PriceRow]:
+    """Daily bars from Yahoo Finance: the default two-year window, or from `start` onward for delta loads."""
     import yfinance as yf
 
-    df = yf.Ticker(symbol).history(
-        period=HISTORY_PERIOD, interval="1d", auto_adjust=False, actions=False
-    )
+    kwargs = {"start": start.isoformat()} if start else {"period": HISTORY_PERIOD}
+    df = yf.Ticker(symbol).history(interval="1d", auto_adjust=False, actions=False, **kwargs)
     if df is None or df.empty:
         raise HTTPException(
             status_code=404, detail=f"No price history found on Yahoo Finance for {symbol}"
@@ -3511,6 +3511,390 @@ def decision_report_html(backtest_id: int, decision_id: int):
         )
     return Response(content=html_text, media_type="text/html; charset=utf-8",
                     headers={"Cache-Control": "private, max-age=300", "X-Frame-Options": "SAMEORIGIN"})
+
+
+# ---------------------------------------------------------------------------
+# S&P 500 universe loader: constituents table + a job that, per symbol, loads only the missing price
+# days and recomputes the TECH_ tables only when they are older than the latest stored close.
+# Driven in batches by the page (one request per batch) so it fits a serverless time limit.
+# ---------------------------------------------------------------------------
+UNIVERSE_TABLE = "dbo.SP500_CONSTITUENTS"
+UJOB_TABLE = "dbo.UNIVERSE_LOAD_JOB"
+UITEM_TABLE = "dbo.UNIVERSE_LOAD_ITEM"
+WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+ENSURE_UNIVERSE_SQL = f"""
+IF OBJECT_ID('{UNIVERSE_TABLE}', 'U') IS NULL
+CREATE TABLE {UNIVERSE_TABLE} (
+    symbol NVARCHAR(20) NOT NULL PRIMARY KEY, name NVARCHAR(200) NULL, sector NVARCHAR(100) NULL,
+    sub_industry NVARCHAR(150) NULL, source NVARCHAR(100) NOT NULL, active BIT NOT NULL CONSTRAINT DF_sp500_active DEFAULT 1,
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_sp500_updated DEFAULT SYSUTCDATETIME());
+IF OBJECT_ID('{UJOB_TABLE}', 'U') IS NULL
+CREATE TABLE {UJOB_TABLE} (
+    job_id INT IDENTITY(1,1) PRIMARY KEY, created_at DATETIME2 NOT NULL CONSTRAINT DF_ujob_created DEFAULT SYSUTCDATETIME(),
+    status NVARCHAR(10) NOT NULL, options NVARCHAR(MAX) NULL, log_json NVARCHAR(MAX) NULL);
+IF OBJECT_ID('{UITEM_TABLE}', 'U') IS NULL
+CREATE TABLE {UITEM_TABLE} (
+    job_id INT NOT NULL, symbol NVARCHAR(20) NOT NULL, status NVARCHAR(10) NOT NULL,
+    price_action NVARCHAR(10) NULL, price_rows_added INT NULL, price_last_date DATE NULL,
+    tech_action NVARCHAR(10) NULL, tech_last_date DATE NULL, message NVARCHAR(600) NULL,
+    started_at DATETIME2 NULL, finished_at DATETIME2 NULL, duration_ms INT NULL,
+    CONSTRAINT PK_UNIVERSE_LOAD_ITEM PRIMARY KEY (job_id, symbol));
+"""
+
+
+def yahoo_symbol(raw: str) -> str:
+    """Wikipedia/exchange tickers use dots for share classes (BRK.B); Yahoo uses dashes (BRK-B)."""
+    return raw.strip().upper().replace(".", "-")
+
+
+def fetch_sp500_from_wikipedia() -> list[dict]:
+    import io
+
+    import pandas as pd
+    import requests
+
+    r = requests.get(WIKIPEDIA_SP500_URL, headers={"User-Agent": "StockScan/1.0 (personal research tool)"}, timeout=30)
+    r.raise_for_status()
+    tables = pd.read_html(io.StringIO(r.text))
+    table = next((t for t in tables if "Symbol" in t.columns and "Security" in t.columns), None)
+    if table is None:
+        raise HTTPException(status_code=502, detail="Could not find the constituents table on the Wikipedia page.")
+    rows = []
+    for _, row in table.iterrows():
+        rows.append({"symbol": yahoo_symbol(str(row["Symbol"])), "name": str(row.get("Security", ""))[:200],
+                     "sector": str(row.get("GICS Sector", ""))[:100], "sub_industry": str(row.get("GICS Sub-Industry", ""))[:150]})
+    if len(rows) < 400:
+        raise HTTPException(status_code=502, detail=f"Only {len(rows)} constituents parsed; page layout may have changed.")
+    return rows
+
+
+def upsert_universe(rows: list[dict], source: str) -> dict:
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_UNIVERSE_SQL)
+        cur.execute(f"UPDATE {UNIVERSE_TABLE} SET active = 0")
+        for r in rows:
+            cur.execute(
+                f"MERGE {UNIVERSE_TABLE} AS t USING (SELECT %s AS symbol) AS s ON t.symbol = s.symbol "
+                f"WHEN MATCHED THEN UPDATE SET name = %s, sector = %s, sub_industry = %s, source = %s, active = 1, updated_at = SYSUTCDATETIME() "
+                f"WHEN NOT MATCHED THEN INSERT (symbol, name, sector, sub_industry, source, active) VALUES (%s, %s, %s, %s, %s, 1);",
+                (r["symbol"], r.get("name"), r.get("sector"), r.get("sub_industry"), source,
+                 r["symbol"], r.get("name"), r.get("sector"), r.get("sub_industry"), source),
+            )
+        conn.commit()
+        cur.execute(f"SELECT COUNT(*) FROM {UNIVERSE_TABLE} WHERE active = 1")
+        active = cur.fetchone()[0]
+    finally:
+        conn.close()
+    return {"imported": len(rows), "active": active, "source": source}
+
+
+def universe_state(cur) -> list[dict]:
+    """Constituents joined with what is stored for each: price coverage and TECH freshness."""
+    cur.execute(ENSURE_UNIVERSE_SQL)
+    cur.execute(ENSURE_TECH_SQL)
+    cur.execute(ENSURE_TABLE_SQL)
+    cur.execute(
+        f"SELECT u.symbol, u.name, u.sector, u.sub_industry, u.source, u.updated_at, "
+        f"p.cnt, p.first_date, p.last_date, t.computed_at, t.last_trade_date, t.price_rows "
+        f"FROM {UNIVERSE_TABLE} u "
+        f"LEFT JOIN (SELECT symbol, COUNT(*) AS cnt, MIN(trade_date) AS first_date, MAX(trade_date) AS last_date FROM {TABLE} GROUP BY symbol) p ON p.symbol = u.symbol "
+        f"LEFT JOIN dbo.TECH_LOAD t ON t.symbol = u.symbol "
+        f"WHERE u.active = 1 ORDER BY u.symbol"
+    )
+    out = []
+    for r in cur.fetchall():
+        symbol, name, sector, sub, source, updated, cnt, first, last, computed, tech_last, tech_rows = r
+        tech_fresh = bool(tech_last and last and tech_last >= last)
+        out.append({"symbol": symbol, "name": name, "sector": sector, "sub_industry": sub,
+                    "price_rows": cnt or 0, "price_first": first.isoformat() if first else None, "price_last": last.isoformat() if last else None,
+                    "tech_computed_at": computed.isoformat() if computed else None, "tech_last": tech_last.isoformat() if tech_last else None,
+                    "tech_fresh": tech_fresh,
+                    "state": "ready" if (cnt and tech_fresh) else "stale" if cnt else "missing"})
+    return out
+
+
+def update_prices_delta(symbol: str) -> dict:
+    """Load only the trading days after the last stored close (or two years when nothing is stored)."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_TABLE_SQL)
+        cur.execute(f"SELECT COUNT(*), MAX(trade_date) FROM {TABLE} WHERE symbol = %s", (symbol,))
+        count, last = cur.fetchone()
+    finally:
+        conn.close()
+    if not count:
+        rows = fetch_history(symbol)
+        save_prices(symbol, rows)
+        return {"action": "full", "added": len(rows), "last_date": rows[-1].trade_date.isoformat()}
+    start = last + timedelta(days=1)
+    if start > date.today():
+        return {"action": "skipped", "added": 0, "last_date": last.isoformat()}
+    try:
+        rows = fetch_history(symbol, start=start)
+    except HTTPException as e:
+        if e.status_code == 404:  # nothing new yet (weekend / holiday)
+            return {"action": "skipped", "added": 0, "last_date": last.isoformat()}
+        raise
+    rows = [r for r in rows if r.trade_date > last]
+    if not rows:
+        return {"action": "skipped", "added": 0, "last_date": last.isoformat()}
+    save_prices(symbol, rows)
+    return {"action": "delta", "added": len(rows), "last_date": rows[-1].trade_date.isoformat()}
+
+
+def _ujob_counts(cur, job_id: int) -> dict:
+    cur.execute(f"SELECT status, COUNT(*) FROM {UITEM_TABLE} WHERE job_id = %s GROUP BY status", (job_id,))
+    counts = {"pending": 0, "running": 0, "done": 0, "skipped": 0, "failed": 0, "cancelled": 0}
+    for s, n in cur.fetchall():
+        counts[s] = n
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def _ujob(cur, job_id: int) -> dict:
+    cur.execute(f"SELECT job_id, created_at, status, options, log_json FROM {UJOB_TABLE} WHERE job_id = %s", (job_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Load job not found")
+    cur.execute(
+        f"SELECT symbol, status, price_action, price_rows_added, price_last_date, tech_action, tech_last_date, message, "
+        f"started_at, finished_at, duration_ms FROM {UITEM_TABLE} WHERE job_id = %s ORDER BY symbol", (job_id,))
+    items = []
+    for r in cur.fetchall():
+        items.append({"symbol": r[0], "status": r[1], "price_action": r[2], "price_rows_added": r[3],
+                      "price_last_date": r[4].isoformat() if r[4] else None, "tech_action": r[5],
+                      "tech_last_date": r[6].isoformat() if r[6] else None, "message": r[7],
+                      "started_at": r[8].isoformat() if r[8] else None, "finished_at": r[9].isoformat() if r[9] else None,
+                      "duration_ms": r[10]})
+    return {"job_id": row[0], "created_at": row[1].isoformat(), "status": row[2], "options": json.loads(row[3] or "{}"),
+            "log": json.loads(row[4] or "[]"), "counts": _ujob_counts(cur, job_id), "items": items}
+
+
+class UniverseImportRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=200_000, description="Symbols separated by commas/whitespace/newlines, or CSV with a Symbol column")
+    source: str = Field("manual import", max_length=100)
+
+
+class UniverseLoadRequest(BaseModel):
+    only_stale: bool = Field(True, description="Skip symbols whose prices and technical data are already current")
+    batch_size: int = Field(5, ge=1, le=20)
+    symbols: list[str] | None = Field(None, description="Optional subset; default is every active constituent")
+
+
+@app.get("/api/py/universe")
+def universe_list():
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        items = universe_state(cur)
+        conn.commit()
+        cur.execute(f"SELECT MAX(updated_at), MIN(source) FROM {UNIVERSE_TABLE} WHERE active = 1")
+        upd, source = cur.fetchone()
+        cur.execute(f"SELECT TOP 1 job_id, status, created_at FROM {UJOB_TABLE} ORDER BY job_id DESC")
+        last = cur.fetchone()
+    finally:
+        conn.close()
+    summary = {"total": len(items), "ready": sum(i["state"] == "ready" for i in items), "stale": sum(i["state"] == "stale" for i in items),
+               "missing": sum(i["state"] == "missing" for i in items)}
+    return {"items": items, "summary": summary, "list_updated_at": upd.isoformat() if upd else None, "list_source": source,
+            "latest_job": {"job_id": last[0], "status": last[1], "created_at": last[2].isoformat()} if last else None}
+
+
+@app.post("/api/py/universe/refresh")
+def universe_refresh():
+    """Fetch the constituents table from Wikipedia (public page) and upsert it."""
+    rows = fetch_sp500_from_wikipedia()
+    return upsert_universe(rows, "wikipedia:List_of_S&P_500_companies")
+
+
+@app.post("/api/py/universe/import")
+def universe_import(req: UniverseImportRequest):
+    import csv
+    import io
+
+    text = req.text.strip()
+    rows: list[dict] = []
+    if "\n" in text and "," in text.split("\n")[0] and "symbol" in text.split("\n")[0].lower():
+        reader = csv.DictReader(io.StringIO(text))
+        key = next(k for k in reader.fieldnames if k.strip().lower() == "symbol")
+        for r in reader:
+            if r.get(key, "").strip():
+                rows.append({"symbol": yahoo_symbol(r[key]), "name": (r.get("Security") or r.get("Name") or r.get("name") or "")[:200],
+                             "sector": (r.get("GICS Sector") or r.get("Sector") or r.get("sector") or "")[:100],
+                             "sub_industry": (r.get("GICS Sub-Industry") or r.get("Sub-Industry") or "")[:150]})
+    else:
+        for tok in re.split(r"[\s,;]+", text):
+            if tok and re.fullmatch(r"[A-Za-z0-9.^-]{1,10}", tok):
+                rows.append({"symbol": yahoo_symbol(tok), "name": None, "sector": None, "sub_industry": None})
+    if not rows:
+        raise HTTPException(status_code=422, detail="No symbols found in the text.")
+    return upsert_universe(rows, req.source)
+
+
+@app.post("/api/py/universe/load")
+def universe_load_create(req: UniverseLoadRequest):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        state = universe_state(cur)
+        if req.symbols:
+            wanted = {normalize_symbol(s) for s in req.symbols}
+            state = [s for s in state if s["symbol"] in wanted]
+        if not state:
+            raise HTTPException(status_code=422, detail="No constituents to load. Refresh or import the S&P 500 list first.")
+        todo = [s for s in state if not (req.only_stale and s["state"] == "ready")]
+        skipped = [s for s in state if req.only_stale and s["state"] == "ready"]
+        log = RunLog(UJOB_TABLE, "job_id")
+        log.add(f"Universe: {len(state)} active constituents; {len(todo)} need work ({sum(s['state'] == 'missing' for s in todo)} missing, "
+                f"{sum(s['state'] == 'stale' for s in todo)} stale); {len(skipped)} already current")
+        log.add(f"Database: {describe_db()} · batch size {req.batch_size} per request · Yahoo Finance for price deltas")
+        cur.execute(f"INSERT INTO {UJOB_TABLE} (status, options, log_json) OUTPUT INSERTED.job_id VALUES ('active', %s, %s)",
+                    (json.dumps(req.model_dump()), json.dumps(log.entries)))
+        job_id = cur.fetchone()[0]
+        rows = [(job_id, s["symbol"], "pending") for s in todo] + [(job_id, s["symbol"], "skipped") for s in skipped]
+        for i in range(0, len(rows), 200):
+            part = rows[i:i + 200]
+            cur.execute(f"INSERT INTO {UITEM_TABLE} (job_id, symbol, status) VALUES " + ", ".join(["(%s, %s, %s)"] * len(part)),
+                        tuple(v for r in part for v in r))
+        if skipped:
+            cur.execute(f"UPDATE {UITEM_TABLE} SET message = 'already current', price_action = 'skipped', tech_action = 'skipped' "
+                        f"WHERE job_id = %s AND status = 'skipped'", (job_id,))
+        conn.commit()
+        return _ujob(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/universe/load/latest")
+def universe_load_latest():
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_UNIVERSE_SQL)
+        conn.commit()
+        cur.execute(f"SELECT TOP 1 job_id FROM {UJOB_TABLE} ORDER BY job_id DESC")
+        row = cur.fetchone()
+        return _ujob(cur, row[0]) if row else None
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/universe/load/{job_id}")
+def universe_load_get(job_id: int):
+    conn = db_connect()
+    try:
+        return _ujob(conn.cursor(), job_id)
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/universe/load/{job_id}/stop")
+def universe_load_stop(job_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {UJOB_TABLE} SET status = 'stopped' WHERE job_id = %s", (job_id,))
+        cur.execute(f"UPDATE {UITEM_TABLE} SET status = 'cancelled', message = 'Stopped by user' WHERE job_id = %s AND status = 'pending'", (job_id,))
+        conn.commit()
+        return _ujob(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/universe/load/{job_id}/resume")
+def universe_load_resume(job_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {UJOB_TABLE} SET status = 'active' WHERE job_id = %s", (job_id,))
+        cur.execute(f"UPDATE {UITEM_TABLE} SET status = 'pending', message = NULL WHERE job_id = %s AND status IN ('cancelled', 'failed')", (job_id,))
+        conn.commit()
+        return _ujob(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/universe/load/{job_id}/step")
+def universe_load_step(job_id: int):
+    """Process the next batch of pending symbols: price delta, then TECH recompute if stale. One request per batch."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT status, options, log_json FROM {UJOB_TABLE} WHERE job_id = %s", (job_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Load job not found")
+        if row[0] == "stopped":
+            return {"done": True, "stopped": True, "processed": [], "counts": _ujob_counts(cur, job_id), "log": []}
+        batch_size = int(json.loads(row[1] or "{}").get("batch_size", 5))
+        cur.execute(f"SELECT TOP {batch_size} symbol FROM {UITEM_TABLE} WHERE job_id = %s AND status = 'pending' ORDER BY symbol", (job_id,))
+        symbols = [r[0] for r in cur.fetchall()]
+        if not symbols:
+            cur.execute(f"UPDATE {UJOB_TABLE} SET status = 'done' WHERE job_id = %s AND status = 'active'", (job_id,))
+            conn.commit()
+            return {"done": True, "processed": [], "counts": _ujob_counts(cur, job_id), "log": []}
+        cur.execute(f"UPDATE {UITEM_TABLE} SET status = 'running', started_at = SYSUTCDATETIME() WHERE job_id = %s AND symbol IN ({', '.join('%s' for _ in symbols)})",
+                    (job_id, *symbols))
+        conn.commit()
+    finally:
+        conn.close()
+
+    processed = []
+    batch_log = RunLog("x", "y")
+    t_batch = time.monotonic()
+    for symbol in symbols:
+        t0 = time.monotonic()
+        item = {"symbol": symbol, "status": "done", "price_action": None, "price_rows_added": 0, "price_last_date": None,
+                "tech_action": None, "tech_last_date": None, "message": None}
+        try:
+            p = update_prices_delta(symbol)
+            item.update({"price_action": p["action"], "price_rows_added": p["added"], "price_last_date": p["last_date"]})
+            st = tech_status(symbol)
+            if st["available"] and st["fresh"]:
+                item.update({"tech_action": "skipped", "tech_last_date": st["last_trade_date"]})
+            else:
+                res = prepare_technicals(symbol)
+                item.update({"tech_action": "computed", "tech_last_date": res["last_trade_date"]})
+            item["message"] = (f"prices {p['action']}" + (f" +{p['added']} rows" if p["added"] else "") + f" to {p['last_date']}; "
+                               f"technical data {item['tech_action']} (to {item['tech_last_date']})")
+            batch_log.add(f"{symbol}: {item['message']} - {time.monotonic() - t0:.1f} s")
+        except HTTPException as e:
+            item.update({"status": "failed", "message": str(e.detail)[:600]})
+            batch_log.add(f"{symbol}: FAILED - {item['message']}", "error")
+        except Exception as e:  # noqa: BLE001
+            item.update({"status": "failed", "message": f"{type(e).__name__}: {str(e)[:500]}"})
+            batch_log.add(f"{symbol}: FAILED - {item['message']}", "error")
+        item["duration_ms"] = round((time.monotonic() - t0) * 1000)
+        processed.append(item)
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        for it in processed:
+            cur.execute(
+                f"UPDATE {UITEM_TABLE} SET status = %s, price_action = %s, price_rows_added = %s, price_last_date = %s, tech_action = %s, "
+                f"tech_last_date = %s, message = %s, finished_at = SYSUTCDATETIME(), duration_ms = %s WHERE job_id = %s AND symbol = %s",
+                (it["status"], it["price_action"], it["price_rows_added"], it["price_last_date"], it["tech_action"], it["tech_last_date"],
+                 it["message"], it["duration_ms"], job_id, it["symbol"]),
+            )
+        cur.execute(f"SELECT log_json FROM {UJOB_TABLE} WHERE job_id = %s", (job_id,))
+        existing = json.loads(cur.fetchone()[0] or "[]")
+        batch_log.add(f"Batch of {len(processed)} done in {time.monotonic() - t_batch:.1f} s")
+        cur.execute(f"UPDATE {UJOB_TABLE} SET log_json = %s WHERE job_id = %s", (json.dumps((existing + batch_log.entries)[-400:]), job_id))
+        counts = _ujob_counts(cur, job_id)
+        if counts["pending"] == 0 and counts["running"] == 0:
+            cur.execute(f"UPDATE {UJOB_TABLE} SET status = 'done' WHERE job_id = %s AND status = 'active'", (job_id,))
+        conn.commit()
+        cur.execute(f"SELECT status FROM {UJOB_TABLE} WHERE job_id = %s", (job_id,))
+        stopped = cur.fetchone()[0] == "stopped"
+    finally:
+        conn.close()
+    return {"done": stopped or (counts["pending"] == 0 and counts["running"] == 0), "stopped": stopped, "processed": processed,
+            "counts": counts, "log": batch_log.entries}
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",

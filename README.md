@@ -43,6 +43,20 @@ Computed in Python (pandas) from the stored daily prices:
 
 The chart is drawn with [lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache 2.0).
 
+### S&P 500 universe loader (`/prices/sp500`)
+
+Loads price history and prepares the technical data for every S&P 500 constituent, with live
+progress. The constituents list is fetched from Wikipedia's public table (*Refresh list*) or pasted
+(*Import list*: symbols or a CSV with a `Symbol` column; dots become dashes, BRK.B → BRK-B) into
+`dbo.SP500_CONSTITUENTS`. A load job (`dbo.UNIVERSE_LOAD_JOB` / `_ITEM`) processes symbols in batches,
+one request per batch (`POST /api/py/universe/load`, `/{id}/step`, `/stop`, `/resume`;
+`GET /api/py/universe` for the current state of every symbol). **Delta only:** prices are fetched from
+the day after the last stored close (two years when nothing is stored); the `TECH_` tables are
+recomputed only when `TECH_LOAD.last_trade_date` is older than the latest stored close; symbols that
+are already current are skipped (unless *only missing/stale* is unchecked). The page shows every
+constituent as a tile coloured by state (missing / stale / ready) and, during a job, by progress
+(pending / loading / loaded / skipped / failed), with a live log, ETA, Stop and Resume.
+
 ### AI agent and skills (`/agent`)
 
 The agent runs a **skill file** against a stock. Skills live in the repository:

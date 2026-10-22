@@ -8,7 +8,12 @@ type Item = { href: string; label: string; icon?: string; children?: Item[] };
 
 const items: Item[] = [
   { href: "/", label: "Dashboard", icon: "▦" },
-  { href: "/prices", label: "Load Prices", icon: "↓" },
+  {
+    href: "/prices",
+    label: "Load Prices",
+    icon: "↓",
+    children: [{ href: "/prices/sp500", label: "S&P 500 universe" }],
+  },
   {
     href: "/analysis",
     label: "Analysis",
