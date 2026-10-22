@@ -134,6 +134,7 @@ export default function UniverseLoader() {
   }, [loadUniverse]);
 
   async function startLoad() {
+    stopRef.current = false;
     setBusy("start");
     setError(null);
     setLog([]);
@@ -145,6 +146,12 @@ export default function UniverseLoader() {
       setJob(j);
       setLog((prev) => [...prev, ...j.log]);
       setBusy(null);
+      if (stopRef.current) {
+        const stopped = await api<Job>(`/api/py/universe/load/${j.job_id}/stop`, { method: "POST" });
+        setJob(stopped);
+        note("Stopped before the first batch", "warn");
+        return;
+      }
       await runSteps(j.job_id);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Could not start";
@@ -154,10 +161,15 @@ export default function UniverseLoader() {
     }
   }
 
+  const canStop = running || busy === "start" || (!!job && job.status === "active" && job.counts.pending + job.counts.running > 0);
+
   async function stopLoad() {
-    if (!job) return;
-    stopRef.current = true;
-    abortRef.current?.abort();
+    stopRef.current = true;          // stops the step loop (and prevents one from starting after a create)
+    abortRef.current?.abort();       // drops the browser's wait on the current batch
+    if (!job) {
+      note("Stop requested before the job was created; it will not start", "warn");
+      return;
+    }
     try {
       const j = await api<Job>(`/api/py/universe/load/${job.job_id}/stop`, { method: "POST" });
       setJob(j);
@@ -225,9 +237,9 @@ export default function UniverseLoader() {
         <button type="button" className="btn" disabled={busy !== null || running || !universe?.summary.total} onClick={startLoad}>
           {busy === "start" ? "Starting…" : "Load / update all"}
         </button>
-        {job && job.status === "active" && (running || active) && (
-          <button type="button" className="btn small danger" onClick={stopLoad}>Stop</button>
-        )}
+        <button type="button" className="btn small danger" disabled={!canStop} onClick={stopLoad} title={canStop ? "Stop the load now; remaining symbols are cancelled and can be resumed later" : "Nothing is running"}>
+          Stop
+        </button>
         {job && !running && (job.counts.pending > 0 || job.counts.cancelled > 0 || job.counts.failed > 0) && (
           <button type="button" className="btn small" onClick={resumeLoad}>
             {job.counts.pending > 0 ? "Resume" : "Retry failed / cancelled"}
