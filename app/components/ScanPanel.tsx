@@ -56,6 +56,7 @@ export default function ScanPanel() {
   const [dayItems, setDayItems] = useState<Item[] | null>(null);
   const [showAllDay, setShowAllDay] = useState(false);
   const [hits, setHits] = useState<Item[]>([]);
+  const [chart, setChart] = useState<{ symbol: string; date: string; murphy: string | null } | null>(null);
   const stopRef = useRef(false);
   const aborts = useRef<AbortController[]>([]);
 
@@ -262,6 +263,22 @@ export default function ScanPanel() {
 
       {job && (
         <>
+          <h2 className="section-title">Progress by date — stocks analyzed vs total</h2>
+          <div className="day-progress">
+            {job.days.map((d) => {
+              const done = d.total - d.open;
+              const p = d.total ? (done / d.total) * 100 : 0;
+              return (
+                <button type="button" key={d.as_of_date} className={`day-row ${selectedDay === d.as_of_date ? "sel" : ""}`} onClick={() => openDay(d.as_of_date)} title={`${d.as_of_date}: ${done} of ${d.total} settled · ${d.prescreen_rejected} pre-screened out · Murphy BUY ${d.murphy_buy} · Buffett BUY ${d.buffett_buy} · all 3: ${d.all3}`}>
+                  <span className="day-date">{d.as_of_date}</span>
+                  <span className="progress"><span className="progress-bar" style={{ width: `${p}%`, background: d.open > 0 ? "var(--accent)" : "#0ca30c" }} /></span>
+                  <span className="day-count">{done.toLocaleString()} / {d.total.toLocaleString()}</span>
+                  <span className={`day-hits ${d.all3 > 0 ? "has" : ""}`}>{d.all3 > 0 ? `★ ${d.all3}` : d.open > 0 ? "…" : "0"}</span>
+                </button>
+              );
+            })}
+          </div>
+
           <h2 className="section-title">Buy recommendations by date</h2>
           <div className="cal-legend">
             <span><i className="cal-key" /> not scanned</span><span><i className="cal-key sched" /> scanning / open</span>
@@ -300,10 +317,11 @@ export default function ScanPanel() {
               {!dayItems ? <p className="msg">Loading…</p> : dayItems.length === 0 ? <p className="msg">Nothing reached a model on this date yet.</p> : (
                 <div className="table-wrap">
                   <table className="table">
-                    <thead><tr><th>Stock</th><th>Sector</th><th>Status</th><th className="num">Close</th><th className="num">Buy below</th><th className="num">Stop</th><th className="num">Target</th><th>Murphy</th><th>Buffett</th><th>Dimon</th><th>Result / reason</th></tr></thead>
+                    <thead><tr><th></th><th>Stock</th><th>Sector</th><th>Status</th><th className="num">Close</th><th className="num">Buy below</th><th className="num">Stop</th><th className="num">Target</th><th>Murphy</th><th>Buffett</th><th>Dimon</th><th>Result / reason</th></tr></thead>
                     <tbody>
                       {dayItems.map((it) => (
-                        <tr key={it.symbol} className={it.recommended_by === 3 ? "row-hit" : ""}>
+                        <tr key={it.symbol} className={`${it.recommended_by === 3 ? "row-hit" : ""} ${chart?.symbol === it.symbol && chart?.date === it.as_of_date ? "row-open" : ""}`}>
+                          <td><button type="button" className="btn small ghost" onClick={() => setChart({ symbol: it.symbol, date: it.as_of_date, murphy: decisionLink("john-murphy", it.murphy_decision_id) })}>Chart</button></td>
                           <td><strong>{it.symbol}</strong></td><td>{it.sector ?? ""}</td>
                           <td>{it.status}{it.status === "pending" || it.status === "running" ? ` (${it.stage})` : ""}</td>
                           <td className="num">{n(it.price)}</td><td className="num">{n(it.buy_below)}</td><td className="num">{n(it.stop_price)}</td><td className="num">{n(it.target_price)}</td>
@@ -320,14 +338,27 @@ export default function ScanPanel() {
             </div>
           )}
 
+          {chart && (
+            <div className="card" style={{ marginTop: 12, padding: 0, overflow: "hidden" }}>
+              <div className="filters" style={{ padding: "10px 12px", marginBottom: 0 }}>
+                <strong>{chart.symbol}</strong> technical chart as of {chart.date} — K chart, SMA 20/50/200, Bollinger, volume, RSI, MACD, support / resistance / Fibonacci, signals, patterns (TECH_ tables, nothing after that date)
+                <a href={`/api/py/tech/${chart.symbol}/chart.html?as_of=${chart.date}`} target="_blank" rel="noreferrer">open in a new tab</a>
+                {chart.murphy && <Link href={chart.murphy}>Murphy report</Link>}
+                <button type="button" className="linklike" onClick={() => setChart(null)}>close</button>
+              </div>
+              <iframe className="pdf-frame report-frame" style={{ borderRadius: 0, border: 0, borderTop: "1px solid var(--border)" }} src={`/api/py/tech/${chart.symbol}/chart.html?as_of=${chart.date}`} title={`${chart.symbol} chart ${chart.date}`} />
+            </div>
+          )}
+
           <h2 className="section-title">All hits (recommended by all three) — {hits.length}</h2>
           {hits.length === 0 ? <p className="msg">None yet.</p> : (
             <div className="table-wrap">
               <table className="table">
-                <thead><tr><th>Date</th><th>Stock</th><th>Sector</th><th className="num">Close</th><th className="num">Buy below</th><th className="num">Stop</th><th className="num">Target (Murphy)</th><th>Reports</th></tr></thead>
+                <thead><tr><th></th><th>Date</th><th>Stock</th><th>Sector</th><th className="num">Close</th><th className="num">Buy below</th><th className="num">Stop</th><th className="num">Target (Murphy)</th><th>Reports</th></tr></thead>
                 <tbody>
                   {hits.map((it) => (
                     <tr key={`${it.as_of_date}-${it.symbol}`} className="row-hit">
+                      <td><button type="button" className="btn small ghost" onClick={() => setChart({ symbol: it.symbol, date: it.as_of_date, murphy: decisionLink("john-murphy", it.murphy_decision_id) })}>Chart</button></td>
                       <td>{it.as_of_date}</td><td><strong>{it.symbol}</strong></td><td>{it.sector ?? ""}</td>
                       <td className="num">{n(it.price)}</td><td className="num">{n(it.buy_below)}</td><td className="num">{n(it.stop_price)}</td><td className="num">{n(it.target_price)}</td>
                       <td>

@@ -353,6 +353,21 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .row-hit td { background: color-mix(in srgb, #0ca30c 12%, transparent); }
 .agent-form input[type="date"], .agent-form input[type="number"] { padding: 8px 10px; }
 
+/* Scan: per-date progress rows */
+.day-progress { display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px; }
+.day-row {
+  all: unset; display: grid; grid-template-columns: 96px 1fr 110px 60px; align-items: center; gap: 10px;
+  padding: 5px 10px; border-radius: 8px; cursor: pointer; font-size: 0.82rem; color: var(--text);
+}
+.day-row:hover { background: var(--surface); }
+.day-row.sel { background: var(--surface); box-shadow: 0 0 0 2px var(--accent) inset; }
+.day-row .progress { display: block; }
+.day-row .progress-bar { display: block; }
+.day-date { font-variant-numeric: tabular-nums; color: var(--muted); }
+.day-count { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.day-hits { text-align: right; color: var(--muted); }
+.day-hits.has { color: #0ca30c; font-weight: 700; }
+
 /* S&P 500 universe loader */
 .u-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 4px; margin-top: 10px; }
 .u-tile {

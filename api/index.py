@@ -3311,7 +3311,7 @@ ul{padding-left:20px}li{margin:3px 0}
 <script>
 (function(){
 const D = JSON.parse(document.getElementById('data').textContent);
-const A = D.analysis || {}, C = D.chart || {bars:[]}, M = D.meta || {};
+const hasA = !!D.analysis, A = D.analysis || {}, C = D.chart || {bars:[]}, M = D.meta || {};
 const app = document.getElementById('app'); app.textContent = '';
 const el = (tag, attrs, ...kids) => { const e = document.createElement(tag); for (const k in attrs||{}) { if (k==='class') e.className = attrs[k]; else if (k==='style') e.style.cssText = attrs[k]; else if (k.startsWith('on')) e.addEventListener(k.slice(2), attrs[k]); else e.setAttribute(k, attrs[k]); }
   for (const kid of kids.flat()) { if (kid===null||kid===undefined) continue; e.appendChild(typeof kid==='string' ? document.createTextNode(kid) : kid); } return e; };
@@ -3326,8 +3326,13 @@ const table = (cols, rows, numCols) => el('table',{}, el('thead',{}, el('tr',{},
 
 // ---- header + verdict
 const rec = A.recommendation || '—';
+if (hasA) {
 app.append(el('h1',{}, `${D.skill.name} analysis: ${D.symbol} as of ${D.as_of}`));
 app.append(el('div',{class:'meta'}, `Skill ${D.skill.id} v${D.skill.version||'-'} · model ${M.model||''} · generated ${M.generated_at||''} UTC · point-in-time: nothing after ${D.as_of} was visible to the agent`));
+} else {
+app.append(el('h1',{}, `${D.symbol}: technical chart as of ${D.as_of}`));
+app.append(el('div',{class:'meta'}, `From the TECH_ tables (${C.source||''}); only bars, levels, signals and patterns dated on or before ${D.as_of}. No agent analysis on this page.`));
+}
 const price = A.current_price, up = A.target_price && price ? (A.target_price/price-1)*100 : null, dn = A.stop_price && price ? (A.stop_price/price-1)*100 : null;
 const v = el('div',{class:'card verdict '+rec});
 v.append(el('div',{}, el('span',{class:'badge'}, rec), el('span',{class:'headline'}, A.headline||'')));
@@ -3341,7 +3346,7 @@ g.append(el('div',{class:'stat stop'}, el('span',{},'Stop'), el('b',{}, money(A.
 v.append(g);
 if (A.target_rationale || A.stop_rationale) v.append(el('div',{class:'hint',style:'margin-top:10px'}, A.target_rationale ? el('p',{}, el('b',{},'Target: '), A.target_rationale) : null, A.stop_rationale ? el('p',{}, el('b',{},'Stop: '), A.stop_rationale) : null));
 if (M.warnings && M.warnings.length) v.append(el('ul',{class:'warn',style:'margin-top:8px;list-style:none;padding:0'}, M.warnings.map(w => el('li',{}, '⚠ ' + w))));
-app.append(v);
+if (hasA) app.append(v);
 
 // ---- evidence model (what the agent cited), linked to chart objects
 const evidence = [];
@@ -3442,8 +3447,23 @@ if (C.bars && C.bars.length && window.LightweightCharts) {
   evidence.forEach(e => { focusFns[e.id] = () => { if (e.kind==='level') flash(levelLines[e.id]); if (e.date) goto(e.date); else if (e.kind==='pattern') { const p = (C.patterns||[]).find(x => e.title.toLowerCase().includes(x.pattern_type.replace(/_/g,' '))); if (p) goto(p.confirmed_date); } else if (e.kind==='level') goto(last.time); }; });
 }
 
+// ---- technical data as of the date (TECH_ tables)
+if (C.technical) {
+  const sec = el('div',{class:'card'});
+  if (C.trend) { sec.append(el('h3',{}, 'Trend (TECH_TREND_DAILY ' + C.trend.trade_date + ')'), el('div',{class:'hint',style:'margin-bottom:8px'}, `primary ${C.trend.primary_trend} · intermediate ${C.trend.intermediate_trend} · short ${C.trend.short_trend} · strength ${C.trend.trend_strength} · ${C.trend.structure} · price vs SMA200 ${pct(C.trend.price_vs_sma200_pct)} · vs SMA50 ${pct(C.trend.price_vs_sma50_pct)}`)); }
+  const lb = C.bars[C.bars.length-1] || {};
+  const ind = [['SMA20', lb.sma20], ['SMA50', lb.sma50], ['SMA200', lb.sma200], ['RSI(14)', lb.rsi14], ['MACD', lb.macd], ['Signal', lb.macd_signal], ['Histogram', lb.macd_hist], ['ADX(14)', lb.adx14], ['BB upper', lb.bb_upper], ['BB lower', lb.bb_lower], ['Volume / 20d avg', lb.volume && lb.volume_sma20 ? (lb.volume/lb.volume_sma20).toFixed(2)+'x' : null]];
+  sec.append(el('h3',{}, 'Key indicators on ' + (lb.trade_date||D.as_of)), el('div',{class:'grid',style:'margin-top:4px'}, ind.map(([k,val]) => el('div',{class:'stat'}, el('span',{}, k), el('b',{}, show(val))))));
+  const lv = (C.levels||[]).slice().sort((a,b) => b.price - a.price);
+  if (lv.length) sec.append(el('h3',{}, 'Support, resistance and Fibonacci levels (TECH_LEVEL, as of the latest trading day <= ' + D.as_of + ')'), table(['level_type','price','distance_pct','touches','last_touch_date','rank'], lv, ['price','distance_pct','touches','rank']));
+  const sg = (C.signals||[]).slice(-25).reverse();
+  if (sg.length) sec.append(el('h3',{}, 'Recent signals (TECH_SIGNAL)'), table(['signal_date','signal_type','direction','description','value'], sg, ['value']));
+  if ((C.patterns||[]).length) sec.append(el('h3',{}, 'Confirmed patterns (TECH_PATTERN)'), table(['pattern_type','direction','start_date','end_date','confirmed_date','neckline','target','description'], C.patterns, ['neckline','target']));
+  app.append(el('h2',{}, 'Technical data as of ' + D.as_of), sec);
+}
+
 // ---- evidence panel
-if (evidence.length) {
+if (hasA && evidence.length) {
   app.append(el('h2',{}, 'Evidence behind the decision'), el('p',{class:'hint'}, chart ? 'Click an item to jump the chart to its date and highlight the related line or marker.' : 'Each item names the data it came from.'));
   const grid = el('div',{class:'evidence'});
   evidence.forEach(e => { const card = el('div',{class:'ev '+e.tone, id:e.id}, el('div',{class:'t'}, e.kind), el('div',{class:'v'}, e.title), e.sub ? el('div',{}, e.sub) : null, e.source ? el('div',{class:'s'}, e.source) : null);
@@ -3453,6 +3473,7 @@ if (evidence.length) {
 }
 
 // ---- narrative + structured blocks
+if (hasA) {
 app.append(el('h2',{}, 'Summary and justification'), ...paras(A.summary));
 if (A.trend_assessment) { const t = A.trend_assessment; app.append(el('h2',{}, 'Trend assessment'), el('div',{class:'card'}, table(['item','value'], Object.entries(t).map(([k,v]) => ({item:label(k), value:v}))))); }
 if (A.trade_plan) app.append(el('h2',{}, 'Trade plan'), el('div',{class:'card'}, table(['item','value'], Object.entries(A.trade_plan).map(([k,v]) => ({item:label(k), value:v})))));
@@ -3464,6 +3485,7 @@ if (A.valuation && Object.keys(A.valuation).length) app.append(el('h2',{}, 'Valu
 if (A.key_metrics && A.key_metrics.length) app.append(el('h2',{}, 'Key metrics'), el('div',{class:'card'}, table(['name','value','assessment','source'], A.key_metrics)));
 [['Risks','risks'],['Assumptions (model judgment, not data)','assumptions'],['Data gaps','data_gaps']].forEach(([t,k]) => { if (A[k] && A[k].length) app.append(el('h2',{}, t), el('ul',{}, A[k].map(x => el('li',{}, x)))); });
 if (D.references && D.references.length) app.append(el('h2',{}, 'Data and reports referenced'), el('div',{class:'card'}, table(['title','detail','used_for'], D.references)));
+}
 app.append(el('p',{class:'foot'}, `Model-generated analysis from stored data reconstructed as of ${D.as_of}` + (C.source ? ` (chart: ${C.source}, ${(C.bars||[]).length} bars up to ${D.as_of})` : '') + `. The model's training knowledge cannot be rewound to that date. Informational only; not investment advice. Verify before use.`));
 })();
 </script>
@@ -3476,9 +3498,9 @@ def build_decision_html(skill: dict, symbol: str, as_of: str, analysis: dict, re
     import html as _html
 
     data = {"skill": {"id": skill["id"], "name": skill["name"], "version": skill.get("version", "")}, "symbol": symbol, "as_of": as_of,
-            "analysis": analysis, "references": references, "meta": meta, "chart": chart or {"bars": [], "technical": False}}
+            "analysis": analysis or None, "references": references or [], "meta": meta or {}, "chart": chart or {"bars": [], "technical": False}}
     payload = json.dumps(data, default=str).replace("</", "<\\/")
-    title = _html.escape(f"{skill['name']} analysis: {symbol} as of {as_of}")
+    title = _html.escape(f"{skill['name']} analysis: {symbol} as of {as_of}" if analysis else f"{symbol} technical chart as of {as_of}")
     return REPORT_HTML_TEMPLATE.replace("__TITLE__", title).replace("__DATA__", payload).replace("__CDN__", LIGHTWEIGHT_CHARTS_CDN)
 
 
@@ -3487,6 +3509,20 @@ def upload_html_report(pathname: str, html_text: str) -> dict:
 
     r = put_blob(pathname, html_text.encode("utf-8"), access=blob_access(), content_type="text/html; charset=utf-8", allow_overwrite=True)
     return {"pathname": r.pathname, "url": r.url}
+
+
+@app.get("/api/py/tech/{symbol}/chart.html")
+def tech_chart_html(symbol: str, as_of: date | None = None):
+    """Interactive K chart with indicators, support/resistance/Fibonacci, signals and patterns from the TECH_ tables,
+    point-in-time as of `as_of` (default today). No agent analysis; works for any prepared symbol."""
+    symbol = normalize_symbol(symbol)
+    as_of = as_of or date.today()
+    chart = load_chart_data(symbol, as_of)
+    if not chart.get("bars"):
+        raise HTTPException(status_code=404, detail=f"No price or technical data stored for {symbol} on or before {as_of}.")
+    html_text = build_decision_html({"id": "tech", "name": "Technical chart", "version": ""}, symbol, as_of.isoformat(), None, [], {}, chart)
+    return Response(content=html_text, media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "private, max-age=300", "X-Frame-Options": "SAMEORIGIN"})
 
 
 @app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}/report.html")
