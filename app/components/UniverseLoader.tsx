@@ -57,8 +57,6 @@ export default function UniverseLoader() {
   const [filter, setFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [selected, setSelected] = useState<string | null>(null);
-  const [importOpen, setImportOpen] = useState(false);
-  const [importText, setImportText] = useState("");
   const stopRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const batchTimes = useRef<number[]>([]);
@@ -180,43 +178,6 @@ export default function UniverseLoader() {
     }
   }
 
-  async function refreshList() {
-    setBusy("refresh");
-    setError(null);
-    note("Fetching the S&P 500 constituents table from Wikipedia ...");
-    try {
-      const r = await api<{ imported: number; active: number; source: string }>("/api/py/universe/refresh", { method: "POST" });
-      note(`Constituents updated: ${r.imported} imported, ${r.active} active (${r.source})`);
-      await loadUniverse();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Refresh failed";
-      setError(msg);
-      note(msg, "error");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function importList() {
-    setBusy("import");
-    setError(null);
-    try {
-      const r = await api<{ imported: number; active: number }>("/api/py/universe/import", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: importText, source: "manual import" }),
-      });
-      note(`List imported: ${r.imported} symbols, ${r.active} active`);
-      setImportOpen(false);
-      setImportText("");
-      await loadUniverse();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Import failed";
-      setError(msg);
-      note(msg, "error");
-    } finally {
-      setBusy(null);
-    }
-  }
-
   const itemBySymbol = useMemo(() => new Map((job?.items ?? []).map((i) => [i.symbol, i])), [job]);
   const tiles = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -244,7 +205,7 @@ export default function UniverseLoader() {
         <div className="stat">
           <span className="stat-label">S&amp;P 500 list</span>
           <span className="stat-value small">{universe ? `${universe.summary.total} constituents` : "—"}</span>
-          <span className="tile-note">{universe?.list_source ? `${universe.list_source} · updated ${when(universe.list_updated_at)}` : "not loaded yet"}</span>
+          <span className="tile-note">{universe?.list_source ? `dbo.SP500_CONSTITUENTS · ${universe.list_source} · updated ${when(universe.list_updated_at)}` : "dbo.SP500_CONSTITUENTS"}</span>
         </div>
         <div className="stat"><span className="stat-label">Ready</span><span className="stat-value" style={{ color: "#0ca30c" }}>{universe?.summary.ready ?? "—"}</span><span className="tile-note">prices and technical data current</span></div>
         <div className="stat"><span className="stat-label">Stale</span><span className="stat-value" style={{ color: "#c98500" }}>{universe?.summary.stale ?? "—"}</span><span className="tile-note">prices stored, update needed</span></div>
@@ -252,10 +213,6 @@ export default function UniverseLoader() {
       </div>
 
       <div className="filters" style={{ marginBottom: 6 }}>
-        <button type="button" className="btn small ghost" disabled={busy !== null || running} onClick={refreshList}>
-          {busy === "refresh" ? "Fetching…" : "Refresh list from Wikipedia"}
-        </button>
-        <button type="button" className="btn small ghost" disabled={busy !== null || running} onClick={() => setImportOpen((v) => !v)}>Import list</button>
         <label>
           Batch size
           <select value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value))} disabled={running} style={{ minWidth: 80 }}>
@@ -280,19 +237,8 @@ export default function UniverseLoader() {
       <p className="msg hint">
         Per symbol: prices are fetched only for days after the last stored close (two years when nothing is stored), and the
         technical data (TECH_ tables) is recomputed only when it is older than the latest stored close. Each batch is one
-        request; you can stop and resume. The constituents list comes from Wikipedia's public table unless you import your own.
+        request; you can stop and resume. The constituents come from dbo.SP500_CONSTITUENTS, which is treated as up to date (seeded from the repository list on first use).
       </p>
-
-      {importOpen && (
-        <div className="card" style={{ marginBottom: 12 }}>
-          <p className="msg hint" style={{ marginTop: 0 }}>Paste symbols (comma, space or newline separated) or a CSV with a <code>Symbol</code> column (e.g. from an official list). Dots become dashes (BRK.B → BRK-B).</p>
-          <textarea value={importText} onChange={(e) => setImportText(e.target.value)} rows={6} style={{ width: "100%" }} placeholder="AAPL, MSFT, NVDA, BRK.B ..." />
-          <div className="card-actions">
-            <button type="button" className="btn small" disabled={!importText.trim() || busy !== null} onClick={importList}>{busy === "import" ? "Importing…" : "Import"}</button>
-            <button type="button" className="btn small ghost" onClick={() => setImportOpen(false)}>Cancel</button>
-          </div>
-        </div>
-      )}
 
       {error && <p className="msg error">{error}</p>}
 
@@ -353,7 +299,7 @@ export default function UniverseLoader() {
         })}
       </div>
       {universe && universe.summary.total === 0 && (
-        <p className="msg">No constituents stored yet. Click <strong>Refresh list from Wikipedia</strong> or <strong>Import list</strong>.</p>
+        <p className="msg">dbo.SP500_CONSTITUENTS is empty and the seed file was not found; run scripts/seed_sp500_constituents.sql.</p>
       )}
     </div>
   );

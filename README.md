@@ -46,9 +46,10 @@ The chart is drawn with [lightweight-charts](https://github.com/tradingview/ligh
 ### S&P 500 universe loader (`/prices/sp500`)
 
 Loads price history and prepares the technical data for every S&P 500 constituent, with live
-progress. The constituents list is fetched from Wikipedia's public table (*Refresh list*) or pasted
-(*Import list*: symbols or a CSV with a `Symbol` column; dots become dashes, BRK.B → BRK-B) into
-`dbo.SP500_CONSTITUENTS`. A load job (`dbo.UNIVERSE_LOAD_JOB` / `_ITEM`) processes symbols in batches,
+progress. The constituents live in `dbo.SP500_CONSTITUENTS`, which the app treats as up to date (no refresh
+or import feature). On first use the table is seeded from `data/sp500_constituents.csv` in the
+repository (503 names; tickers in Yahoo form, BRK.B → BRK-B); `scripts/seed_sp500_constituents.sql`
+loads the same list by hand. Maintain the table directly (`active = 1` rows are included in a load). A load job (`dbo.UNIVERSE_LOAD_JOB` / `_ITEM`) processes symbols in batches,
 one request per batch (`POST /api/py/universe/load`, `/{id}/step`, `/stop`, `/resume`;
 `GET /api/py/universe` for the current state of every symbol). **Delta only:** prices are fetched from
 the day after the last stored close (two years when nothing is stored); the `TECH_` tables are

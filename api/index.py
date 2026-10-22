@@ -3521,7 +3521,7 @@ def decision_report_html(backtest_id: int, decision_id: int):
 UNIVERSE_TABLE = "dbo.SP500_CONSTITUENTS"
 UJOB_TABLE = "dbo.UNIVERSE_LOAD_JOB"
 UITEM_TABLE = "dbo.UNIVERSE_LOAD_ITEM"
-WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+SP500_SEED_FILE = Path(__file__).resolve().parent.parent / "data" / "sp500_constituents.csv"
 
 ENSURE_UNIVERSE_SQL = f"""
 IF OBJECT_ID('{UNIVERSE_TABLE}', 'U') IS NULL
@@ -3548,47 +3548,24 @@ def yahoo_symbol(raw: str) -> str:
     return raw.strip().upper().replace(".", "-")
 
 
-def fetch_sp500_from_wikipedia() -> list[dict]:
-    import io
+def seed_universe_if_empty(cur) -> int:
+    """The constituents table is maintained in the database; when it is empty (first use) it is seeded from
+    data/sp500_constituents.csv in the repository. Returns the number of rows inserted."""
+    import csv
 
-    import pandas as pd
-    import requests
-
-    r = requests.get(WIKIPEDIA_SP500_URL, headers={"User-Agent": "StockScan/1.0 (personal research tool)"}, timeout=30)
-    r.raise_for_status()
-    tables = pd.read_html(io.StringIO(r.text))
-    table = next((t for t in tables if "Symbol" in t.columns and "Security" in t.columns), None)
-    if table is None:
-        raise HTTPException(status_code=502, detail="Could not find the constituents table on the Wikipedia page.")
-    rows = []
-    for _, row in table.iterrows():
-        rows.append({"symbol": yahoo_symbol(str(row["Symbol"])), "name": str(row.get("Security", ""))[:200],
-                     "sector": str(row.get("GICS Sector", ""))[:100], "sub_industry": str(row.get("GICS Sub-Industry", ""))[:150]})
-    if len(rows) < 400:
-        raise HTTPException(status_code=502, detail=f"Only {len(rows)} constituents parsed; page layout may have changed.")
-    return rows
-
-
-def upsert_universe(rows: list[dict], source: str) -> dict:
-    conn = db_connect()
-    try:
-        cur = conn.cursor()
-        cur.execute(ENSURE_UNIVERSE_SQL)
-        cur.execute(f"UPDATE {UNIVERSE_TABLE} SET active = 0")
-        for r in rows:
-            cur.execute(
-                f"MERGE {UNIVERSE_TABLE} AS t USING (SELECT %s AS symbol) AS s ON t.symbol = s.symbol "
-                f"WHEN MATCHED THEN UPDATE SET name = %s, sector = %s, sub_industry = %s, source = %s, active = 1, updated_at = SYSUTCDATETIME() "
-                f"WHEN NOT MATCHED THEN INSERT (symbol, name, sector, sub_industry, source, active) VALUES (%s, %s, %s, %s, %s, 1);",
-                (r["symbol"], r.get("name"), r.get("sector"), r.get("sub_industry"), source,
-                 r["symbol"], r.get("name"), r.get("sector"), r.get("sub_industry"), source),
-            )
-        conn.commit()
-        cur.execute(f"SELECT COUNT(*) FROM {UNIVERSE_TABLE} WHERE active = 1")
-        active = cur.fetchone()[0]
-    finally:
-        conn.close()
-    return {"imported": len(rows), "active": active, "source": source}
+    cur.execute(f"SELECT COUNT(*) FROM {UNIVERSE_TABLE}")
+    if cur.fetchone()[0] > 0 or not SP500_SEED_FILE.is_file():
+        return 0
+    with open(SP500_SEED_FILE, newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("symbol")]
+    for i in range(0, len(rows), 100):
+        part = rows[i:i + 100]
+        cur.execute(
+            f"INSERT INTO {UNIVERSE_TABLE} (symbol, name, sector, sub_industry, source, active) VALUES "
+            + ", ".join(["(%s, %s, %s, %s, 'repo:data/sp500_constituents.csv', 1)"] * len(part)),
+            tuple(v for r in part for v in (yahoo_symbol(r["symbol"]), r.get("name"), r.get("sector"), r.get("sub_industry"))),
+        )
+    return len(rows)
 
 
 def universe_state(cur) -> list[dict]:
@@ -3596,6 +3573,7 @@ def universe_state(cur) -> list[dict]:
     cur.execute(ENSURE_UNIVERSE_SQL)
     cur.execute(ENSURE_TECH_SQL)
     cur.execute(ENSURE_TABLE_SQL)
+    seed_universe_if_empty(cur)
     cur.execute(
         f"SELECT u.symbol, u.name, u.sector, u.sub_industry, u.source, u.updated_at, "
         f"p.cnt, p.first_date, p.last_date, t.computed_at, t.last_trade_date, t.price_rows "
@@ -3674,11 +3652,6 @@ def _ujob(cur, job_id: int) -> dict:
             "log": json.loads(row[4] or "[]"), "counts": _ujob_counts(cur, job_id), "items": items}
 
 
-class UniverseImportRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=200_000, description="Symbols separated by commas/whitespace/newlines, or CSV with a Symbol column")
-    source: str = Field("manual import", max_length=100)
-
-
 class UniverseLoadRequest(BaseModel):
     only_stale: bool = Field(True, description="Skip symbols whose prices and technical data are already current")
     batch_size: int = Field(5, ge=1, le=20)
@@ -3702,37 +3675,6 @@ def universe_list():
                "missing": sum(i["state"] == "missing" for i in items)}
     return {"items": items, "summary": summary, "list_updated_at": upd.isoformat() if upd else None, "list_source": source,
             "latest_job": {"job_id": last[0], "status": last[1], "created_at": last[2].isoformat()} if last else None}
-
-
-@app.post("/api/py/universe/refresh")
-def universe_refresh():
-    """Fetch the constituents table from Wikipedia (public page) and upsert it."""
-    rows = fetch_sp500_from_wikipedia()
-    return upsert_universe(rows, "wikipedia:List_of_S&P_500_companies")
-
-
-@app.post("/api/py/universe/import")
-def universe_import(req: UniverseImportRequest):
-    import csv
-    import io
-
-    text = req.text.strip()
-    rows: list[dict] = []
-    if "\n" in text and "," in text.split("\n")[0] and "symbol" in text.split("\n")[0].lower():
-        reader = csv.DictReader(io.StringIO(text))
-        key = next(k for k in reader.fieldnames if k.strip().lower() == "symbol")
-        for r in reader:
-            if r.get(key, "").strip():
-                rows.append({"symbol": yahoo_symbol(r[key]), "name": (r.get("Security") or r.get("Name") or r.get("name") or "")[:200],
-                             "sector": (r.get("GICS Sector") or r.get("Sector") or r.get("sector") or "")[:100],
-                             "sub_industry": (r.get("GICS Sub-Industry") or r.get("Sub-Industry") or "")[:150]})
-    else:
-        for tok in re.split(r"[\s,;]+", text):
-            if tok and re.fullmatch(r"[A-Za-z0-9.^-]{1,10}", tok):
-                rows.append({"symbol": yahoo_symbol(tok), "name": None, "sector": None, "sub_industry": None})
-    if not rows:
-        raise HTTPException(status_code=422, detail="No symbols found in the text.")
-    return upsert_universe(rows, req.source)
 
 
 @app.post("/api/py/universe/load")
