@@ -3,6 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api, DiagnosticsPanel, LiveLog, type Diagnostics, type LogEntry } from "./RunUi";
+import PortfolioCalendar from "./PortfolioCalendar";
+import { PORTFOLIO_FIELDS } from "@/lib/portfolioFields";
+import { defaultInputs, validateAll, validateField, type FieldSpec } from "@/lib/portfolioValidation";
 
 type Config = {
   stock_count: number; start_date: string; end_date: string | null; starting_capital: number; buy_amount: number; max_buys_per_stock: number;
@@ -30,6 +33,7 @@ type State = {
   positions: Position[]; market_value: number; total_value: number; unrealized_pnl: number; return_pct: number;
   trades: Trade[]; trade_counts: { total: number; buys: number; sells: number; wins: number; win_rate_pct: number | null };
   assessment_counts: Record<string, number>; assessments: Assessment[]; snapshots: Snapshot[]; log?: LogEntry[];
+  trade_days: { trade_date: string; symbol: string; side: "BUY" | "SELL"; count: number; realized_pnl: number }[];
 };
 type StepResult = { done: boolean; stopped: boolean; busy: boolean; model_call?: boolean; day_done?: boolean; state: State | null; log: LogEntry[] };
 type SymbolInfo = { symbol: string; name: string | null; ready: boolean; price_last: string | null; tech_fresh: boolean; bundle_fetched_at: string | null };
@@ -40,6 +44,30 @@ const money = (v: number | null | undefined, nd = 2) => (v === null || v === und
 const signed = (v: number | null | undefined, nd = 2) => (v === null || v === undefined ? "—" : `${v >= 0 ? "+" : ""}${money(v, nd)}`);
 const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`);
 const tone = (v: number | null | undefined) => (v === null || v === undefined || v === 0 ? "" : v > 0 ? "pos" : "neg");
+
+const FORM_LABEL: Record<string, string> = {
+  stock_count: "Stocks (first N by symbol)", starting_capital: "Starting capital (USD)", buy_amount: "Buy amount (USD)",
+  max_buys_per_stock: "Max buys / stock", take_profit_pct: "Take profit %", analysis_validity_days: "Assessment valid (days)",
+  rerun_proximity_pct: "Rerun within %", skip_threshold_pct: "Skip above %", held_reassess_days: "Held reassess (trading days)",
+};
+
+/** A text input (not type=number) so the browser's step rules cannot reject valid values; checked by validateField. */
+function NumField({ spec, label, value, error, disabled, onChange, onBlur }: {
+  spec: FieldSpec; label: string; value: string; error?: string; disabled: boolean;
+  onChange: (spec: FieldSpec, v: string) => void; onBlur: (spec: FieldSpec) => void;
+}) {
+  const id = `pf-${spec.key}`;
+  return (
+    <label htmlFor={id} className={error ? "invalid" : ""}>
+      {label}
+      <input id={id} type="text" inputMode={spec.kind === "decimal" ? "decimal" : "numeric"} autoComplete="off" value={value} disabled={disabled}
+        aria-invalid={!!error} aria-describedby={error ? `${id}-err` : undefined}
+        title={`${spec.kind === "decimal" ? "Number" : "Whole number"} from ${spec.min.toLocaleString("en-CA")} to ${spec.max.toLocaleString("en-CA")}`}
+        onChange={(e) => onChange(spec, e.target.value)} onBlur={() => onBlur(spec)} />
+      {error && <span className="field-error" id={`${id}-err`} role="alert">{error}</span>}
+    </label>
+  );
+}
 
 function Pill({ rec }: { rec: string | null }) {
   if (!rec) return <span className="tile-note">—</span>;
@@ -54,17 +82,36 @@ export default function PortfolioPanel() {
   const [running, setRunning] = useState(false);
   const [preparing, setPreparing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [cfg, setCfg] = useState({
-    stock_count: 10, start_date: "2026-01-01", end_date: "", starting_capital: 10_000_000, buy_amount: 10_000, max_buys_per_stock: 3,
-    take_profit_pct: 10, analysis_validity_days: 30, rerun_proximity_pct: 5, skip_threshold_pct: 20, held_reassess_days: 3,
-  });
+  // Numeric inputs are kept as typed text and checked against data/portfolio_fields.json (the API applies the same rules).
+  const [inputs, setInputs] = useState<Record<string, string>>(() => defaultInputs(PORTFOLIO_FIELDS));
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [startDate, setStartDate] = useState("2026-01-01");
+  const [endDate, setEndDate] = useState("");
   const stopRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const note = useCallback((message: string, level: LogEntry["level"] = "info") => {
     setLog((prev) => [...prev, { t: new Date().toISOString(), elapsed_s: 0, level, message }].slice(-800));
   }, []);
-  const set = (k: keyof typeof cfg, v: string) => setCfg((c) => ({ ...c, [k]: typeof c[k] === "number" ? Number(v) : v }));
+  const setInput = (spec: FieldSpec, v: string) => {
+    setInputs((prev) => ({ ...prev, [spec.key]: v }));
+    // Clear a message as soon as the value becomes valid; new messages appear on blur or submit.
+    setFieldErrors((prev) => {
+      if (!prev[spec.key] || !validateField(spec, v).ok) return prev;
+      const next = { ...prev };
+      delete next[spec.key];
+      return next;
+    });
+  };
+  const checkInput = (spec: FieldSpec) => {
+    const r = validateField(spec, inputs[spec.key]);
+    setFieldErrors((prev) => {
+      const next = { ...prev };
+      if (r.ok) delete next[spec.key]; else next[spec.key] = r.error;
+      return next;
+    });
+  };
+  const dateError = !startDate ? "From date is required." : endDate && endDate < startDate ? "To date must be on or after the From date." : null;
 
   useEffect(() => {
     api<Diagnostics>("/api/py/agent/diagnostics").then(setDiag).catch((e: Error) => setDiagError(e.message));
@@ -114,6 +161,15 @@ export default function PortfolioPanel() {
 
   async function start() {
     setError(null);
+    const checked = validateAll(PORTFOLIO_FIELDS, inputs);
+    setFieldErrors(checked.errors);
+    if (!checked.ok || dateError) {
+      setError(`Fix the highlighted field${Object.keys(checked.errors).length + (dateError ? 1 : 0) > 1 ? "s" : ""} before starting.`);
+      const first = PORTFOLIO_FIELDS.find((f) => checked.errors[f.key]);
+      if (first) document.getElementById(`pf-${first.key}`)?.focus();
+      return;
+    }
+    const cfg = checked.values;
     setLog([]);
     setJob(null);
     stopRef.current = false;
@@ -130,7 +186,7 @@ export default function PortfolioPanel() {
         note(`${s.symbol}: prices ${r.prices.action} (+${r.prices.added}, latest ${r.prices.last_date}); technical data to ${r.tech_last ?? "?"}; fundamentals bundle ready`);
       }
       setPreparing(null);
-      const body = { ...cfg, end_date: cfg.end_date || null };
+      const body = { ...cfg, start_date: startDate, end_date: endDate || null };
       const s = await api<State>("/api/py/portfolio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       setJob(s);
       if (s.log) setLog((prev) => [...prev, ...s.log!]);
@@ -181,24 +237,18 @@ export default function PortfolioPanel() {
   const busy = running || !!preparing;
   const p = job?.progress;
   const progressPct = job && job.days_total ? (job.days_done / job.days_total) * 100 : 0;
-  const cap = job?.config.starting_capital ?? cfg.starting_capital;
+  const cap = job?.config.starting_capital ?? Number(inputs.starting_capital);
 
   return (
     <div className="single" style={{ maxWidth: 1240 }}>
       <DiagnosticsPanel diag={diag} error={diagError} onLog={(entries) => setLog((prev) => [...prev, ...entries])} />
 
-      <form className="filters agent-form" onSubmit={(e) => { e.preventDefault(); start(); }}>
-        <label>Stocks (first N by symbol)<input type="number" min={1} max={100} value={cfg.stock_count} onChange={(e) => set("stock_count", e.target.value)} disabled={busy} style={{ minWidth: 80 }} /></label>
-        <label>From<input type="date" value={cfg.start_date} onChange={(e) => set("start_date", e.target.value)} disabled={busy} /></label>
-        <label>To (blank = latest)<input type="date" value={cfg.end_date} onChange={(e) => set("end_date", e.target.value)} disabled={busy} /></label>
-        <label>Starting capital<input type="number" min={1} step={1000} value={cfg.starting_capital} onChange={(e) => set("starting_capital", e.target.value)} disabled={busy} style={{ minWidth: 120 }} /></label>
-        <label>Buy amount<input type="number" min={1} step={100} value={cfg.buy_amount} onChange={(e) => set("buy_amount", e.target.value)} disabled={busy} style={{ minWidth: 100 }} /></label>
-        <label>Max buys / stock<input type="number" min={1} max={50} value={cfg.max_buys_per_stock} onChange={(e) => set("max_buys_per_stock", e.target.value)} disabled={busy} style={{ minWidth: 70 }} /></label>
-        <label>Take profit %<input type="number" min={0.1} step={0.5} value={cfg.take_profit_pct} onChange={(e) => set("take_profit_pct", e.target.value)} disabled={busy} style={{ minWidth: 70 }} /></label>
-        <label>Assessment valid (days)<input type="number" min={1} max={365} value={cfg.analysis_validity_days} onChange={(e) => set("analysis_validity_days", e.target.value)} disabled={busy} style={{ minWidth: 70 }} /></label>
-        <label>Rerun within %<input type="number" min={0} step={0.5} value={cfg.rerun_proximity_pct} onChange={(e) => set("rerun_proximity_pct", e.target.value)} disabled={busy} style={{ minWidth: 70 }} /></label>
-        <label>Skip above %<input type="number" min={0} step={1} value={cfg.skip_threshold_pct} onChange={(e) => set("skip_threshold_pct", e.target.value)} disabled={busy} style={{ minWidth: 70 }} /></label>
-        <label>Held reassess (trading days)<input type="number" min={1} max={60} value={cfg.held_reassess_days} onChange={(e) => set("held_reassess_days", e.target.value)} disabled={busy} style={{ minWidth: 70 }} /></label>
+      <form className="filters agent-form portfolio-form" noValidate onSubmit={(e) => { e.preventDefault(); start(); }}>
+        {PORTFOLIO_FIELDS.slice(0, 1).map((f) => <NumField key={f.key} spec={f} label={FORM_LABEL[f.key]} value={inputs[f.key]} error={fieldErrors[f.key]} disabled={busy} onChange={setInput} onBlur={checkInput} />)}
+        <label className={dateError && !startDate ? "invalid" : ""}>From<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={busy} /></label>
+        <label className={dateError && startDate ? "invalid" : ""}>To (blank = latest)<input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} disabled={busy} />
+          {dateError && <span className="field-error" role="alert">{dateError}</span>}</label>
+        {PORTFOLIO_FIELDS.slice(1).map((f) => <NumField key={f.key} spec={f} label={FORM_LABEL[f.key]} value={inputs[f.key]} error={fieldErrors[f.key]} disabled={busy} onChange={setInput} onBlur={checkInput} />)}
         <button type="submit" className="btn" disabled={busy}>{preparing ? `Preparing ${preparing}…` : running ? "Running…" : "Start backtest"}</button>
         <button type="button" className="btn small danger" disabled={!busy && !active} onClick={stop}>Stop</button>
         {job && !busy && job.status === "stopped" && <button type="button" className="btn small" onClick={resume}>Resume</button>}
@@ -252,6 +302,11 @@ export default function PortfolioPanel() {
           )}
         </>
       )}
+
+      {job && <>
+        <h2 className="section-title">Calendar — daily portfolio change, buys and sells</h2>
+        <PortfolioCalendar job={job} />
+      </>}
 
       <LiveLog title={job ? `Simulation log - #${job.job_id}` : "Log"} entries={log} running={busy || active} waitHint="waiting for the next model call (30-90 s each); days without calls pass in seconds" />
 

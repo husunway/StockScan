@@ -198,6 +198,26 @@ The page shows the day being simulated, cash, market value, total value, realize
 positions, the trade log with trigger reasons, the agent-run log with links to each decision, and a
 final summary (final value, return %, trades, win rate). Use **Load last run** to pick a run back up.
 
+**Form validation.** The numeric parameters are defined once in `data/portfolio_fields.json` (kind, min, max,
+default, unit). The form (`lib/portfolioValidation.ts`) and the API (`validate_portfolio_config`) both read it, so
+they apply the same rules and the same messages. Inputs are text fields, not `type=number`, so the browser's step
+rules can no longer reject a valid value such as 10,000,000. Separators, a leading `$` and a trailing `%` are
+accepted, and percentages take decimals. Each invalid field shows its own message, for example "Starting capital
+must be a whole dollar amount between $1,000 and $10,000,000,000.", and blocks the run.
+
+**Calendar.** A month view over the backtest range, with previous and next controls and a month picker. Each
+trading day shows ▲ buys, ▼ sells and the day's change in total value ($ and %), shaded as a heat map. Weekends
+and market holidays are greyed out. The calendar fills in live and follows the simulation until you navigate.
+Clicking a day opens a panel, beside the calendar on wide screens and below it on narrow ones, with the day
+summary, the transactions and an agent-activity list. Transactions show the trigger, each agent's buy and target
+price, and when each assessment was run, fresh or cached. Clicking a ticker filters the calendar to that stock,
+and the transactions export to CSV. Data comes from `GET /api/py/portfolio/{id}/day/{date}`. Each trade stores
+`trigger_type`, `agents_json` and `cost_basis`; trades from earlier runs fall back to the assessments table.
+
+**Tests.** `npm test` runs the form rules (`tests/portfolio-fields.test.mjs`, Node 23.6 or later), and
+`python tests/test_portfolio_fields.py` runs the same cases against the API, including a check that every
+default passes its own validation.
+
 ### Weekly backtest (`/agent/backtest`)
 
 Runs a skill as of the **first N Mondays of a year** (N = 1-52, default 10; year default 2026, never

@@ -20,7 +20,13 @@ export type Diagnostics = {
 export async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${res.status})`);
+  if (!res.ok) {
+    const d = data.detail;
+    const msg = typeof d === "string" ? d
+      : Array.isArray(d) ? d.map((e: { loc?: unknown[]; msg?: string }) => `${(e.loc ?? []).slice(1).join(".") || "request"}: ${e.msg ?? "invalid"}`).join("; ")
+      : `Request failed (${res.status})`;
+    throw new Error(msg);
+  }
   return data as T;
 }
 

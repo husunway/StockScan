@@ -1,0 +1,14 @@
+{
+  "description": "Portfolio backtest numeric parameters. Single source of truth for the form (lib/portfolioValidation.ts) and the API (api/index.py validate_portfolio_config). kind = integer (whole numbers) or decimal; min/max are inclusive.",
+  "fields": [
+    { "key": "stock_count", "label": "Stocks", "kind": "integer", "min": 1, "max": 100, "default": 10, "unit": "count" },
+    { "key": "starting_capital", "label": "Starting capital", "kind": "integer", "min": 1000, "max": 10000000000, "default": 10000000, "unit": "usd" },
+    { "key": "buy_amount", "label": "Buy amount", "kind": "integer", "min": 1, "max": 1000000000, "default": 10000, "unit": "usd" },
+    { "key": "max_buys_per_stock", "label": "Max buys / stock", "kind": "integer", "min": 1, "max": 50, "default": 3, "unit": "count" },
+    { "key": "take_profit_pct", "label": "Take profit %", "kind": "decimal", "min": 0.1, "max": 1000, "default": 10, "unit": "pct" },
+    { "key": "analysis_validity_days", "label": "Assessment validity", "kind": "integer", "min": 1, "max": 365, "default": 30, "unit": "days" },
+    { "key": "rerun_proximity_pct", "label": "Rerun proximity %", "kind": "decimal", "min": 0, "max": 100, "default": 5, "unit": "pct" },
+    { "key": "skip_threshold_pct", "label": "Skip threshold %", "kind": "decimal", "min": 0, "max": 1000, "default": 20, "unit": "pct" },
+    { "key": "held_reassess_days", "label": "Held reassess", "kind": "integer", "min": 1, "max": 60, "default": 3, "unit": "trading days" }
+  ]
+}
