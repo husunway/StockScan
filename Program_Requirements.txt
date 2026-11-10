@@ -1,0 +1,16 @@
+1. Execute and record a buy only when 3 agents suggests buy at that price, or higher price.
+If one of the agent does not suggest to buy at current price, no need to run other agents.
+Warren Buffet agent always runs first, if last run of Warren Buffet indicate a buy price range that current price does not fall into. No buy action. 
+For Warren Buffet and Jimmy dimon, their analysis is good for one month, within this month. 
+- Every day we should check if the price is falling into their buy range. If the price is becoming very close to their suggested buy price, we rerun the agent to get the latest assessment. 
+- If the current price is way higher than the suggest buy price of an agent, there is no need to rerun the agent. Skip the agent, mark it NOT buy.
+
+2. Execute and record a sell when
+- if any of the agent target price is met
+- if the profit is above the 10%. 10% is the value that is configurable.
+
+3. Run this against every day in 2026, for first 10 stocks. 10 is the value that is configurable. 
+4. Assume you have 10M dollars, every buy will use 10K dollars. 
+4. Enhance the run window. 
+- Add the real time update to the portfolio. Position, Total value
+
