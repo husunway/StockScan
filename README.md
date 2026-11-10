@@ -160,6 +160,44 @@ The page shows a calendar where each scanned date carries the number of all-3 hi
 each agent's verdict and links to the reports, and the full hit list. Scale note: 503 stocks x 42 Mondays
 is ~21,000 stage-1 calls without the pre-screen; the pre-screen usually removes 60-80%.
 
+### Portfolio backtest (`/agent/portfolio`)
+
+A daily trading simulation over the **first N constituents in ticker-symbol order** (default 10) from
+`BACKTEST_START` (default 2026-01-01) to the latest stored trading day, with a configurable starting
+capital (default 10,000,000), buy amount (10,000), maximum buys per stock (3), take-profit (10%),
+assessment validity (30 days), rerun proximity (5%), skip threshold (20%) and held-stock reassessment
+cadence (3 trading days). Amounts are in USD, the native currency of the prices.
+
+Each trading day, **sells run before buys**:
+
+- **Sells** - a held stock is reassessed by Buffett and Dimon every `held_reassess_days` trading days
+  (Murphy's target comes from his last run). The whole position is sold when the day's high reaches the
+  *lowest* of the three agents' latest targets, or the take-profit level on the average cost, whichever is
+  lower; if the day traded entirely above that price the fill is the day's low.
+- **Buys** - Warren Buffett → Jamie Dimon → John Murphy, stopping at the first NOT BUY. An agent
+  recommends buying when it says BUY and its `buy_below_price` is at or above the current price. Buffett
+  and Dimon are cached for the validity window: no valid assessment ⇒ run; price within the proximity band
+  of the cached buy price ⇒ rerun; price more than the skip threshold above it ⇒ skipped (NOT BUY, no
+  model call); otherwise the cached verdict is reused. Murphy always runs fresh. When all three agree the
+  order fills at the *lowest* of their buy prices, if that price lies inside the day's low-high range;
+  quantity = buy amount ÷ price, rounded down. Stocks at the buy limit or with insufficient cash skip the agents.
+- **Current price** on a simulated day is the last close *before* it: agents see only data before that day
+  (the usual point-in-time rules) and orders fill inside the day's own range, so there is no look-ahead.
+
+Tables: `dbo.PORTFOLIO_JOB` (config, symbols, trading days, cursor, cash, realized P&L, log),
+`dbo.PORTFOLIO_ASSESSMENT` (every agent run: date, stock, agent, phase, mode = run / rerun / reassess /
+cached / skipped / failed, buy / stop / target prices, decision link), `dbo.PORTFOLIO_TRADE`,
+`dbo.PORTFOLIO_POSITION`, `dbo.PORTFOLIO_SNAPSHOT` (daily cash, market value, total). Each model call is a
+normal stored decision (`PORTFOLIO#<job>` backtest rows per skill) with HTML/PDF reports.
+Endpoints: `GET /api/py/portfolio/symbols?count=N`, `POST /api/py/portfolio/prepare` (price delta, TECH_
+tables, fundamentals bundle for one symbol - the page runs it for every symbol before starting),
+`POST /api/py/portfolio` (create), `POST /api/py/portfolio/{id}/step` (one model call or one finished day
+per request, guarded by a lock so only one worker advances the sequential simulation), `/stop`, `/resume`,
+`GET /api/py/portfolio/latest`, `/{id}`, `/{id}/trades`, `/{id}/assessments?symbol=&sim_date=`.
+The page shows the day being simulated, cash, market value, total value, realized and unrealized P&L,
+positions, the trade log with trigger reasons, the agent-run log with links to each decision, and a
+final summary (final value, return %, trades, win rate). Use **Load last run** to pick a run back up.
+
 ### Weekly backtest (`/agent/backtest`)
 
 Runs a skill as of the **first N Mondays of a year** (N = 1-52, default 10; year default 2026, never

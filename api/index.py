@@ -4339,3 +4339,815 @@ def load_prices(req: LoadRequest):
         table=TABLE,
         preview=list(reversed(rows[-10:])),
     )
+
+
+# ---------------------------------------------------------------------------
+# Portfolio backtest: a daily simulation over the first N S&P 500 symbols.
+# Buys need all three agents (Buffett -> Dimon -> Murphy, early exit) to recommend buying at the
+# current price; Buffett and Dimon assessments are cached for ANALYSIS_VALIDITY_DAYS with proximity
+# reruns and far-above skips; Murphy always runs fresh. Sells trigger on the lowest agent target or
+# a take-profit level. The job is resumable: each /step request performs at most one model call
+# (or finishes one simulated day) and persists cursor, cash, positions, trades and a daily snapshot.
+# "Current price" on a simulated day is the last close before that day: agents see data strictly
+# before the day (the existing point-in-time rules) and orders fill inside that day's range.
+# ---------------------------------------------------------------------------
+PJOB_TABLE = "dbo.PORTFOLIO_JOB"
+PASSESS_TABLE = "dbo.PORTFOLIO_ASSESSMENT"
+PTRADE_TABLE = "dbo.PORTFOLIO_TRADE"
+PPOS_TABLE = "dbo.PORTFOLIO_POSITION"
+PSNAP_TABLE = "dbo.PORTFOLIO_SNAPSHOT"
+PORTFOLIO_SKILLS = ("warren-buffett", "jamie-dimon", "john-murphy")
+PSKILL_SHORT = {"warren-buffett": "Buffett", "jamie-dimon": "Dimon", "john-murphy": "Murphy"}
+PSTAGE_SKILL = {"buffett": "warren-buffett", "dimon": "jamie-dimon", "murphy": "john-murphy"}
+PJOB_LOCK_MINUTES = 6
+PJOB_LOG_KEEP = 800
+
+ENSURE_PORTFOLIO_SQL = f"""
+IF OBJECT_ID('{PJOB_TABLE}', 'U') IS NULL
+CREATE TABLE {PJOB_TABLE} (
+    job_id INT IDENTITY(1,1) PRIMARY KEY, created_at DATETIME2 NOT NULL CONSTRAINT DF_pjob_created DEFAULT SYSUTCDATETIME(),
+    status NVARCHAR(10) NOT NULL, start_date DATE NOT NULL, end_date DATE NOT NULL,
+    config NVARCHAR(MAX) NOT NULL, symbols NVARCHAR(MAX) NOT NULL, trading_days NVARCHAR(MAX) NOT NULL,
+    backtests NVARCHAR(MAX) NULL, cursor_json NVARCHAR(400) NOT NULL,
+    cash DECIMAL(18,2) NOT NULL, realized_pnl DECIMAL(18,2) NOT NULL CONSTRAINT DF_pjob_real DEFAULT 0,
+    ai_calls INT NOT NULL CONSTRAINT DF_pjob_calls DEFAULT 0, failed_calls INT NOT NULL CONSTRAINT DF_pjob_failed DEFAULT 0,
+    locked_at DATETIME2 NULL, log_json NVARCHAR(MAX) NULL);
+IF OBJECT_ID('{PASSESS_TABLE}', 'U') IS NULL
+CREATE TABLE {PASSESS_TABLE} (
+    assessment_id INT IDENTITY(1,1) PRIMARY KEY, job_id INT NOT NULL, sim_date DATE NOT NULL, symbol NVARCHAR(20) NOT NULL,
+    skill_id NVARCHAR(60) NOT NULL, phase NVARCHAR(10) NOT NULL, mode NVARCHAR(10) NOT NULL, decision_id INT NULL,
+    source_assessment_id INT NULL, recommendation CHAR(4) NULL, current_price DECIMAL(18,4) NULL, buy_price DECIMAL(18,4) NULL,
+    stop_price DECIMAL(18,4) NULL, target_price DECIMAL(18,4) NULL, is_buy BIT NOT NULL, note NVARCHAR(400) NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_passess_created DEFAULT SYSUTCDATETIME());
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PASSESS_job') CREATE INDEX IX_PASSESS_job ON {PASSESS_TABLE} (job_id, symbol, skill_id, sim_date);
+IF OBJECT_ID('{PTRADE_TABLE}', 'U') IS NULL
+CREATE TABLE {PTRADE_TABLE} (
+    trade_id INT IDENTITY(1,1) PRIMARY KEY, job_id INT NOT NULL, trade_date DATE NOT NULL, symbol NVARCHAR(20) NOT NULL,
+    side CHAR(4) NOT NULL, quantity INT NOT NULL, price DECIMAL(18,4) NOT NULL, amount DECIMAL(18,2) NOT NULL,
+    reason NVARCHAR(600) NULL, realized_pnl DECIMAL(18,2) NULL, cash_after DECIMAL(18,2) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_ptrade_created DEFAULT SYSUTCDATETIME());
+IF OBJECT_ID('{PPOS_TABLE}', 'U') IS NULL
+CREATE TABLE {PPOS_TABLE} (
+    job_id INT NOT NULL, symbol NVARCHAR(20) NOT NULL, buys INT NOT NULL, quantity INT NOT NULL, cost DECIMAL(18,2) NOT NULL,
+    opened_date DATE NOT NULL, last_reassess_idx INT NOT NULL, CONSTRAINT PK_PPOS PRIMARY KEY (job_id, symbol));
+IF OBJECT_ID('{PSNAP_TABLE}', 'U') IS NULL
+CREATE TABLE {PSNAP_TABLE} (
+    job_id INT NOT NULL, trade_date DATE NOT NULL, cash DECIMAL(18,2) NOT NULL, market_value DECIMAL(18,2) NOT NULL,
+    total_value DECIMAL(18,2) NOT NULL, realized_pnl DECIMAL(18,2) NOT NULL, positions INT NOT NULL,
+    CONSTRAINT PK_PSNAP PRIMARY KEY (job_id, trade_date));
+"""
+
+
+class PortfolioRequest(BaseModel):
+    stock_count: int = Field(10, ge=1, le=100, description="First N constituents in ticker-symbol order")
+    start_date: date = Field(date(2026, 1, 1))
+    end_date: date | None = Field(None, description="Defaults to the latest stored trading day")
+    starting_capital: float = Field(10_000_000, gt=0)
+    buy_amount: float = Field(10_000, gt=0)
+    max_buys_per_stock: int = Field(3, ge=1, le=50)
+    take_profit_pct: float = Field(10, gt=0)
+    analysis_validity_days: int = Field(30, ge=1, le=365)
+    rerun_proximity_pct: float = Field(5, ge=0, le=100)
+    skip_threshold_pct: float = Field(20, ge=0, le=1000)
+    held_reassess_days: int = Field(3, ge=1, le=60)
+    symbols: list[str] | None = Field(None, description="Optional explicit list; overrides stock_count")
+
+
+class PortfolioPrepareRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+
+
+def _fnum(v, nd=4):
+    return None if v is None else round(float(v), nd)
+
+
+def _portfolio_symbols(cur, count: int) -> list[dict]:
+    """First `count` active constituents in symbol order, with what is stored for each."""
+    universe = universe_state(cur)[:count]
+    cur.execute(ENSURE_SYMBOL_DATA_SQL)
+    cur.execute(f"SELECT symbol, fetched_at FROM {SYMBOL_DATA_TABLE}")
+    bundles = {r[0]: r[1] for r in cur.fetchall()}
+    out = []
+    for u in universe:
+        fetched = bundles.get(u["symbol"])
+        out.append({**u, "bundle_fetched_at": fetched.isoformat() if fetched else None,
+                    "ready": bool(u["price_rows"] and u["tech_fresh"] and fetched)})
+    return out
+
+
+@app.get("/api/py/portfolio/symbols")
+def portfolio_symbols(count: int = 10):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        rows = _portfolio_symbols(cur, max(1, min(count, 100)))
+        conn.commit()
+        return {"count": count, "symbols": rows}
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/portfolio/prepare")
+def portfolio_prepare(req: PortfolioPrepareRequest):
+    """Make one symbol ready for the simulation: price delta, TECH_ tables, stored fundamentals bundle."""
+    symbol = normalize_symbol(req.symbol)
+    log = RunLog("x", "y")
+    prices = update_prices_delta(symbol)
+    log.add(f"{symbol}: prices {prices['action']} (+{prices['added']} rows, latest {prices['last_date']})")
+    tech = ensure_technicals(symbol, log)
+    bundle = load_symbol_bundle(symbol, log=log)
+    s = bundle_summary(bundle)
+    return {"symbol": symbol, "prices": prices, "tech_last": tech.get("last_trade_date"),
+            "bundle_fetched_at": bundle.get("fetched_at"), "annual_periods": s.get("annual_periods"), "log": log.entries}
+
+
+def _portfolio_backtests(cur, job_id: int, year: int) -> dict:
+    out = {}
+    for skill_id in PORTFOLIO_SKILLS:
+        skill = get_skill(skill_id)
+        cur.execute(
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active')",
+            (skill_id, skill["version"], f"PORTFOLIO#{job_id}", year,
+             json.dumps({"portfolio_job": job_id, "data_source": skill.get("data_source")})),
+        )
+        out[skill_id] = cur.fetchone()[0]
+    return out
+
+
+def _pjob(cur, job_id: int) -> dict:
+    cur.execute(f"SELECT job_id, created_at, status, start_date, end_date, config, symbols, trading_days, backtests, cursor_json, "
+                f"cash, realized_pnl, ai_calls, failed_calls, locked_at, log_json FROM {PJOB_TABLE} WHERE job_id = %s", (job_id,))
+    r = cur.fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="Portfolio backtest not found")
+    return {"job_id": r[0], "created_at": r[1].isoformat(), "status": r[2], "start_date": r[3].isoformat(), "end_date": r[4].isoformat(),
+            "config": json.loads(r[5]), "symbols": json.loads(r[6]), "days": json.loads(r[7]), "backtests": json.loads(r[8] or "{}"),
+            "cursor": json.loads(r[9]), "cash": float(r[10]), "realized_pnl": float(r[11]), "ai_calls": r[12], "failed_calls": r[13],
+            "locked_at": r[14].isoformat() if r[14] else None, "log": json.loads(r[15] or "[]")}
+
+
+def _save_cursor(cur, job: dict) -> None:
+    cur.execute(f"UPDATE {PJOB_TABLE} SET cursor_json = %s, cash = %s, realized_pnl = %s WHERE job_id = %s",
+                (json.dumps(job["cursor"]), round(job["cash"], 2), round(job["realized_pnl"], 2), job["job_id"]))
+
+
+def _ppositions(cur, job_id: int) -> dict:
+    cur.execute(f"SELECT symbol, buys, quantity, cost, opened_date, last_reassess_idx FROM {PPOS_TABLE} WHERE job_id = %s ORDER BY symbol", (job_id,))
+    return {r[0]: {"symbol": r[0], "buys": r[1], "quantity": r[2], "cost": float(r[3]), "opened_date": r[4].isoformat(),
+                   "last_reassess_idx": r[5]} for r in cur.fetchall()}
+
+
+def _pbars(cur, symbols: list[str], day: date) -> dict:
+    """For each symbol: the bar on `day` (None if it did not trade) and the last close strictly before it."""
+    placeholders = ", ".join("%s" for _ in symbols)
+    cur.execute(f"SELECT symbol, trade_date, [open], high, low, [close] FROM {TABLE} WHERE symbol IN ({placeholders}) "
+                f"AND trade_date BETWEEN %s AND %s ORDER BY symbol, trade_date", (*symbols, day - timedelta(days=14), day))
+    out = {s: {"bar": None, "prev_close": None, "prev_date": None} for s in symbols}
+    for sym, td, o, h, l, c in cur.fetchall():
+        if td == day:
+            out[sym]["bar"] = {"open": float(o), "high": float(h), "low": float(l), "close": float(c)}
+        elif td < day and c is not None:
+            out[sym]["prev_close"], out[sym]["prev_date"] = float(c), td.isoformat()
+    return out
+
+
+def _passess_latest(cur, job_id: int, symbol: str, skill_id: str) -> dict | None:
+    """The most recent real (model-backed, successful) assessment of this agent for this stock."""
+    cur.execute(f"SELECT TOP 1 assessment_id, sim_date, recommendation, current_price, buy_price, stop_price, target_price, decision_id, mode "
+                f"FROM {PASSESS_TABLE} WHERE job_id = %s AND symbol = %s AND skill_id = %s AND decision_id IS NOT NULL AND mode <> 'failed' "
+                f"ORDER BY sim_date DESC, assessment_id DESC", (job_id, symbol, skill_id))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"assessment_id": r[0], "sim_date": r[1], "recommendation": r[2], "current_price": _fnum(r[3]), "buy_price": _fnum(r[4]),
+            "stop_price": _fnum(r[5]), "target_price": _fnum(r[6]), "decision_id": r[7], "mode": r[8]}
+
+
+def _agent_is_buy(rec: str | None, buy_price: float | None, price: float) -> bool:
+    """An agent recommends buying when it says BUY and its suggested buy price is at or above the current price."""
+    return rec == "BUY" and buy_price is not None and buy_price > 0 and price <= buy_price
+
+
+def _record_assessment(cur, job: dict, day: date, symbol: str, skill_id: str, phase: str, mode: str, price: float | None,
+                       rec, buy_price, stop_price, target_price, is_buy: bool, note: str | None,
+                       decision_id: int | None = None, source_id: int | None = None) -> dict:
+    cur.execute(
+        f"INSERT INTO {PASSESS_TABLE} (job_id, sim_date, symbol, skill_id, phase, mode, decision_id, source_assessment_id, recommendation, "
+        f"current_price, buy_price, stop_price, target_price, is_buy, note) OUTPUT INSERTED.assessment_id "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (job["job_id"], day, symbol, skill_id, phase, mode, decision_id, source_id, rec, price, buy_price, stop_price, target_price,
+         1 if is_buy else 0, (note or "")[:400] or None))
+    aid = cur.fetchone()[0]
+    return {"assessment_id": aid, "sim_date": day, "symbol": symbol, "skill_id": skill_id, "phase": phase, "mode": mode,
+            "decision_id": decision_id, "recommendation": rec, "current_price": price, "buy_price": buy_price,
+            "stop_price": stop_price, "target_price": target_price, "is_buy": is_buy, "note": note}
+
+
+def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase: str, mode: str, price: float, log: RunLog) -> dict:
+    """One model call (a normal stored decision with reports) -> an assessment row. Opens its own connections so none
+    is held open during the model call. Reuses a decision that already exists for (skill, symbol, day), e.g. after a crash."""
+    skill = get_skill(skill_id)
+    bt_id = job["backtests"][skill_id]
+    decision = None
+    decision_id = None
+    prices_df = None
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT decision_id, status FROM {DECISIONS_TABLE} WHERE backtest_id = %s AND symbol = %s AND as_of_date = %s", (bt_id, symbol, day))
+        existing = cur.fetchone()
+        if existing and existing[1] == "done":
+            cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (existing[0],))
+            decision = _decision_dict(cur.fetchone())
+            log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} decision #{existing[0]} already exists for this day; reusing it")
+        elif existing:
+            cur.execute(f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = COALESCE(error, 'interrupted before completion') WHERE decision_id = %s", (existing[0],))
+            conn.commit()
+            cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (existing[0],))
+            decision = _decision_dict(cur.fetchone())
+            log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} decision #{existing[0]} was interrupted earlier; recorded as failed", "warn")
+        else:
+            cur.execute(f"INSERT INTO {DECISIONS_TABLE} (backtest_id, skill_id, symbol, as_of_date, status, started_at, log_json) "
+                        f"OUTPUT INSERTED.decision_id VALUES (%s, %s, %s, %s, 'running', SYSUTCDATETIME(), %s)",
+                        (bt_id, skill_id, symbol, day, json.dumps([])))
+            decision_id = cur.fetchone()[0]
+            conn.commit()
+            prices_df = load_prices_df(cur, symbol)
+    finally:
+        conn.close()
+
+    if decision is None:
+        log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} {mode} ({phase} phase) -> decision #{decision_id}; current price {price:.2f}")
+        dlog = RunLog(DECISIONS_TABLE, "decision_id", decision_id)
+        dlog.add(f"Portfolio backtest #{job['job_id']}: {skill['name']} as of {day} for {symbol} ({mode}, {phase} phase)")
+        raw = {"symbol": symbol, "data_source": "tech"}
+        if skill.get("data_source") != "tech":
+            bundle = load_symbol_bundle(symbol, log=dlog)
+            raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
+        decision = execute_decision(bt_id, decision_id, skill, symbol, day, raw, prices_df, dlog)
+
+    rec, bp, sp, tp = decision.get("recommendation"), decision.get("buy_below_price"), decision.get("stop_price"), decision.get("target_price")
+    failed = decision["status"] != "done"
+    is_buy = False if failed else _agent_is_buy(rec, bp, price)
+    note = (decision.get("error") or "failed")[:300] if failed else (decision.get("headline") or "")[:300]
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        a = _record_assessment(cur, job, day, symbol, skill_id, phase, "failed" if failed else mode, price,
+                               None if failed else rec, None if failed else bp, None if failed else sp, None if failed else tp,
+                               is_buy, note, decision_id=decision["decision_id"])
+        cur.execute(f"UPDATE {PJOB_TABLE} SET ai_calls = ai_calls + 1, failed_calls = failed_calls + %s WHERE job_id = %s", (1 if failed else 0, job["job_id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    job["ai_calls"] += 1
+    if failed:
+        log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} FAILED - {note}", "error")
+    else:
+        log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} -> {rec}, buy at/below {bp}, stop {sp}, target {tp} => "
+                f"{'BUY' if is_buy else 'NOT BUY'} at {price:.2f}")
+    return a
+
+
+def _cached_or_run(cur, job: dict, day: date, symbol: str, skill_id: str, price: float, log: RunLog) -> tuple[dict | None, bool, str]:
+    """Buffett/Dimon buy-phase rules (section 3.4). Returns (assessment or None, model_call_needed, mode)."""
+    cfg = job["config"]
+    latest = _passess_latest(cur, job["job_id"], symbol, skill_id)
+    short = PSKILL_SHORT[skill_id]
+    if latest and latest["sim_date"] == day:
+        is_buy = _agent_is_buy(latest["recommendation"], latest["buy_price"], price)
+        a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "cached", price, latest["recommendation"], latest["buy_price"],
+                               latest["stop_price"], latest["target_price"], is_buy, "assessed earlier today (held-stock reassessment)",
+                               decision_id=None, source_id=latest["assessment_id"])
+        log.add(f"{day} {symbol}: {short} assessed earlier today -> {'BUY' if is_buy else 'NOT BUY'} at {price:.2f} (buy at/below {latest['buy_price']})")
+        return a, False, "cached"
+    age = (day - latest["sim_date"]).days if latest else None
+    if not latest or age > cfg["analysis_validity_days"]:
+        why = "no assessment yet" if not latest else f"last assessment {age} days old (> {cfg['analysis_validity_days']})"
+        log.add(f"{day} {symbol}: {short} - {why}; running the agent")
+        return None, True, "run"
+    bp = latest["buy_price"]
+    if bp is None or bp <= 0:
+        a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "cached", price, latest["recommendation"], bp, latest["stop_price"],
+                               latest["target_price"], False, f"cached assessment from {latest['sim_date']} has no buy price", source_id=latest["assessment_id"])
+        log.add(f"{day} {symbol}: {short} cached ({latest['sim_date']}) has no buy price -> NOT BUY")
+        return a, False, "cached"
+    gap_pct = (price - bp) / bp * 100
+    if gap_pct > cfg["skip_threshold_pct"]:
+        a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "skipped", price, latest["recommendation"], bp, latest["stop_price"],
+                               latest["target_price"], False, f"price {gap_pct:.1f}% above the suggested buy price {bp} (> {cfg['skip_threshold_pct']}%); not rerun",
+                               source_id=latest["assessment_id"])
+        log.add(f"{day} {symbol}: {short} skipped - price {price:.2f} is {gap_pct:.1f}% above buy price {bp} -> NOT BUY")
+        return a, False, "skipped"
+    if abs(gap_pct) <= cfg["rerun_proximity_pct"]:
+        log.add(f"{day} {symbol}: {short} - price {price:.2f} within {cfg['rerun_proximity_pct']}% of buy price {bp} ({gap_pct:+.1f}%); rerunning")
+        return None, True, "rerun"
+    is_buy = _agent_is_buy(latest["recommendation"], bp, price)
+    a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "cached", price, latest["recommendation"], bp, latest["stop_price"],
+                           latest["target_price"], is_buy, f"cached assessment from {latest['sim_date']} ({age} days old)", source_id=latest["assessment_id"])
+    log.add(f"{day} {symbol}: {short} cached ({latest['sim_date']}, {latest['recommendation']}, buy at/below {bp}) -> {'BUY' if is_buy else 'NOT BUY'} at {price:.2f}")
+    return a, False, "cached"
+
+
+def _record_trade(cur, job: dict, day: date, symbol: str, side: str, qty: int, price: float, reason: str, pnl: float | None) -> None:
+    cur.execute(f"INSERT INTO {PTRADE_TABLE} (job_id, trade_date, symbol, side, quantity, price, amount, reason, realized_pnl, cash_after) "
+                f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (job["job_id"], day, symbol, side, qty, round(price, 4), round(qty * price, 2), reason[:600], None if pnl is None else round(pnl, 2), round(job["cash"], 2)))
+
+
+def _check_sell(cur, job: dict, day: date, symbol: str, pos: dict, bar: dict | None, log: RunLog) -> bool:
+    """Section 4.2: sell the whole position at the lowest agent target or the take-profit level, whichever is lower."""
+    if not bar:
+        return False
+    cfg = job["config"]
+    targets = {}
+    for sk in PORTFOLIO_SKILLS:
+        a = _passess_latest(cur, job["job_id"], symbol, sk)
+        if a and a["target_price"]:
+            targets[PSKILL_SHORT[sk]] = a["target_price"]
+    avg = pos["cost"] / pos["quantity"]
+    tp = avg * (1 + cfg["take_profit_pct"] / 100)
+    candidates = []
+    if targets:
+        t = min(targets.values())
+        if bar["high"] >= t:
+            candidates.append((t, f"target price {t:.2f} reached (lowest of " + ", ".join(f"{k} {v:.2f}" for k, v in targets.items()) + ")"))
+    if bar["high"] >= tp:
+        candidates.append((tp, f"take profit {cfg['take_profit_pct']:g}% on average cost {avg:.2f} reached ({tp:.2f})"))
+    if not candidates:
+        return False
+    price, reason = min(candidates, key=lambda c: c[0])
+    if bar["low"] > price:
+        reason += f"; the day traded entirely above it, sold at the day's low {bar['low']:.2f}"
+        price = bar["low"]
+    amount = pos["quantity"] * price
+    pnl = amount - pos["cost"]
+    job["cash"] += amount
+    job["realized_pnl"] += pnl
+    _record_trade(cur, job, day, symbol, "SELL", pos["quantity"], price, reason, pnl)
+    cur.execute(f"DELETE FROM {PPOS_TABLE} WHERE job_id = %s AND symbol = %s", (job["job_id"], symbol))
+    log.add(f"{day} {symbol}: SELL {pos['quantity']} @ {price:.2f} = {amount:,.2f}; P&L {pnl:+,.2f} ({pnl / pos['cost'] * 100:+.1f}%) - {reason}")
+    return True
+
+
+def _execute_buy(cur, job: dict, day: date, idx: int, symbol: str, bar: dict, todays: dict, pos: dict | None, log: RunLog) -> bool:
+    """Section 3.7: fill at the lowest of the three agents' buy prices if it lies inside the day's range."""
+    cfg = job["config"]
+    bps = {PSKILL_SHORT[sk]: a["buy_price"] for sk, a in todays.items() if a.get("buy_price")}
+    if len(bps) < 3:
+        log.add(f"{day} {symbol}: all three agents BUY but a buy price is missing ({bps}); no order", "warn")
+        return False
+    limit = min(bps.values())
+    desc = ", ".join(f"{k} {v:.2f}" for k, v in bps.items())
+    if not (bar["low"] <= limit <= bar["high"]):
+        log.add(f"{day} {symbol}: all three agents BUY; lowest buy price {limit:.2f} ({desc}) is outside the day's range "
+                f"{bar['low']:.2f}-{bar['high']:.2f}; no fill today")
+        return False
+    qty = int(cfg["buy_amount"] // limit)
+    if qty < 1:
+        log.add(f"{day} {symbol}: buy amount {cfg['buy_amount']:,.0f} buys less than one share at {limit:.2f}; no order", "warn")
+        return False
+    amount = qty * limit
+    if amount > job["cash"]:
+        log.add(f"{day} {symbol}: insufficient cash ({job['cash']:,.2f}) for {amount:,.2f}; no order", "warn")
+        return False
+    job["cash"] -= amount
+    if pos:
+        cur.execute(f"UPDATE {PPOS_TABLE} SET buys = buys + 1, quantity = quantity + %s, cost = cost + %s WHERE job_id = %s AND symbol = %s",
+                    (qty, round(amount, 2), job["job_id"], symbol))
+    else:
+        cur.execute(f"INSERT INTO {PPOS_TABLE} (job_id, symbol, buys, quantity, cost, opened_date, last_reassess_idx) VALUES (%s, %s, 1, %s, %s, %s, %s)",
+                    (job["job_id"], symbol, qty, round(amount, 2), day, idx))
+    n_buys = (pos["buys"] + 1) if pos else 1
+    reason = f"all three agents BUY; lowest buy price {limit:.2f} ({desc}) inside the day's range {bar['low']:.2f}-{bar['high']:.2f}; buy {n_buys} of {cfg['max_buys_per_stock']}"
+    _record_trade(cur, job, day, symbol, "BUY", qty, limit, reason, None)
+    log.add(f"{day} {symbol}: BUY {qty} @ {limit:.2f} = {amount:,.2f} ({reason})")
+    return True
+
+
+def _snapshot(cur, job: dict, day: date, bars: dict, positions: dict) -> dict:
+    mv = 0.0
+    for sym, pos in positions.items():
+        b = bars.get(sym) or {}
+        px = (b.get("bar") or {}).get("close") or b.get("prev_close")
+        if px:
+            mv += pos["quantity"] * px
+    total = job["cash"] + mv
+    cur.execute(f"DELETE FROM {PSNAP_TABLE} WHERE job_id = %s AND trade_date = %s", (job["job_id"], day))
+    cur.execute(f"INSERT INTO {PSNAP_TABLE} (job_id, trade_date, cash, market_value, total_value, realized_pnl, positions) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (job["job_id"], day, round(job["cash"], 2), round(mv, 2), round(total, 2), round(job["realized_pnl"], 2), len(positions)))
+    return {"market_value": mv, "total_value": total}
+
+
+def _todays_buy_assessments(cur, job_id: int, day: date, symbol: str) -> dict:
+    cur.execute(f"SELECT skill_id, buy_price, recommendation, is_buy FROM {PASSESS_TABLE} WHERE job_id = %s AND sim_date = %s AND symbol = %s "
+                f"AND phase = 'buy' AND mode <> 'failed' ORDER BY assessment_id", (job_id, day, symbol))
+    out = {}
+    for sk, bp, rec, is_buy in cur.fetchall():
+        out[sk] = {"buy_price": _fnum(bp), "recommendation": rec, "is_buy": bool(is_buy)}
+    return out
+
+
+class _Db:
+    """A reconnectable cursor holder: the simulation closes the connection around every model call."""
+
+    def __init__(self):
+        self.conn = db_connect()
+        self.cur = self.conn.cursor()
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def reopen(self):
+        self.conn = db_connect()
+        self.cur = self.conn.cursor()
+
+
+def _portfolio_advance(job: dict, log: RunLog) -> dict:
+    """Run the simulation from the stored cursor until one model call has been made or one day is finished."""
+    cfg, symbols, days, cur_ = job["config"], job["symbols"], job["days"], job["cursor"]
+    idx = cur_["idx"]
+    if idx >= len(days):
+        return {"done": True}
+    day = date.fromisoformat(days[idx])
+    db = _Db()
+
+    def save():
+        _save_cursor(db.cur, job)
+        db.commit()
+
+    try:
+        bars = _pbars(db.cur, symbols, day)
+        positions = _ppositions(db.cur, job["job_id"])
+        while True:
+            phase = cur_["phase"]
+            if phase == "sell":
+                held = [s for s in symbols if s in positions]
+                if cur_["sym"] >= len(held):
+                    cur_.update({"phase": "buy", "sym": 0, "stage": "buffett"})
+                    save()
+                    continue
+                sym = held[cur_["sym"]]
+                pos = positions[sym]
+                due = idx - pos["last_reassess_idx"] >= cfg["held_reassess_days"]
+                price = bars[sym]["prev_close"]
+                if due and price and cur_["stage"] in ("buffett", "dimon"):
+                    skill_id = PSTAGE_SKILL[cur_["stage"]]
+                    latest = _passess_latest(db.cur, job["job_id"], sym, skill_id)
+                    cur_["stage"] = "dimon" if cur_["stage"] == "buffett" else "check"
+                    if latest and latest["sim_date"] == day:
+                        continue
+                    save()
+                    db.close()
+                    log.add(f"{day} {sym}: held {pos['quantity']} shares ({pos['buys']} buys), last reassessed {idx - pos['last_reassess_idx']} trading days ago; reassessing")
+                    _run_portfolio_agent(job, day, sym, skill_id, "sell", "reassess", price, log)
+                    return {"done": False, "model_call": True}
+                if due:
+                    db.cur.execute(f"UPDATE {PPOS_TABLE} SET last_reassess_idx = %s WHERE job_id = %s AND symbol = %s", (idx, job["job_id"], sym))
+                    pos["last_reassess_idx"] = idx
+                if _check_sell(db.cur, job, day, sym, pos, bars[sym]["bar"], log):
+                    positions.pop(sym, None)
+                else:
+                    cur_["sym"] += 1
+                cur_["stage"] = "buffett"
+                save()
+                continue
+
+            if phase == "buy":
+                if cur_["sym"] >= len(symbols):
+                    cur_.update({"phase": "close", "sym": 0, "stage": "buffett"})
+                    save()
+                    continue
+                sym = symbols[cur_["sym"]]
+                stage = cur_["stage"]
+                b = bars[sym]
+                price = b["prev_close"]
+                pos = positions.get(sym)
+
+                def next_symbol():
+                    cur_["sym"] += 1
+                    cur_["stage"] = "buffett"
+                    save()
+
+                if stage == "buffett":
+                    if not b["bar"] or not price:
+                        log.add(f"{day} {sym}: no trading data for this day; skipped")
+                        next_symbol()
+                        continue
+                    if pos and pos["buys"] >= cfg["max_buys_per_stock"]:
+                        log.add(f"{day} {sym}: {pos['buys']} buys held (limit {cfg['max_buys_per_stock']}); buy agents skipped until the position is sold")
+                        next_symbol()
+                        continue
+                    if job["cash"] < cfg["buy_amount"]:
+                        log.add(f"{day} {sym}: cash {job['cash']:,.2f} below the buy amount {cfg['buy_amount']:,.0f}; skipped", "warn")
+                        next_symbol()
+                        continue
+                if stage in ("buffett", "dimon"):
+                    skill_id = PSTAGE_SKILL[stage]
+                    a, need_call, mode = _cached_or_run(db.cur, job, day, sym, skill_id, price, log)
+                    if need_call:
+                        db.commit()
+                        db.close()
+                        a = _run_portfolio_agent(job, day, sym, skill_id, "buy", mode, price, log)
+                        db.reopen()
+                    if not a["is_buy"]:
+                        log.add(f"{day} {sym}: {PSKILL_SHORT[skill_id]} NOT BUY; remaining agents not run today")
+                        next_symbol()
+                    else:
+                        cur_["stage"] = "dimon" if stage == "buffett" else "murphy"
+                        save()
+                    if need_call:
+                        return {"done": False, "model_call": True}
+                    continue
+                if stage == "murphy":
+                    db.commit()
+                    db.close()
+                    a = _run_portfolio_agent(job, day, sym, "john-murphy", "buy", "run", price, log)
+                    db.reopen()
+                    if a["is_buy"]:
+                        todays = _todays_buy_assessments(db.cur, job["job_id"], day, sym)
+                        _execute_buy(db.cur, job, day, idx, sym, b["bar"], todays, pos, log)
+                        positions = _ppositions(db.cur, job["job_id"])
+                    else:
+                        log.add(f"{day} {sym}: Murphy NOT BUY; no order")
+                    next_symbol()
+                    return {"done": False, "model_call": True}
+
+            if phase == "close":
+                snap = _snapshot(db.cur, job, day, bars, positions)
+                log.add(f"{day}: day closed - cash {job['cash']:,.2f}, positions {len(positions)} worth {snap['market_value']:,.2f}, "
+                        f"total {snap['total_value']:,.2f}, realized {job['realized_pnl']:+,.2f}")
+                finished = idx + 1 >= len(days)
+                cur_.update({"idx": idx + 1, "phase": "sell", "sym": 0, "stage": "buffett"})
+                _save_cursor(db.cur, job)
+                if finished:
+                    db.cur.execute(f"UPDATE {PJOB_TABLE} SET status = 'done' WHERE job_id = %s AND status = 'active'", (job["job_id"],))
+                    log.add(f"Simulation complete: {len(days)} trading days {days[0]} to {days[-1]}")
+                db.commit()
+                return {"done": finished, "day_done": True}
+    finally:
+        db.close()
+
+
+def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limit: int = 60) -> dict:
+    job = _pjob(cur, job_id)
+    symbols, days, idx = job["symbols"], job["days"], job["cursor"]["idx"]
+    priced_as_of = date.fromisoformat(days[idx - 1]) if idx > 0 else date.fromisoformat(days[0]) - timedelta(days=1)
+    positions = _ppositions(cur, job_id)
+    prices = {}
+    if positions:
+        placeholders = ", ".join("%s" for _ in positions)
+        cur.execute(f"SELECT p.symbol, p.[close] FROM {TABLE} p JOIN (SELECT symbol, MAX(trade_date) AS td FROM {TABLE} "
+                    f"WHERE symbol IN ({placeholders}) AND trade_date <= %s GROUP BY symbol) m ON m.symbol = p.symbol AND m.td = p.trade_date",
+                    (*positions.keys(), priced_as_of))
+        prices = {r[0]: float(r[1]) for r in cur.fetchall()}
+    pos_rows, mv = [], 0.0
+    for sym, p in positions.items():
+        px = prices.get(sym)
+        value = p["quantity"] * px if px else None
+        avg = p["cost"] / p["quantity"]
+        mv += value or 0.0
+        pos_rows.append({"symbol": sym, "buys": p["buys"], "quantity": p["quantity"], "avg_cost": round(avg, 4), "cost": round(p["cost"], 2),
+                         "price": px, "market_value": None if value is None else round(value, 2),
+                         "unrealized_pnl": None if value is None else round(value - p["cost"], 2),
+                         "unrealized_pct": None if value is None else round((value - p["cost"]) / p["cost"] * 100, 2),
+                         "opened_date": p["opened_date"]})
+    cur.execute(f"SELECT TOP {trades_limit} trade_id, trade_date, symbol, side, quantity, price, amount, reason, realized_pnl, cash_after "
+                f"FROM {PTRADE_TABLE} WHERE job_id = %s ORDER BY trade_id DESC", (job_id,))
+    trades = [{"trade_id": r[0], "trade_date": r[1].isoformat(), "symbol": r[2], "side": r[3].strip(), "quantity": r[4], "price": _fnum(r[5]),
+               "amount": _fnum(r[6], 2), "reason": r[7], "realized_pnl": _fnum(r[8], 2), "cash_after": _fnum(r[9], 2)} for r in cur.fetchall()]
+    cur.execute(f"SELECT COUNT(*), SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END), SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN side = 'SELL' AND realized_pnl > 0 THEN 1 ELSE 0 END) FROM {PTRADE_TABLE} WHERE job_id = %s", (job_id,))
+    n_tr, n_buy, n_sell, n_win = [x or 0 for x in cur.fetchone()]
+    cur.execute(f"SELECT mode, COUNT(*) FROM {PASSESS_TABLE} WHERE job_id = %s GROUP BY mode", (job_id,))
+    modes = {r[0]: r[1] for r in cur.fetchall()}
+    cur.execute(f"SELECT TOP {assessments_limit} assessment_id, sim_date, symbol, skill_id, phase, mode, decision_id, recommendation, current_price, "
+                f"buy_price, stop_price, target_price, is_buy, note FROM {PASSESS_TABLE} WHERE job_id = %s ORDER BY assessment_id DESC", (job_id,))
+    assessments = [{"assessment_id": r[0], "sim_date": r[1].isoformat(), "symbol": r[2], "skill_id": r[3], "phase": r[4], "mode": r[5],
+                    "decision_id": r[6], "recommendation": r[7], "current_price": _fnum(r[8]), "buy_price": _fnum(r[9]), "stop_price": _fnum(r[10]),
+                    "target_price": _fnum(r[11]), "is_buy": bool(r[12]), "note": r[13]} for r in cur.fetchall()]
+    cur.execute(f"SELECT trade_date, cash, market_value, total_value, realized_pnl, positions FROM {PSNAP_TABLE} WHERE job_id = %s ORDER BY trade_date", (job_id,))
+    snapshots = [{"trade_date": r[0].isoformat(), "cash": float(r[1]), "market_value": float(r[2]), "total_value": float(r[3]),
+                  "realized_pnl": float(r[4]), "positions": r[5]} for r in cur.fetchall()]
+    total = job["cash"] + mv
+    cap = job["config"]["starting_capital"]
+    c = job["cursor"]
+    current_symbol = None
+    if idx < len(days):
+        if c["phase"] == "buy" and c["sym"] < len(symbols):
+            current_symbol = symbols[c["sym"]]
+        elif c["phase"] == "sell":
+            held = [s for s in symbols if s in positions]
+            current_symbol = held[c["sym"]] if c["sym"] < len(held) else None
+    job.pop("log", None)
+    return {**job, "days_total": len(days), "days_done": min(idx, len(days)),
+            "progress": {"idx": idx, "current_date": days[idx] if idx < len(days) else None, "phase": c["phase"], "stage": c["stage"],
+                         "symbol": current_symbol, "priced_as_of": priced_as_of.isoformat()},
+            "positions": pos_rows, "market_value": round(mv, 2), "total_value": round(total, 2),
+            "unrealized_pnl": round(sum(p["unrealized_pnl"] or 0 for p in pos_rows), 2),
+            "return_pct": round((total - cap) / cap * 100, 4),
+            "trades": trades, "trade_counts": {"total": n_tr, "buys": n_buy, "sells": n_sell, "wins": n_win,
+                                               "win_rate_pct": round(n_win / n_sell * 100, 1) if n_sell else None},
+            "assessment_counts": modes, "assessments": assessments, "snapshots": snapshots}
+
+
+@app.post("/api/py/portfolio")
+def portfolio_create(req: PortfolioRequest):
+    require_claude()
+    log = RunLog(PJOB_TABLE, "job_id")
+    log.add(f"Claude: {describe_claude()}")
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_PORTFOLIO_SQL)
+        ensure_backtest_tables(cur)
+        if req.symbols:
+            wanted = {normalize_symbol(s) for s in req.symbols}
+            rows = [u for u in _portfolio_symbols(cur, 600) if u["symbol"] in wanted]
+        else:
+            rows = _portfolio_symbols(cur, req.stock_count)
+        if not rows:
+            raise HTTPException(status_code=422, detail="No constituents found (is dbo.SP500_CONSTITUENTS filled?).")
+        symbols = [u["symbol"] for u in rows]
+        not_ready = [u["symbol"] for u in rows if not u["ready"]]
+        if not_ready:
+            raise HTTPException(status_code=422, detail=f"Not ready (prices, TECH_ tables or data bundle missing): {', '.join(not_ready)}. "
+                                                        f"Use 'Prepare data' first.")
+        placeholders = ", ".join("%s" for _ in symbols)
+        cur.execute(f"SELECT MAX(trade_date) FROM {TABLE} WHERE symbol IN ({placeholders})", tuple(symbols))
+        latest = cur.fetchone()[0]
+        end = min(req.end_date or latest, latest) if latest else None
+        if not end or end < req.start_date:
+            raise HTTPException(status_code=422, detail="No stored prices in that date range; prepare the data first.")
+        cur.execute(f"SELECT DISTINCT trade_date FROM {TABLE} WHERE symbol IN ({placeholders}) AND trade_date BETWEEN %s AND %s ORDER BY trade_date",
+                    (*symbols, req.start_date, end))
+        days = [r[0].isoformat() for r in cur.fetchall()]
+        if not days:
+            raise HTTPException(status_code=422, detail="No trading days with stored prices in that range.")
+        cur.execute(f"SELECT symbol, COUNT(*) FROM {TABLE} WHERE symbol IN ({placeholders}) AND trade_date < %s GROUP BY symbol", (*symbols, req.start_date))
+        history = {r[0]: r[1] for r in cur.fetchall()}
+        thin = [s for s in symbols if history.get(s, 0) < 30]
+        if thin:
+            raise HTTPException(status_code=422, detail=f"Fewer than 30 price rows before {req.start_date} for: {', '.join(thin)}.")
+        cfg = req.model_dump(mode="json")
+        cfg["end_date"] = end.isoformat()
+        cursor = {"idx": 0, "phase": "sell", "sym": 0, "stage": "buffett"}
+        cur.execute(f"INSERT INTO {PJOB_TABLE} (status, start_date, end_date, config, symbols, trading_days, cursor_json, cash) "
+                    f"OUTPUT INSERTED.job_id VALUES ('active', %s, %s, %s, %s, %s, %s, %s)",
+                    (req.start_date, end, json.dumps(cfg), json.dumps(symbols), json.dumps(days), json.dumps(cursor), round(req.starting_capital, 2)))
+        job_id = cur.fetchone()[0]
+        backtests = _portfolio_backtests(cur, job_id, req.start_date.year)
+        log.row_id = job_id
+        log.add(f"Portfolio backtest #{job_id}: {len(symbols)} stocks ({', '.join(symbols)}), {len(days)} trading days {days[0]} to {days[-1]}, "
+                f"capital {req.starting_capital:,.0f}, {req.buy_amount:,.0f} per buy, max {req.max_buys_per_stock} buys/stock, take profit {req.take_profit_pct:g}%")
+        log.add(f"Agent rules: Buffett -> Dimon -> Murphy with early exit; Buffett/Dimon cached {req.analysis_validity_days} days, rerun within "
+                f"{req.rerun_proximity_pct:g}% of the buy price, skipped when more than {req.skip_threshold_pct:g}% above it; held stocks reassessed every "
+                f"{req.held_reassess_days} trading day(s); Murphy never cached")
+        log.add("Current price on a simulated day = last close before that day; agents see nothing from that day on; orders fill inside the day's range")
+        cur.execute(f"UPDATE {PJOB_TABLE} SET backtests = %s, log_json = %s WHERE job_id = %s", (json.dumps(backtests), json.dumps(log.entries), job_id))
+        conn.commit()
+        return {**_portfolio_state(cur, job_id), "log": log.entries}
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/portfolio/latest")
+def portfolio_latest():
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(ENSURE_PORTFOLIO_SQL)
+        conn.commit()
+        cur.execute(f"SELECT TOP 1 job_id FROM {PJOB_TABLE} ORDER BY job_id DESC")
+        row = cur.fetchone()
+        if not row:
+            return None
+        st = _portfolio_state(cur, row[0])
+        cur.execute(f"SELECT log_json FROM {PJOB_TABLE} WHERE job_id = %s", (row[0],))
+        return {**st, "log": json.loads(cur.fetchone()[0] or "[]")}
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/portfolio/{job_id}")
+def portfolio_get(job_id: int, with_log: bool = False):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        st = _portfolio_state(cur, job_id)
+        if with_log:
+            cur.execute(f"SELECT log_json FROM {PJOB_TABLE} WHERE job_id = %s", (job_id,))
+            st["log"] = json.loads(cur.fetchone()[0] or "[]")
+        return st
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/portfolio/{job_id}/trades")
+def portfolio_trades(job_id: int):
+    conn = db_connect()
+    try:
+        return {"job_id": job_id, "trades": _portfolio_state(conn.cursor(), job_id, trades_limit=5000, assessments_limit=1)["trades"]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/py/portfolio/{job_id}/assessments")
+def portfolio_assessments(job_id: int, symbol: str | None = None, sim_date: date | None = None, limit: int = 500):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        where, params = ["job_id = %s"], [job_id]
+        if symbol:
+            where.append("symbol = %s")
+            params.append(normalize_symbol(symbol))
+        if sim_date:
+            where.append("sim_date = %s")
+            params.append(sim_date)
+        cur.execute(f"SELECT TOP {max(1, min(limit, 5000))} assessment_id, sim_date, symbol, skill_id, phase, mode, decision_id, recommendation, "
+                    f"current_price, buy_price, stop_price, target_price, is_buy, note FROM {PASSESS_TABLE} WHERE {' AND '.join(where)} "
+                    f"ORDER BY assessment_id DESC", tuple(params))
+        rows = [{"assessment_id": r[0], "sim_date": r[1].isoformat(), "symbol": r[2], "skill_id": r[3], "phase": r[4], "mode": r[5],
+                 "decision_id": r[6], "recommendation": r[7], "current_price": _fnum(r[8]), "buy_price": _fnum(r[9]), "stop_price": _fnum(r[10]),
+                 "target_price": _fnum(r[11]), "is_buy": bool(r[12]), "note": r[13]} for r in cur.fetchall()]
+        return {"job_id": job_id, "assessments": rows}
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/portfolio/{job_id}/stop")
+def portfolio_stop(job_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {PJOB_TABLE} SET status = 'stopped' WHERE job_id = %s AND status = 'active'", (job_id,))
+        conn.commit()
+        return _portfolio_state(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/portfolio/{job_id}/resume")
+def portfolio_resume(job_id: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {PJOB_TABLE} SET status = 'active' WHERE job_id = %s AND status = 'stopped'", (job_id,))
+        conn.commit()
+        return _portfolio_state(cur, job_id)
+    finally:
+        conn.close()
+
+
+@app.post("/api/py/portfolio/{job_id}/step")
+def portfolio_step(job_id: int):
+    """Advance the simulation: at most one model call, or one finished trading day, per request."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE {PJOB_TABLE} SET locked_at = SYSUTCDATETIME() OUTPUT inserted.job_id WHERE job_id = %s AND status = 'active' "
+                    f"AND (locked_at IS NULL OR locked_at < DATEADD(minute, -{PJOB_LOCK_MINUTES}, SYSUTCDATETIME()))", (job_id,))
+        claimed = cur.fetchone()
+        conn.commit()
+        if not claimed:
+            job = _pjob(cur, job_id)
+            if job["status"] != "active":
+                return {"done": job["status"] == "done", "stopped": job["status"] == "stopped", "busy": False, "state": _portfolio_state(cur, job_id), "log": []}
+            return {"done": False, "stopped": False, "busy": True, "state": None, "log": []}
+        job = _pjob(cur, job_id)
+    finally:
+        conn.close()
+
+    log = RunLog("x", "y")
+    outcome: dict = {}
+    error: str | None = None
+    try:
+        outcome = _portfolio_advance(job, log)
+    except HTTPException as e:
+        error = str(e.detail)[:500]
+    except Exception as e:  # noqa: BLE001
+        error = f"{type(e).__name__}: {str(e)[:400]}"
+    if error:
+        log.add(f"Step failed: {error}", "error")
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT log_json FROM {PJOB_TABLE} WHERE job_id = %s", (job_id,))
+        merged = (json.loads(cur.fetchone()[0] or "[]") + log.entries)[-PJOB_LOG_KEEP:]
+        cur.execute(f"UPDATE {PJOB_TABLE} SET log_json = %s, locked_at = NULL WHERE job_id = %s", (json.dumps(merged), job_id))
+        conn.commit()
+        state = _portfolio_state(cur, job_id)
+    finally:
+        conn.close()
+    if error:
+        raise HTTPException(status_code=500, detail=error)
+    return {"done": bool(outcome.get("done")) or state["status"] == "done", "stopped": state["status"] == "stopped", "busy": False,
+            "model_call": bool(outcome.get("model_call")), "day_done": bool(outcome.get("day_done")), "state": state, "log": log.entries}

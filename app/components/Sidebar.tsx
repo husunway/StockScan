@@ -29,6 +29,7 @@ const items: Item[] = [
       { href: "/agent/run?skill=jamie-dimon", label: "Jamie Dimon" },
       { href: "/agent/backtest?skill=john-murphy", label: "John Murphy" },
       { href: "/agent/scan", label: "S&P 500 scan" },
+      { href: "/agent/portfolio", label: "Portfolio backtest" },
       { href: "/agent", label: "Skill library" },
     ],
   },

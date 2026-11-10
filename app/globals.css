@@ -443,3 +443,7 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.ok { background: var(--ok); }
 .dot.down { background: var(--down); }
+
+/* Portfolio backtest: signed P&L colouring */
+.num.pos, .stat-value.pos { color: #0ca30c; }
+.num.neg, .stat-value.neg { color: #c0392b; }
