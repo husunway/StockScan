@@ -466,7 +466,7 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .pcal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
 .pcal-dow { font-size: 0.72rem; color: var(--muted); text-align: center; padding-bottom: 2px; }
 .pcal-cell {
-  min-height: 78px; padding: 4px 5px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text);
+  min-height: 96px; padding: 4px 5px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text);
   display: flex; flex-direction: column; align-items: stretch; gap: 2px; text-align: left; font: inherit; cursor: pointer; overflow: hidden;
 }
 .pcal-cell.empty { border: 0; background: transparent; cursor: default; }
@@ -506,3 +506,7 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 strong.pos, .pos { color: var(--ok); }
 strong.neg { color: var(--down); }
 .pcal-cost { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 10px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.pcal-activity-row { display: flex; flex-wrap: wrap; gap: 2px 6px; font-size: 0.66rem; line-height: 1.2; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pcal-activity-row .zero { opacity: 0.45; }
+.pcal-activity-row .c2 { color: var(--accent); font-weight: 600; }
+.pcal-activity-row .c3 { color: var(--ok); font-weight: 700; }

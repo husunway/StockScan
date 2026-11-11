@@ -5190,6 +5190,21 @@ def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limi
         e["cost"] += c_ or 0.0
         e["calls"] += calls or 0
     ai_costs = [{**v, "cost": round(v["cost"], 4)} for _, v in sorted(cost_by_day.items())]
+    # Per day and stock: skipped assessments, fresh model runs (reused copies excluded), and how far the buy chain got
+    # (Buffett + Dimon both BUY = 2-agent consensus; plus Murphy = 3-agent consensus).
+    cur.execute(f"SELECT a.sim_date, a.symbol, "
+                f"SUM(CASE WHEN a.mode = 'skipped' THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN a.decision_id IS NOT NULL AND d.reused_from_id IS NULL THEN 1 ELSE 0 END), "
+                f"MAX(CASE WHEN a.phase = 'buy' AND a.skill_id = 'warren-buffett' AND a.is_buy = 1 THEN 1 ELSE 0 END), "
+                f"MAX(CASE WHEN a.phase = 'buy' AND a.skill_id = 'jamie-dimon' AND a.is_buy = 1 THEN 1 ELSE 0 END), "
+                f"MAX(CASE WHEN a.phase = 'buy' AND a.skill_id = 'john-murphy' AND a.is_buy = 1 THEN 1 ELSE 0 END) "
+                f"FROM {PASSESS_TABLE} a LEFT JOIN {DECISIONS_TABLE} d ON d.decision_id = a.decision_id "
+                f"WHERE a.job_id = %s GROUP BY a.sim_date, a.symbol ORDER BY a.sim_date", (job_id,))
+    day_activity = []
+    for sim_date, sym, skipped, fresh, b, dm, mu in cur.fetchall():
+        c2 = 1 if (b and dm) else 0
+        day_activity.append({"trade_date": sim_date.isoformat(), "symbol": sym, "skipped": skipped or 0, "fresh": fresh or 0,
+                             "consensus2": c2, "consensus3": 1 if (c2 and mu) else 0})
     total = job["cash"] + mv
     cap = job["config"]["starting_capital"]
     c = job["cursor"]
@@ -5210,7 +5225,7 @@ def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limi
             "trades": trades, "trade_counts": {"total": n_tr, "buys": n_buy, "sells": n_sell, "wins": n_win,
                                                "win_rate_pct": round(n_win / n_sell * 100, 1) if n_sell else None},
             "assessment_counts": modes, "assessments": assessments, "snapshots": snapshots, "trade_days": trade_days,
-            "ai_costs": ai_costs, "ai_cost_total": round(sum(v["cost"] for v in ai_costs), 4),
+            "ai_costs": ai_costs, "ai_cost_total": round(sum(v["cost"] for v in ai_costs), 4), "day_activity": day_activity,
             "ai_cost_currency": pricing.get("currency", "USD"), "ai_cost_unpriced": unpriced}
 
 

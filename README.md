@@ -206,7 +206,9 @@ accepted, and percentages take decimals. Each invalid field shows its own messag
 must be a whole dollar amount between $1,000 and $10,000,000,000.", and blocks the run.
 
 **Calendar.** A month view over the backtest range, with previous and next controls and a month picker. Each
-trading day shows ▲ buys, ▼ sells and the day's change in total value ($ and %), shaded as a heat map. Weekends
+trading day shows ▲ buys, ▼ sells and the day's change in total value ($ and %), shaded as a heat map. A second row shows S (agent assessments skipped because
+the price was far above the buy price), F (fresh model runs; reused analyses not counted), 2✓ (stocks where Buffett
+and Dimon both said buy) and 3✓ (stocks where all three did). Weekends
 and market holidays are greyed out. The calendar fills in live and follows the simulation until you navigate.
 Clicking a day opens a panel, beside the calendar on wide screens and below it on narrow ones, with the day
 summary, the transactions and an agent-activity list. Transactions show the trigger, each agent's buy and target
