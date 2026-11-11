@@ -22,7 +22,7 @@ def _env(**kw):
 
 
 def test_available_models_default_first_and_deduplicated():
-    old = _env(ANTHROPIC_MODEL="claude-opus-5-5", ANTHROPIC_MODELS="claude-sonnet-5-5, claude-opus-5-5;claude-haiku-5-5\nclaude-fable-5-1")
+    old = _env(DEFAULT_AI_MODEL="claude-opus-5-5", AI_MODELS="claude-sonnet-5-5, claude-opus-5-5;claude-haiku-5-5\nclaude-fable-5-1")
     try:
         assert api.available_models() == ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]
         assert api.resolve_model(None) == "claude-opus-5-5"
@@ -37,7 +37,7 @@ def test_available_models_default_first_and_deduplicated():
 
 
 def test_default_when_nothing_configured():
-    old = _env(ANTHROPIC_MODEL=None, ANTHROPIC_MODELS=None)
+    old = _env(DEFAULT_AI_MODEL=None, AI_MODELS=None)
     try:
         assert api.available_models() == [api.DEFAULT_CLAUDE_MODEL]
         assert api.requested_model() == api.DEFAULT_CLAUDE_MODEL
@@ -46,7 +46,7 @@ def test_default_when_nothing_configured():
 
 
 def test_use_model_scopes_the_override():
-    old = _env(ANTHROPIC_MODEL="claude-opus-5-5", ANTHROPIC_MODELS="claude-sonnet-5-5")
+    old = _env(DEFAULT_AI_MODEL="claude-opus-5-5", AI_MODELS="claude-sonnet-5-5")
     try:
         assert api.requested_model() == "claude-opus-5-5"
         with api.use_model("claude-sonnet-5-5"):

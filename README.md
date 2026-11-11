@@ -120,7 +120,7 @@ A run:
 1. Gathers data - fundamentals and three years of annual statements from Yahoo Finance (yfinance),
    plus a price snapshot (52-week range, 200-day average, 1-year return, volatility, drawdown)
    from the stored prices, or from Yahoo if the symbol is not loaded.
-2. Calls Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`; pick another model per run, see
+2. Calls Claude (`claude-opus-5-5` by default; override with `DEFAULT_AI_MODEL`; pick another model per run, see
    *Choosing the AI model* below) with the skill's
    instructions as the system prompt and the data as the user message. The provider is **Microsoft
    Foundry** when `ANTHROPIC_FOUNDRY_API_KEY` and `ANTHROPIC_FOUNDRY_RESOURCE` (or `_BASE_URL`) are set
@@ -171,8 +171,8 @@ is ~21,000 stage-1 calls without the pre-screen; the pre-screen usually removes 
 ### Choosing the AI model
 
 Every page that calls Claude (single run, weekly backtest, index scan, portfolio backtest) has an
-**AI model** picker. Its choices come from the server environment: `ANTHROPIC_MODEL` is the default and
-`ANTHROPIC_MODELS` lists the others (comma separated; on Foundry, deployment names). `GET
+**AI model** picker. Its choices come from the server environment: `DEFAULT_AI_MODEL` is the default and
+`AI_MODELS` lists the others (comma separated; on Foundry, deployment names). `GET
 /api/py/agent/models` returns the list with each model's price from `data/ai_pricing.json`. The API
 rejects a model that is not configured. The choice is stored on the run's backtest rows
 (`agent_backtests.model_requested`), so every step, resume and retry of that run uses the same model.
@@ -242,7 +242,7 @@ model call, in the portfolio backtest, the S&P 500 scan or the weekly backtest, 
 analysis by the same agent, of the same stock, as of the same date, with the same skill version and model, from
 any earlier run. If one exists, its result and reports are copied into the current run (`reused_from_id` points
 at the original) and no model call is made. Failed runs are never reused. Decisions saved before this change
-have no recorded model, so they match only when the model name the provider returned equals `ANTHROPIC_MODEL`.
+have no recorded model, so they match only when the model name the provider returned equals `DEFAULT_AI_MODEL`.
 
 **Close price and AI cost.** The day panel's agent activity table shows each run's decision price (the previous
 close), the day's close, and an estimated cost. Cost = input tokens × input price + output tokens × output price,
@@ -368,8 +368,8 @@ AUTH_SECRET=        # random, e.g. node -e "console.log(require('crypto').random
 ANTHROPIC_FOUNDRY_API_KEY=   # Claude via Microsoft Foundry (preferred when set) ...
 ANTHROPIC_FOUNDRY_RESOURCE=  # ... resource name from https://<resource>.services.ai.azure.com/anthropic/
 ANTHROPIC_API_KEY=           # or the Anthropic Claude API, used only when the Foundry variables are absent
-ANTHROPIC_MODEL=             # optional, default claude-opus-5-5 (on Foundry: the deployed model name)
-ANTHROPIC_MODELS=            # optional, other models the run forms may pick, comma separated
+DEFAULT_AI_MODEL=            # optional, default claude-opus-5-5 (on Foundry: the deployed model name)
+AI_MODELS=                   # optional, other models the run forms may pick, comma separated
 BLOB_READ_WRITE_TOKEN=  # Vercel Blob store for backtest PDFs (set automatically when the store is connected on Vercel)
 BLOB_ACCESS=private     # or public; must match the store
 ```

@@ -580,19 +580,19 @@ def single_stock_analysis(symbol: str, index: str | None = None, sector: str | N
 # ---------------------------------------------------------------------------
 DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 
-# The model for the current request. Runs pick a model from the environment list (ANTHROPIC_MODEL plus ANTHROPIC_MODELS);
+# The model for the current request. Runs pick a model from the environment list (DEFAULT_AI_MODEL plus AI_MODELS);
 # the choice is stored with the run, and each step sets it here so every call of that run uses the same model.
 _MODEL_OVERRIDE: "contextvars.ContextVar[str | None]" = contextvars.ContextVar("stockscan_model", default=None)
 
 
 def default_model() -> str:
-    return (os.environ.get("ANTHROPIC_MODEL") or "").strip() or DEFAULT_CLAUDE_MODEL
+    return (os.environ.get("DEFAULT_AI_MODEL") or "").strip() or DEFAULT_CLAUDE_MODEL
 
 
 def available_models() -> list[str]:
-    """ANTHROPIC_MODEL (the default) first, then every model in ANTHROPIC_MODELS (comma, semicolon or newline separated)."""
+    """DEFAULT_AI_MODEL (the default) first, then every model in AI_MODELS (comma, semicolon or newline separated)."""
     out = [default_model()]
-    for m in re.split(r"[,;\n]", os.environ.get("ANTHROPIC_MODELS") or ""):
+    for m in re.split(r"[,;\n]", os.environ.get("AI_MODELS") or ""):
         m = m.strip()
         if m and m not in out:
             out.append(m)
@@ -606,7 +606,7 @@ def resolve_model(model: str | None) -> str:
         return default_model()
     if m not in available_models():
         raise HTTPException(status_code=422, detail=f"Model '{m}' is not configured. Choose one of: {', '.join(available_models())} "
-                                                    f"(set ANTHROPIC_MODEL and ANTHROPIC_MODELS in the environment).")
+                                                    f"(set DEFAULT_AI_MODEL and AI_MODELS in the environment).")
     return m
 
 
@@ -866,7 +866,7 @@ def load_price_history_any(symbol: str):
 class AgentRunRequest(BaseModel):
     skill: str = Field(..., min_length=1, max_length=60)
     symbol: str = Field(..., min_length=1, max_length=20)
-    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default DEFAULT_AI_MODEL")
 
 
 def validate_verdict(a: dict) -> list[str]:
@@ -1170,7 +1170,7 @@ def agent_skill(skill_id: str):
 
 @app.get("/api/py/agent/models")
 def agent_models():
-    """The models a run can use, from the environment: ANTHROPIC_MODEL (default) and ANTHROPIC_MODELS."""
+    """The models a run can use, from the environment: DEFAULT_AI_MODEL (default) and AI_MODELS."""
     pricing = ai_pricing()
     return {"default": default_model(), "provider": claude_provider(),
             "models": [{"id": m, "default": m == default_model(), "price": price_for_model(m, pricing)} for m in available_models()],
@@ -1352,12 +1352,12 @@ def env_diagnostics() -> dict:
         claude = {"provider": "Microsoft Foundry", "endpoint": base, "model": requested_model(),
                   "effort": claude_effort(), "credentials": _set("ANTHROPIC_FOUNDRY_API_KEY"),
                   "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"),
-                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_MODELS"), _set("ANTHROPIC_EFFORT")],
+                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("DEFAULT_AI_MODEL"), _set("AI_MODELS"), _set("ANTHROPIC_EFFORT")],
                   "models": available_models()}
     elif provider == "anthropic":
         claude = {"provider": "Anthropic API", "endpoint": "https://api.anthropic.com/", "model": requested_model(),
                   "effort": claude_effort(), "credentials": _set("ANTHROPIC_API_KEY"),
-                  "variables": [_set("ANTHROPIC_API_KEY"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_MODELS"), _set("ANTHROPIC_EFFORT")],
+                  "variables": [_set("ANTHROPIC_API_KEY"), _set("DEFAULT_AI_MODEL"), _set("AI_MODELS"), _set("ANTHROPIC_EFFORT")],
                   "models": available_models()}
     else:
         claude = {"provider": "not configured", "endpoint": None, "model": None, "credentials": None,
@@ -2145,7 +2145,7 @@ class BacktestRequest(BaseModel):
     year: int = Field(2026, ge=2000, le=2100)
     weeks: int = Field(10, ge=1, le=52, description="How many Mondays to run, counting from January 1")
     refresh_data: bool = Field(False, description="Re-download the symbol's data bundle even if a fresh one is stored")
-    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default DEFAULT_AI_MODEL")
 
 
 def _decision_dict(row) -> dict:
@@ -4161,7 +4161,7 @@ SCAN_ITEM_COLUMNS = ("as_of_date", "symbol", "stage", "status", "reason", "price
 
 class ScanRequest(BaseModel):
     index: str = Field(DEFAULT_INDEX, pattern=INDEX_PATTERN, description="Which index to scan")
-    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default DEFAULT_AI_MODEL")
     start_date: date = Field(date(2026, 1, 1))
     end_date: date | None = Field(None, description="Defaults to today")
     cadence: str = Field("weekly", pattern="^(weekly|daily)$", description="weekly = Mondays; daily = Monday to Friday")
@@ -4548,7 +4548,7 @@ CONFIG_VARS = (
     "AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD",
     "AUTH_USERNAME", "AUTH_PASSWORD", "AUTH_SECRET",
     "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL",
-    "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
+    "ANTHROPIC_API_KEY", "DEFAULT_AI_MODEL",
     "BLOB_READ_WRITE_TOKEN", "BLOB_ACCESS",
 )
 
@@ -4750,7 +4750,7 @@ class PortfolioRequest(BaseModel):
     """Numeric fields accept numbers or strings; they are checked by validate_portfolio_config so the API returns
     the same specific messages as the form instead of generic type errors."""
     index: str = Field(DEFAULT_INDEX, pattern=INDEX_PATTERN, description="Which index the first N stocks come from")
-    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default DEFAULT_AI_MODEL")
     stock_count: int | float | str | None = Field(_PF_DEFAULT["stock_count"], description="First N constituents in ticker-symbol order")
     start_date: date = Field(date(2026, 1, 1))
     end_date: date | None = Field(None, description="Defaults to the latest stored trading day")

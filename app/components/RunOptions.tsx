@@ -31,7 +31,7 @@ function loadModels(): Promise<Models> {
   return cache;
 }
 
-/** The configured models (ANTHROPIC_MODEL plus ANTHROPIC_MODELS on the server). `value` "" means the server default. */
+/** The configured models (DEFAULT_AI_MODEL plus AI_MODELS on the server). `value` "" means the server default. */
 export function ModelSelect({ value, onChange, disabled }: { value: string; onChange: (v: string) => void; disabled?: boolean }) {
   const [models, setModels] = useState<Models | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -41,7 +41,7 @@ export function ModelSelect({ value, onChange, disabled }: { value: string; onCh
   const list = models?.models ?? [];
   const price = (m: ModelInfo) => (m.price ? ` · $${m.price.input}/$${m.price.output} per M tokens` : "");
   return (
-    <label title={error ? `Could not load the model list: ${error}` : "Models come from ANTHROPIC_MODEL (default) and ANTHROPIC_MODELS in the server environment"}>
+    <label title={error ? `Could not load the model list: ${error}` : "Models come from DEFAULT_AI_MODEL (default) and AI_MODELS in the server environment"}>
       AI model
       <select value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled || list.length < 2} style={{ minWidth: 190 }}>
         {!models && <option value="">{error ? "server default" : "loading…"}</option>}
