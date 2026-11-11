@@ -1247,6 +1247,14 @@ DECISION_COLUMNS = (
 STATEMENT_NAMES = {"income": "Income statement", "balance": "Balance sheet", "cashflow": "Cash flow statement"}
 
 
+def norm_rec(v) -> str | None:
+    """Verdicts are stored in CHAR(4) columns, which SQL Server pads ('BUY' comes back as 'BUY '). Normalize every read."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip().upper()
+    return v or None
+
+
 _BACKTEST_TABLES_READY = False
 
 
@@ -2082,6 +2090,7 @@ class BacktestRequest(BaseModel):
 
 def _decision_dict(row) -> dict:
     d = dict(zip(DECISION_COLUMNS, row))
+    d["recommendation"] = norm_rec(d["recommendation"])
     for k in ("current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low",
               "intrinsic_value_base", "intrinsic_value_high", "margin_of_safety_pct"):
         d[k] = num(d[k], 4)
@@ -4086,6 +4095,8 @@ def _scan_job(cur, job_id: int) -> dict:
 
 def _scan_item_dict(row) -> dict:
     d = dict(zip(SCAN_ITEM_COLUMNS, row))
+    for k in ("murphy_rec", "buffett_rec", "dimon_rec"):
+        d[k] = norm_rec(d[k])
     for k in ("price", "buy_below", "stop_price", "target_price"):
         d[k] = num(d[k], 4)
     for k in ("as_of_date", "updated_at"):
@@ -4727,13 +4738,13 @@ def _passess_latest(cur, job_id: int, symbol: str, skill_id: str) -> dict | None
     r = cur.fetchone()
     if not r:
         return None
-    return {"assessment_id": r[0], "sim_date": r[1], "recommendation": r[2], "current_price": _fnum(r[3]), "buy_price": _fnum(r[4]),
+    return {"assessment_id": r[0], "sim_date": r[1], "recommendation": norm_rec(r[2]), "current_price": _fnum(r[3]), "buy_price": _fnum(r[4]),
             "stop_price": _fnum(r[5]), "target_price": _fnum(r[6]), "decision_id": r[7], "mode": r[8]}
 
 
 def _agent_is_buy(rec: str | None, buy_price: float | None, price: float) -> bool:
     """An agent recommends buying when it says BUY and its suggested buy price is at or above the current price."""
-    return rec == "BUY" and buy_price is not None and buy_price > 0 and price <= buy_price
+    return norm_rec(rec) == "BUY" and buy_price is not None and buy_price > 0 and price <= buy_price
 
 
 def _record_assessment(cur, job: dict, day: date, symbol: str, skill_id: str, phase: str, mode: str, price: float | None,
@@ -4981,7 +4992,7 @@ def _todays_buy_assessments(cur, job_id: int, day: date, symbol: str) -> dict:
                 (job_id, day, symbol))
     out = {}
     for sk, bp, rec, is_buy, tp, sp, mode, did, run_date in cur.fetchall():
-        out[sk] = {"buy_price": _fnum(bp), "recommendation": rec, "is_buy": bool(is_buy), "target_price": _fnum(tp), "stop_price": _fnum(sp),
+        out[sk] = {"buy_price": _fnum(bp), "recommendation": norm_rec(rec), "is_buy": bool(is_buy), "target_price": _fnum(tp), "stop_price": _fnum(sp),
                    "mode": mode, "decision_id": did, "run_date": run_date}
     return out
 
@@ -5168,7 +5179,7 @@ def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limi
     cur.execute(f"SELECT TOP {assessments_limit} assessment_id, sim_date, symbol, skill_id, phase, mode, decision_id, recommendation, current_price, "
                 f"buy_price, stop_price, target_price, is_buy, note FROM {PASSESS_TABLE} WHERE job_id = %s ORDER BY assessment_id DESC", (job_id,))
     assessments = [{"assessment_id": r[0], "sim_date": r[1].isoformat(), "symbol": r[2], "skill_id": r[3], "phase": r[4], "mode": r[5],
-                    "decision_id": r[6], "recommendation": r[7], "current_price": _fnum(r[8]), "buy_price": _fnum(r[9]), "stop_price": _fnum(r[10]),
+                    "decision_id": r[6], "recommendation": norm_rec(r[7]), "current_price": _fnum(r[8]), "buy_price": _fnum(r[9]), "stop_price": _fnum(r[10]),
                     "target_price": _fnum(r[11]), "is_buy": bool(r[12]), "note": r[13]} for r in cur.fetchall()]
     cur.execute(f"SELECT trade_date, cash, market_value, total_value, realized_pnl, positions FROM {PSNAP_TABLE} WHERE job_id = %s ORDER BY trade_date", (job_id,))
     snapshots = [{"trade_date": r[0].isoformat(), "cash": float(r[1]), "market_value": float(r[2]), "total_value": float(r[3]),
@@ -5352,7 +5363,7 @@ def portfolio_assessments(job_id: int, symbol: str | None = None, sim_date: date
                     f"current_price, buy_price, stop_price, target_price, is_buy, note FROM {PASSESS_TABLE} WHERE {' AND '.join(where)} "
                     f"ORDER BY assessment_id DESC", tuple(params))
         rows = [{"assessment_id": r[0], "sim_date": r[1].isoformat(), "symbol": r[2], "skill_id": r[3], "phase": r[4], "mode": r[5],
-                 "decision_id": r[6], "recommendation": r[7], "current_price": _fnum(r[8]), "buy_price": _fnum(r[9]), "stop_price": _fnum(r[10]),
+                 "decision_id": r[6], "recommendation": norm_rec(r[7]), "current_price": _fnum(r[8]), "buy_price": _fnum(r[9]), "stop_price": _fnum(r[10]),
                  "target_price": _fnum(r[11]), "is_buy": bool(r[12]), "note": r[13]} for r in cur.fetchall()]
         return {"job_id": job_id, "assessments": rows}
     finally:
@@ -5374,7 +5385,7 @@ def _agents_fallback(cur, job_id: int, day: date, symbol: str) -> dict:
                     f"WHERE job_id = %s AND symbol = %s AND skill_id = %s AND decision_id IS NOT NULL AND mode <> 'failed' AND sim_date <= %s "
                     f"ORDER BY sim_date DESC, assessment_id DESC", (job_id, symbol, sk, day))
         r = cur.fetchone()
-        out[sk] = None if not r else _agent_snapshot({"sim_date": r[0], "recommendation": r[1], "buy_price": _fnum(r[2]), "stop_price": _fnum(r[3]),
+        out[sk] = None if not r else _agent_snapshot({"sim_date": r[0], "recommendation": norm_rec(r[1]), "buy_price": _fnum(r[2]), "stop_price": _fnum(r[3]),
                                                        "target_price": _fnum(r[4]), "decision_id": r[5], "mode": r[6]}, day)
     return out
 
@@ -5422,7 +5433,7 @@ def portfolio_day(job_id: int, day: date):
         for r in cur.fetchall():
             model_call = r[14] is not None and r[17] is None and bool(r[15] or r[16])
             runs.append({"assessment_id": r[0], "symbol": r[1], "skill_id": r[2], "phase": r[3], "mode": r[4], "decision_id": r[5],
-                         "recommendation": r[6], "current_price": _fnum(r[7]), "buy_price": _fnum(r[8]), "stop_price": _fnum(r[9]),
+                         "recommendation": norm_rec(r[6]), "current_price": _fnum(r[7]), "buy_price": _fnum(r[8]), "stop_price": _fnum(r[9]),
                          "target_price": _fnum(r[10]), "is_buy": bool(r[11]), "note": r[12], "run_date": r[13].isoformat(),
                          "model": r[14], "input_tokens": r[15], "output_tokens": r[16], "reused_from_id": r[17], "close": _fnum(r[18]),
                          "model_call": model_call,
