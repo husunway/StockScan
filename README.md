@@ -214,6 +214,20 @@ price, and when each assessment was run, fresh or cached. Clicking a ticker filt
 and the transactions export to CSV. Data comes from `GET /api/py/portfolio/{id}/day/{date}`. Each trade stores
 `trigger_type`, `agents_json` and `cost_basis`; trades from earlier runs fall back to the assessments table.
 
+**Reusing analyses.** Every completed decision records its skill version and the configured model. Before any
+model call, in the portfolio backtest, the S&P 500 scan or the weekly backtest, the server looks for a completed
+analysis by the same agent, of the same stock, as of the same date, with the same skill version and model, from
+any earlier run. If one exists, its result and reports are copied into the current run (`reused_from_id` points
+at the original) and no model call is made. Failed runs are never reused. Decisions saved before this change
+have no recorded model, so they match only when the model name the provider returned equals `ANTHROPIC_MODEL`.
+
+**Close price and AI cost.** The day panel's agent activity table shows each run's decision price (the previous
+close), the day's close, and an estimated cost. Cost = input tokens × input price + output tokens × output price,
+using `data/ai_pricing.json` (Anthropic list prices per million tokens, which Microsoft Foundry also charges;
+override with `AI_PRICING_JSON`). Reused, cached and skipped assessments cost nothing. The day panel shows the
+day's total by agent, the calendar tooltip shows each day's cost, and the run shows a running total. All
+costs are estimates, not the provider's invoice.
+
 **Tests.** `npm test` runs the form rules (`tests/portfolio-fields.test.mjs`, Node 23.6 or later), and
 `python tests/test_portfolio_fields.py` runs the same cases against the API, including a check that every
 default passes its own validation.

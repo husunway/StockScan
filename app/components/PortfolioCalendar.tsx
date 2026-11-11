@@ -9,6 +9,7 @@ type TradeDay = { trade_date: string; symbol: string; side: "BUY" | "SELL"; coun
 export type CalendarJob = {
   job_id: number; status: string; start_date: string; end_date: string; days: string[]; backtests: Record<string, number>;
   config: { starting_capital: number }; snapshots: Snapshot[]; trade_days: TradeDay[];
+  ai_costs?: { trade_date: string; cost: number; calls: number }[]; ai_cost_currency?: string;
 };
 type AgentInfo = {
   buy_price: number | null; target_price: number | null; stop_price: number | null; recommendation: string | null;
@@ -23,12 +24,18 @@ type DayRun = {
   assessment_id: number; symbol: string; skill_id: string; phase: string; mode: string; decision_id: number | null; recommendation: string | null;
   current_price: number | null; buy_price: number | null; stop_price: number | null; target_price: number | null; is_buy: boolean;
   note: string | null; run_date: string;
+  close: number | null; model: string | null; input_tokens: number | null; output_tokens: number | null;
+  reused_from_id: number | null; model_call: boolean; est_cost: number | null;
+};
+type AiCost = {
+  total: number; calls: number; reused: number; currency: string; prices_as_of: string | null; unpriced: boolean;
+  by_agent: Record<string, { cost: number; calls: number; reused: number }>;
 };
 type DayDetail = {
   date: string; trading: boolean; simulated: boolean; backtests?: Record<string, number>;
   summary?: { start_value: number; end_value: number; change: number; change_pct: number | null; cash: number; market_value: number;
     positions: number; buys: number; sells: number; realized_pnl: number; realized_to_date: number };
-  trades?: DayTrade[]; assessments?: DayRun[];
+  trades?: DayTrade[]; assessments?: DayRun[]; ai_cost?: AiCost;
 };
 
 const AGENTS = [["warren-buffett", "Buffett"], ["jamie-dimon", "Dimon"], ["john-murphy", "Murphy"]] as const;
@@ -45,6 +52,7 @@ const money = (v: number | null | undefined, nd = 2) => (v === null || v === und
 const signed = (v: number | null | undefined, nd = 2) => (v === null || v === undefined ? "—" : `${v >= 0 ? "+" : "−"}${money(Math.abs(v), nd)}`);
 const pct = (v: number | null | undefined, nd = 2) => (v === null || v === undefined ? "—" : `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(nd)}%`);
 const tone = (v: number | null | undefined) => (!v ? "" : v > 0 ? "pos" : "neg");
+const usd = (v: number | null | undefined, cur = "USD") => (v === null || v === undefined ? "—" : `${cur === "USD" ? "US$" : `${cur} `}${v.toFixed(v < 1 ? 4 : 2)}`);
 function compact(v: number): string {
   const a = Math.abs(v);
   const s = a >= 1e6 ? `${(a / 1e6).toFixed(2)}M` : a >= 1e3 ? `${(a / 1e3).toFixed(1)}K` : a.toFixed(0);
@@ -122,6 +130,8 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
     return map;
   }, [job.trade_days, filter]);
   const tickers = useMemo(() => [...new Set(job.trade_days.map((t) => t.symbol))].sort(), [job.trade_days]);
+  const costByDay = useMemo(() => new Map((job.ai_costs ?? []).map((c) => [c.trade_date, c])), [job.ai_costs]);
+  const currency = job.ai_cost_currency ?? "USD";
 
   // Open on the latest simulated month and follow the simulation until the user navigates.
   const lastSnap = job.snapshots.length ? job.snapshots[job.snapshots.length - 1].trade_date : job.start_date;
@@ -201,11 +211,13 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
             const trading = tradingDays.has(date);
             const st = dayStats.get(date);
             const c = counts.get(date);
+            const ai = costByDay.get(date);
             const cls = !inRange(date) ? "out" : !trading ? "closed" : !st ? "pending" : heat(st.pct);
             return (
               <button type="button" key={date} className={`pcal-cell ${cls} ${selected === date ? "sel" : ""}`} onClick={() => setSelected(date)}
                 title={!inRange(date) ? `${date}: outside the backtest range` : !trading ? `${date}: market closed` : !st ? `${date}: not simulated yet`
-                  : `${date}: ${signed(st.change)} (${pct(st.pct)}), total ${money(st.total, 0)}${c ? ` · ${c.buys} buy(s), ${c.sells} sell(s)` : ""}`}>
+                  : `${date}: ${signed(st.change)} (${pct(st.pct)}), total ${money(st.total, 0)}${c ? ` · ${c.buys} buy(s), ${c.sells} sell(s)` : ""}`
+                    + ` · est. AI cost ${usd(ai?.cost ?? 0, currency)} (${ai?.calls ?? 0} model call${ai?.calls === 1 ? "" : "s"})`}>
                 <span className="pcal-day">{day}</span>
                 {c && (c.buys > 0 || c.sells > 0) && (
                   <span className="pcal-marks">
@@ -255,6 +267,17 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
                 <div><span className="stat-label">Buys / sells</span><strong>{detail.summary.buys} / {detail.summary.sells}</strong></div>
                 <div><span className="stat-label">Realized P&amp;L (day)</span><strong className={tone(detail.summary.realized_pnl)}>{signed(detail.summary.realized_pnl)}</strong></div>
               </div>
+              {detail.ai_cost && (
+                <div className="pcal-cost" title={`Estimate: tokens × configured list prices${detail.ai_cost.prices_as_of ? ` (as of ${detail.ai_cost.prices_as_of})` : ""}; not the provider's invoice`}>
+                  <span className="stat-label">Estimated AI cost (day)</span>
+                  <strong>{usd(detail.ai_cost.total, detail.ai_cost.currency)}</strong>
+                  <span className="tile-note">
+                    {detail.ai_cost.calls} model call{detail.ai_cost.calls === 1 ? "" : "s"}{detail.ai_cost.reused ? ` · ${detail.ai_cost.reused} reused (no cost)` : ""}
+                    {AGENTS.filter(([k]) => detail.ai_cost!.by_agent[k]).map(([k, n]) => ` · ${n} ${usd(detail.ai_cost!.by_agent[k].cost, detail.ai_cost!.currency)}`).join("")}
+                    {detail.ai_cost.unpriced && " · some calls use a model with no configured price"}
+                  </span>
+                </div>
+              )}
 
               <div className="pcal-subhead">
                 <h4>Transactions {filter ? `— ${filter}` : ""} ({rowsShown.length})</h4>
@@ -286,7 +309,7 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
                 {runsShown.length === 0 ? <p className="msg">No agent runs.</p> : (
                   <div className="table-wrap">
                     <table className="table compact">
-                      <thead><tr><th>Ticker</th><th>Agent</th><th className="num">Buy price</th><th className="num">Target</th><th>Decision</th><th>Status</th></tr></thead>
+                      <thead><tr><th>Ticker</th><th>Agent</th><th className="num" title="Previous close: the price the agent decided on">Decision price</th><th className="num" title="This day's closing price">Close</th><th className="num">Buy price</th><th className="num">Target</th><th>Decision</th><th>Status</th><th className="num">Est. cost</th></tr></thead>
                       <tbody>
                         {runsShown.map((r) => {
                           const name = AGENTS.find(([k]) => k === r.skill_id)?.[1] ?? r.skill_id;
@@ -295,9 +318,11 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
                             <tr key={r.assessment_id} className={r.mode === "failed" ? "row-failed" : ""} title={r.note ?? ""}>
                               <td><strong>{r.symbol}</strong></td>
                               <td>{href ? <Link href={href}>{name}</Link> : name}</td>
+                              <td className="num">{money(r.current_price)}</td><td className="num">{money(r.close)}</td>
                               <td className="num">{money(r.buy_price)}</td><td className="num">{money(r.target_price)}</td>
                               <td>{r.is_buy ? <strong className="pos">BUY</strong> : <span className="dim">NOT BUY</span>}{r.recommendation ? <span className="tile-note"> ({r.recommendation})</span> : null}</td>
-                              <td>{MODE_LABEL[r.mode] ?? r.mode}{r.mode === "cached" || r.mode === "skipped" ? <span className="tile-note"> from {r.run_date}</span> : null}{r.phase === "sell" ? <span className="tile-note"> · sell check</span> : null}</td>
+                              <td>{MODE_LABEL[r.mode] ?? r.mode}{r.reused_from_id ? <span className="agent-tag">reused from #{r.reused_from_id}</span> : null}{r.mode === "cached" || r.mode === "skipped" ? <span className="tile-note"> from {r.run_date}</span> : null}{r.phase === "sell" ? <span className="tile-note"> · sell check</span> : null}</td>
+                              <td className="num" title={r.model_call ? `${r.model ?? "?"}: ${r.input_tokens ?? 0} input + ${r.output_tokens ?? 0} output tokens` : "no model call"}>{r.model_call ? usd(r.est_cost, currency) : usd(0, currency)}</td>
                             </tr>
                           );
                         })}

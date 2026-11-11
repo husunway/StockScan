@@ -1228,6 +1228,11 @@ IF COL_LENGTH('{DECISIONS_TABLE}', 'report_html_pathname') IS NULL ALTER TABLE {
 IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UQ_agent_decisions') ALTER TABLE {DECISIONS_TABLE} DROP CONSTRAINT UQ_agent_decisions;
 IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UQ_agent_decisions_sym') ALTER TABLE {DECISIONS_TABLE} ADD CONSTRAINT UQ_agent_decisions_sym UNIQUE (backtest_id, symbol, as_of_date);
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'status') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD status NVARCHAR(10) NOT NULL CONSTRAINT DF_agent_backtests_status DEFAULT 'active';
+IF COL_LENGTH('{DECISIONS_TABLE}', 'skill_version') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD skill_version NVARCHAR(20) NULL;
+IF COL_LENGTH('{DECISIONS_TABLE}', 'model_requested') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD model_requested NVARCHAR(100) NULL;
+IF COL_LENGTH('{DECISIONS_TABLE}', 'reused_from_id') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD reused_from_id INT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_reuse')
+CREATE INDEX IX_agent_decisions_reuse ON {DECISIONS_TABLE} (skill_id, symbol, as_of_date, status);
 """
 DECISION_STATUSES = ("pending", "running", "done", "failed", "cancelled")
 
@@ -1237,12 +1242,32 @@ DECISION_COLUMNS = (
     "intrinsic_value_high", "margin_of_safety_pct", "headline", "summary", "warnings_json", "model",
     "input_tokens", "output_tokens", "error", "started_at", "finished_at",
     "references_json", "report_pathname", "report_url", "log_json", "report_html_pathname",
+    "reused_from_id", "skill_version", "model_requested",
 )
 STATEMENT_NAMES = {"income": "Income statement", "balance": "Balance sheet", "cashflow": "Cash flow statement"}
 
 
+_BACKTEST_TABLES_READY = False
+
+
 def ensure_backtest_tables(cur) -> None:
     cur.execute(ENSURE_BACKTEST_TABLES_SQL)
+
+
+def _commit_cursor(cur) -> bool:
+    conn = getattr(cur, "connection", None)
+    if conn is None:
+        return False
+    conn.commit()
+    return True
+
+
+def ensure_backtest_tables_once(cur) -> None:
+    """Readers select the newest decision columns; make sure they exist (committed) once per server process."""
+    global _BACKTEST_TABLES_READY
+    if not _BACKTEST_TABLES_READY:
+        ensure_backtest_tables(cur)
+        _BACKTEST_TABLES_READY = _commit_cursor(cur)
 
 
 # ---------------------------------------------------------------------------
@@ -2102,6 +2127,7 @@ def _backtest_status(cur, backtest_id: int) -> str:
 
 
 def _decisions(cur, backtest_id: int) -> list[dict]:
+    ensure_backtest_tables_once(cur)
     cur.execute(
         f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE backtest_id = %s ORDER BY as_of_date",
         (backtest_id,),
@@ -2395,6 +2421,7 @@ def get_decision(backtest_id: int, decision_id: int):
     conn = db_connect()
     try:
         cur = conn.cursor()
+        ensure_backtest_tables_once(cur)
         cur.execute(
             f"SELECT {', '.join(DECISION_COLUMNS)}, input_json, output_json FROM {DECISIONS_TABLE} "
             f"WHERE backtest_id = %s AND decision_id = %s",
@@ -2411,9 +2438,68 @@ def get_decision(backtest_id: int, decision_id: int):
         conn.close()
 
 
+REUSE_COPY_COLUMNS = (
+    "recommendation", "conviction", "current_price", "buy_below_price", "target_price", "stop_price", "intrinsic_value_low",
+    "intrinsic_value_base", "intrinsic_value_high", "margin_of_safety_pct", "headline", "summary", "input_json", "output_json",
+    "warnings_json", "model", "references_json", "report_pathname", "report_url", "report_html_pathname", "skill_version", "model_requested",
+)
+
+
+def requested_model() -> str:
+    return os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+
+
+def find_reusable_decision(skill: dict, symbol: str, as_of: date, exclude_id: int | None = None) -> dict | None:
+    """A completed analysis by the same agent, of the same stock, as of the same date, from the same skill version and model,
+    in any earlier run. Copies are never sources; failed runs never match."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT TOP 1 d.decision_id, d.backtest_id, d.finished_at FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
+            f"WHERE d.skill_id = %s AND d.symbol = %s AND d.as_of_date = %s AND d.status = 'done' AND d.reused_from_id IS NULL "
+            f"AND d.decision_id <> %s AND COALESCE(d.skill_version, b.skill_version, '') = %s AND COALESCE(d.model_requested, d.model, '') = %s "
+            f"ORDER BY d.decision_id DESC",
+            (skill["id"], symbol, as_of, exclude_id or 0, skill.get("version") or "", requested_model()))
+        r = cur.fetchone()
+    finally:
+        conn.close()
+    return None if not r else {"decision_id": r[0], "backtest_id": r[1], "finished_at": r[2].isoformat() if r[2] else None}
+
+
+def reuse_decision(decision_id: int, source: dict, log: "RunLog") -> dict:
+    """Fill the claimed decision row from the stored source: no model call, no data loading. Tokens are zero on the copy, so
+    cost is counted once, on the original. Reports point at the original's stored files."""
+    log.add(f"Reusing stored analysis: decision #{source['decision_id']} (backtest #{source['backtest_id']}, run {str(source.get('finished_at'))[:19]}) "
+            f"- same agent, stock, date, skill version and model; no model call")
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        sets = ", ".join(f"t.{c} = s.{c}" for c in REUSE_COPY_COLUMNS)
+        cur.execute(
+            f"UPDATE t SET {sets}, t.status = 'done', t.error = NULL, t.input_tokens = 0, t.output_tokens = 0, t.reused_from_id = s.decision_id, "
+            f"t.started_at = COALESCE(t.started_at, SYSUTCDATETIME()), t.finished_at = SYSUTCDATETIME(), t.log_json = %s "
+            f"FROM {DECISIONS_TABLE} t JOIN {DECISIONS_TABLE} s ON s.decision_id = %s WHERE t.decision_id = %s",
+            (json.dumps(log.entries), source["decision_id"], decision_id))
+        conn.commit()
+        cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
+        return _decision_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def try_reuse_decision(decision_id: int, skill: dict, symbol: str, as_of: date, log: "RunLog") -> dict | None:
+    source = find_reusable_decision(skill, symbol, as_of, exclude_id=decision_id)
+    return reuse_decision(decision_id, source, log) if source else None
+
+
 def execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: str, as_of: date, raw: dict, prices_df, log: "RunLog") -> dict:
     """Run one claimed decision end to end: point-in-time data -> model -> validation -> PDF/HTML/Blob -> persist.
-    Shared by the weekly backtest and the S&P 500 scan."""
+    Shared by the weekly backtest, the S&P 500 scan and the portfolio backtest. A stored analysis with the same agent, stock,
+    date, skill version and model is reused instead of calling the model again."""
+    reused = try_reuse_decision(decision_id, skill, symbol, as_of, log)
+    if reused:
+        return reused
     skill_id = skill["id"]
     log.add(f"Skill: {skill['path']} v{skill.get('version') or '-'}; statements from backtest #{backtest_id} "
             f"(fetched {raw.get('fetched_at', '')[:19]})")
@@ -2503,6 +2589,8 @@ def execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: st
                                             "message": "Decision saved"}]),
                  decision_id),
             )
+        cur.execute(f"UPDATE {DECISIONS_TABLE} SET skill_version = %s, model_requested = %s WHERE decision_id = %s",
+                    (skill.get("version"), requested_model(), decision_id))
         conn.commit()
         cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
         decision = _decision_dict(cur.fetchone())
@@ -4196,6 +4284,7 @@ def scan_step(job_id: int):
     conn = db_connect()
     try:
         cur = conn.cursor()
+        ensure_backtest_tables_once(cur)
         cur.execute(f"SELECT status, backtests FROM {SCAN_JOB_TABLE} WHERE job_id = %s", (job_id,))
         row = cur.fetchone()
         if not row:
@@ -4225,17 +4314,22 @@ def scan_step(job_id: int):
     finally:
         conn.close()
 
-    # Data for the stage: TECH tables for Murphy; the stored fundamentals bundle (downloaded once per symbol) for the others.
-    raw = {"symbol": symbol, "data_source": "tech"}
-    if skill.get("data_source") != "tech":
-        bundle = load_symbol_bundle(symbol, log=log)
-        raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
     dlog = RunLog(DECISIONS_TABLE, "decision_id", decision_id)
     dlog.entries = list(log.entries)
-    decision = execute_decision(bt_id, decision_id, skill, symbol, as_of, raw, prices_df, dlog)
+    decision = try_reuse_decision(decision_id, skill, symbol, as_of, dlog)
+    if decision is None:
+        # Data for the stage: TECH tables for Murphy; the stored fundamentals bundle (downloaded once per symbol) for the others.
+        raw = {"symbol": symbol, "data_source": "tech"}
+        if skill.get("data_source") != "tech":
+            bundle = load_symbol_bundle(symbol, log=dlog)
+            raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
+        decision = execute_decision(bt_id, decision_id, skill, symbol, as_of, raw, prices_df, dlog)
+    else:
+        dlog.add(f"{as_of} {symbol}: {skill['name']} reused stored decision #{decision['reused_from_id']} (no model call)")
     log.entries = dlog.entries
 
-    update = {"ai_calls": (ai_calls or 0) + 1, f"{stage}_decision_id": decision_id, "updated_at": datetime.now(timezone.utc)}
+    update = {"ai_calls": (ai_calls or 0) + (0 if decision.get("reused_from_id") else 1), f"{stage}_decision_id": decision_id,
+              "updated_at": datetime.now(timezone.utc)}
     rec = decision.get("recommendation")
     if decision["status"] != "done":
         update.update({"status": "failed", "reason": f"{skill['name']}: {decision.get('error') or 'failed'}"})
@@ -4372,6 +4466,7 @@ CREATE TABLE {PJOB_TABLE} (
     cash DECIMAL(18,2) NOT NULL, realized_pnl DECIMAL(18,2) NOT NULL CONSTRAINT DF_pjob_real DEFAULT 0,
     ai_calls INT NOT NULL CONSTRAINT DF_pjob_calls DEFAULT 0, failed_calls INT NOT NULL CONSTRAINT DF_pjob_failed DEFAULT 0,
     locked_at DATETIME2 NULL, log_json NVARCHAR(MAX) NULL);
+IF COL_LENGTH('{PJOB_TABLE}', 'reused_calls') IS NULL ALTER TABLE {PJOB_TABLE} ADD reused_calls INT NOT NULL CONSTRAINT DF_pjob_reused DEFAULT 0;
 IF OBJECT_ID('{PASSESS_TABLE}', 'U') IS NULL
 CREATE TABLE {PASSESS_TABLE} (
     assessment_id INT IDENTITY(1,1) PRIMARY KEY, job_id INT NOT NULL, sim_date DATE NOT NULL, symbol NVARCHAR(20) NOT NULL,
@@ -4400,6 +4495,40 @@ IF COL_LENGTH('{PTRADE_TABLE}', 'agents_json') IS NULL ALTER TABLE {PTRADE_TABLE
 IF COL_LENGTH('{PTRADE_TABLE}', 'cost_basis') IS NULL ALTER TABLE {PTRADE_TABLE} ADD cost_basis DECIMAL(18,2) NULL;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PTRADE_job_date') CREATE INDEX IX_PTRADE_job_date ON {PTRADE_TABLE} (job_id, trade_date);
 """
+
+
+AI_PRICING_PATH = Path(__file__).resolve().parent.parent / "data" / "ai_pricing.json"
+
+
+def ai_pricing() -> dict:
+    """Per-model token prices (per million tokens) from data/ai_pricing.json; AI_PRICING_JSON overrides the model table."""
+    cfg = json.loads(AI_PRICING_PATH.read_text(encoding="utf-8"))
+    override = os.environ.get("AI_PRICING_JSON")
+    if override:
+        try:
+            cfg["models"] = {**cfg["models"], **json.loads(override)}
+            cfg["source"] = "AI_PRICING_JSON"
+        except ValueError:
+            pass
+    return cfg
+
+
+def price_for_model(model: str | None, pricing: dict) -> dict | None:
+    """Longest configured model id contained in the reported model name (so 'claude-sonnet-5-5' wins over 'claude-sonnet-5')."""
+    name = (model or "").lower()
+    for key in sorted(pricing["models"], key=len, reverse=True):
+        if key.lower() in name:
+            return pricing["models"][key]
+    return None
+
+
+def estimate_cost(model: str | None, input_tokens, output_tokens, pricing: dict) -> float | None:
+    if not input_tokens and not output_tokens:
+        return 0.0
+    p = price_for_model(model, pricing) or price_for_model(requested_model(), pricing)
+    if not p:
+        return None
+    return ((input_tokens or 0) * p["input"] + (output_tokens or 0) * p["output"]) / 1_000_000
 
 
 PORTFOLIO_FIELDS_PATH = Path(__file__).resolve().parent.parent / "data" / "portfolio_fields.json"
@@ -4541,16 +4670,28 @@ def _portfolio_backtests(cur, job_id: int, year: int) -> dict:
     return out
 
 
+_PORTFOLIO_TABLES_READY = False
+
+
+def _ensure_portfolio_once(cur) -> None:
+    global _PORTFOLIO_TABLES_READY
+    if not _PORTFOLIO_TABLES_READY:
+        cur.execute(ENSURE_PORTFOLIO_SQL)
+        ensure_backtest_tables(cur)
+        _PORTFOLIO_TABLES_READY = _commit_cursor(cur)
+
+
 def _pjob(cur, job_id: int) -> dict:
+    _ensure_portfolio_once(cur)
     cur.execute(f"SELECT job_id, created_at, status, start_date, end_date, config, symbols, trading_days, backtests, cursor_json, "
-                f"cash, realized_pnl, ai_calls, failed_calls, locked_at, log_json FROM {PJOB_TABLE} WHERE job_id = %s", (job_id,))
+                f"cash, realized_pnl, ai_calls, failed_calls, locked_at, log_json, reused_calls FROM {PJOB_TABLE} WHERE job_id = %s", (job_id,))
     r = cur.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Portfolio backtest not found")
     return {"job_id": r[0], "created_at": r[1].isoformat(), "status": r[2], "start_date": r[3].isoformat(), "end_date": r[4].isoformat(),
             "config": json.loads(r[5]), "symbols": json.loads(r[6]), "days": json.loads(r[7]), "backtests": json.loads(r[8] or "{}"),
             "cursor": json.loads(r[9]), "cash": float(r[10]), "realized_pnl": float(r[11]), "ai_calls": r[12], "failed_calls": r[13],
-            "locked_at": r[14].isoformat() if r[14] else None, "log": json.loads(r[15] or "[]")}
+            "locked_at": r[14].isoformat() if r[14] else None, "log": json.loads(r[15] or "[]"), "reused_calls": r[16] or 0}
 
 
 def _save_cursor(cur, job: dict) -> None:
@@ -4621,6 +4762,7 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
     conn = db_connect()
     try:
         cur = conn.cursor()
+        ensure_backtest_tables_once(cur)
         cur.execute(f"SELECT decision_id, status FROM {DECISIONS_TABLE} WHERE backtest_id = %s AND symbol = %s AND as_of_date = %s", (bt_id, symbol, day))
         existing = cur.fetchone()
         if existing and existing[1] == "done":
@@ -4647,11 +4789,13 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
         log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} {mode} ({phase} phase) -> decision #{decision_id}; current price {price:.2f}")
         dlog = RunLog(DECISIONS_TABLE, "decision_id", decision_id)
         dlog.add(f"Portfolio backtest #{job['job_id']}: {skill['name']} as of {day} for {symbol} ({mode}, {phase} phase)")
-        raw = {"symbol": symbol, "data_source": "tech"}
-        if skill.get("data_source") != "tech":
-            bundle = load_symbol_bundle(symbol, log=dlog)
-            raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
-        decision = execute_decision(bt_id, decision_id, skill, symbol, day, raw, prices_df, dlog)
+        decision = try_reuse_decision(decision_id, skill, symbol, day, dlog)
+        if decision is None:
+            raw = {"symbol": symbol, "data_source": "tech"}
+            if skill.get("data_source") != "tech":
+                bundle = load_symbol_bundle(symbol, log=dlog)
+                raw = {k: bundle[k] for k in ("symbol", "profile", "statements", "earnings_dates", "fetched_at")}
+            decision = execute_decision(bt_id, decision_id, skill, symbol, day, raw, prices_df, dlog)
 
     rec, bp, sp, tp = decision.get("recommendation"), decision.get("buy_below_price"), decision.get("stop_price"), decision.get("target_price")
     failed = decision["status"] != "done"
@@ -4663,11 +4807,16 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
         a = _record_assessment(cur, job, day, symbol, skill_id, phase, "failed" if failed else mode, price,
                                None if failed else rec, None if failed else bp, None if failed else sp, None if failed else tp,
                                is_buy, note, decision_id=decision["decision_id"])
-        cur.execute(f"UPDATE {PJOB_TABLE} SET ai_calls = ai_calls + 1, failed_calls = failed_calls + %s WHERE job_id = %s", (1 if failed else 0, job["job_id"]))
+        reused = bool(decision.get("reused_from_id"))
+        cur.execute(f"UPDATE {PJOB_TABLE} SET ai_calls = ai_calls + %s, reused_calls = reused_calls + %s, failed_calls = failed_calls + %s WHERE job_id = %s",
+                    (0 if reused else 1, 1 if reused else 0, 1 if failed else 0, job["job_id"]))
         conn.commit()
     finally:
         conn.close()
-    job["ai_calls"] += 1
+    job["ai_calls"] += 0 if reused else 1
+    if reused:
+        log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} reused stored decision #{decision['reused_from_id']} (same agent, stock, date, "
+                f"skill version and model; no model call)")
     if failed:
         log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} FAILED - {note}", "error")
     else:
@@ -5028,6 +5177,19 @@ def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limi
                 f"GROUP BY trade_date, symbol, side ORDER BY trade_date", (job_id,))
     trade_days = [{"trade_date": r[0].isoformat(), "symbol": r[1], "side": r[2].strip(), "count": r[3], "realized_pnl": float(r[4] or 0)}
                   for r in cur.fetchall()]
+    pricing = ai_pricing()
+    cur.execute(f"SELECT a.sim_date, d.model, SUM(COALESCE(d.input_tokens, 0)), SUM(COALESCE(d.output_tokens, 0)), "
+                f"SUM(CASE WHEN d.reused_from_id IS NULL AND (d.input_tokens > 0 OR d.output_tokens > 0) THEN 1 ELSE 0 END) "
+                f"FROM {PASSESS_TABLE} a JOIN {DECISIONS_TABLE} d ON d.decision_id = a.decision_id WHERE a.job_id = %s GROUP BY a.sim_date, d.model", (job_id,))
+    cost_by_day: dict = {}
+    unpriced = False
+    for sim_date, model, tin, tout, calls in cur.fetchall():
+        c_ = estimate_cost(model, tin, tout, pricing)
+        unpriced = unpriced or c_ is None
+        e = cost_by_day.setdefault(sim_date.isoformat(), {"trade_date": sim_date.isoformat(), "cost": 0.0, "calls": 0})
+        e["cost"] += c_ or 0.0
+        e["calls"] += calls or 0
+    ai_costs = [{**v, "cost": round(v["cost"], 4)} for _, v in sorted(cost_by_day.items())]
     total = job["cash"] + mv
     cap = job["config"]["starting_capital"]
     c = job["cursor"]
@@ -5047,7 +5209,9 @@ def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limi
             "return_pct": round((total - cap) / cap * 100, 4),
             "trades": trades, "trade_counts": {"total": n_tr, "buys": n_buy, "sells": n_sell, "wins": n_win,
                                                "win_rate_pct": round(n_win / n_sell * 100, 1) if n_sell else None},
-            "assessment_counts": modes, "assessments": assessments, "snapshots": snapshots, "trade_days": trade_days}
+            "assessment_counts": modes, "assessments": assessments, "snapshots": snapshots, "trade_days": trade_days,
+            "ai_costs": ai_costs, "ai_cost_total": round(sum(v["cost"] for v in ai_costs), 4),
+            "ai_cost_currency": pricing.get("currency", "USD"), "ai_cost_unpriced": unpriced}
 
 
 @app.post("/api/py/portfolio")
@@ -5232,19 +5396,39 @@ def portfolio_day(job_id: int, day: date):
                            "reason": r[6], "realized_pnl": pnl, "realized_pct": round(pnl / cost * 100, 2) if pnl is not None and cost else None,
                            "cash_after": _fnum(r[8], 2), "trigger": r[9] or _trigger_from_reason(side, r[6]), "agents": agents})
         cur.execute(f"SELECT a.assessment_id, a.symbol, a.skill_id, a.phase, a.mode, COALESCE(a.decision_id, s.decision_id), a.recommendation, "
-                    f"a.current_price, a.buy_price, a.stop_price, a.target_price, a.is_buy, a.note, COALESCE(s.sim_date, a.sim_date) "
+                    f"a.current_price, a.buy_price, a.stop_price, a.target_price, a.is_buy, a.note, COALESCE(s.sim_date, a.sim_date), "
+                    f"d.model, d.input_tokens, d.output_tokens, d.reused_from_id, p.[close] "
                     f"FROM {PASSESS_TABLE} a LEFT JOIN {PASSESS_TABLE} s ON s.assessment_id = a.source_assessment_id "
+                    f"LEFT JOIN {DECISIONS_TABLE} d ON d.decision_id = a.decision_id "
+                    f"LEFT JOIN {TABLE} p ON p.symbol = a.symbol AND p.trade_date = a.sim_date "
                     f"WHERE a.job_id = %s AND a.sim_date = %s ORDER BY a.assessment_id", (job_id, day))
-        runs = [{"assessment_id": r[0], "symbol": r[1], "skill_id": r[2], "phase": r[3], "mode": r[4], "decision_id": r[5], "recommendation": r[6],
-                 "current_price": _fnum(r[7]), "buy_price": _fnum(r[8]), "stop_price": _fnum(r[9]), "target_price": _fnum(r[10]),
-                 "is_buy": bool(r[11]), "note": r[12], "run_date": r[13].isoformat()} for r in cur.fetchall()]
+        pricing = ai_pricing()
+        runs = []
+        for r in cur.fetchall():
+            model_call = r[14] is not None and r[17] is None and bool(r[15] or r[16])
+            runs.append({"assessment_id": r[0], "symbol": r[1], "skill_id": r[2], "phase": r[3], "mode": r[4], "decision_id": r[5],
+                         "recommendation": r[6], "current_price": _fnum(r[7]), "buy_price": _fnum(r[8]), "stop_price": _fnum(r[9]),
+                         "target_price": _fnum(r[10]), "is_buy": bool(r[11]), "note": r[12], "run_date": r[13].isoformat(),
+                         "model": r[14], "input_tokens": r[15], "output_tokens": r[16], "reused_from_id": r[17], "close": _fnum(r[18]),
+                         "model_call": model_call,
+                         "est_cost": estimate_cost(r[14], r[15], r[16], pricing) if model_call else 0.0})
+        by_agent = {}
+        for run in runs:
+            e = by_agent.setdefault(run["skill_id"], {"cost": 0.0, "calls": 0, "reused": 0})
+            e["cost"] += run["est_cost"] or 0.0
+            e["calls"] += 1 if run["model_call"] else 0
+            e["reused"] += 1 if run["reused_from_id"] else 0
+        ai_cost = {"total": round(sum(e["cost"] for e in by_agent.values()), 4), "calls": sum(e["calls"] for e in by_agent.values()),
+                   "reused": sum(e["reused"] for e in by_agent.values()), "currency": pricing.get("currency", "USD"),
+                   "prices_as_of": pricing.get("as_of"), "unpriced": any(r["model_call"] and r["est_cost"] is None for r in runs),
+                   "by_agent": {k: {**v, "cost": round(v["cost"], 4)} for k, v in by_agent.items()}}
         return {"job_id": job_id, "date": iso, "trading": True, "simulated": True, "backtests": job["backtests"],
                 "summary": {"start_value": round(start_value, 2), "end_value": round(end_value, 2), "change": round(end_value - start_value, 2),
                             "change_pct": round((end_value - start_value) / start_value * 100, 4) if start_value else None,
                             "cash": float(end[1]), "market_value": float(end[2]), "positions": end[5],
                             "buys": sum(1 for t in trades if t["side"] == "BUY"), "sells": sum(1 for t in trades if t["side"] == "SELL"),
                             "realized_pnl": round(sum(t["realized_pnl"] or 0 for t in trades), 2), "realized_to_date": float(end[4])},
-                "trades": trades, "assessments": runs}
+                "trades": trades, "assessments": runs, "ai_cost": ai_cost}
     finally:
         conn.close()
 
@@ -5279,6 +5463,7 @@ def portfolio_step(job_id: int):
     conn = db_connect()
     try:
         cur = conn.cursor()
+        _ensure_portfolio_once(cur)
         cur.execute(f"UPDATE {PJOB_TABLE} SET locked_at = SYSUTCDATETIME() OUTPUT inserted.job_id WHERE job_id = %s AND status = 'active' "
                     f"AND (locked_at IS NULL OR locked_at < DATEADD(minute, -{PJOB_LOCK_MINUTES}, SYSUTCDATETIME()))", (job_id,))
         claimed = cur.fetchone()

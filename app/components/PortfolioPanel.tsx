@@ -34,6 +34,8 @@ type State = {
   trades: Trade[]; trade_counts: { total: number; buys: number; sells: number; wins: number; win_rate_pct: number | null };
   assessment_counts: Record<string, number>; assessments: Assessment[]; snapshots: Snapshot[]; log?: LogEntry[];
   trade_days: { trade_date: string; symbol: string; side: "BUY" | "SELL"; count: number; realized_pnl: number }[];
+  ai_costs: { trade_date: string; cost: number; calls: number }[]; ai_cost_total: number; ai_cost_currency: string; ai_cost_unpriced: boolean;
+  reused_calls: number;
 };
 type StepResult = { done: boolean; stopped: boolean; busy: boolean; model_call?: boolean; day_done?: boolean; state: State | null; log: LogEntry[] };
 type SymbolInfo = { symbol: string; name: string | null; ready: boolean; price_last: string | null; tech_fresh: boolean; bundle_fetched_at: string | null };
@@ -67,6 +69,11 @@ function NumField({ spec, label, value, error, disabled, onChange, onBlur }: {
       {error && <span className="field-error" id={`${id}-err`} role="alert">{error}</span>}
     </label>
   );
+}
+
+function aiCost(job: { ai_cost_total?: number; ai_cost_currency?: string }): string {
+  const cur = job.ai_cost_currency ?? "USD";
+  return `${cur === "USD" ? "US$" : `${cur} `}${(job.ai_cost_total ?? 0).toFixed(2)}`;
 }
 
 function Pill({ rec }: { rec: string | null }) {
@@ -282,6 +289,7 @@ export default function PortfolioPanel() {
             <div className={`tile ${job.total_value >= cap ? "tone-good" : "tone-bad"}`}><span className="stat-label">Total portfolio value</span><span className="tile-value">{money(job.total_value, 0)}</span><span className="tile-note">return {pct(job.return_pct)}</span></div>
             <div className={`tile ${job.realized_pnl > 0 ? "tone-good" : job.realized_pnl < 0 ? "tone-bad" : "tone-neutral"}`}><span className="stat-label">Realized P&amp;L</span><span className="tile-value">{signed(job.realized_pnl, 0)}</span><span className="tile-note">{job.trade_counts.sells} sell(s), {job.trade_counts.wins} profitable</span></div>
             <div className={`tile ${job.unrealized_pnl > 0 ? "tone-good" : job.unrealized_pnl < 0 ? "tone-bad" : "tone-neutral"}`}><span className="stat-label">Unrealized P&amp;L</span><span className="tile-value">{signed(job.unrealized_pnl, 0)}</span><span className="tile-note">on open positions</span></div>
+            <div className="tile tone-neutral"><span className="stat-label">Estimated AI cost</span><span className="tile-value">{aiCost(job)}</span><span className="tile-note">{job.ai_calls.toLocaleString()} model call(s){job.reused_calls ? `, ${job.reused_calls} reused at no cost` : ""}{job.ai_cost_unpriced ? " · some models unpriced" : ""}</span></div>
             <div className="tile tone-neutral"><span className="stat-label">Agent runs</span><span className="tile-value">{job.ai_calls.toLocaleString()}</span><span className="tile-note">
               {["run", "rerun", "reassess", "cached", "skipped", "failed"].filter((m) => job.assessment_counts[m]).map((m) => `${m} ${job.assessment_counts[m]}`).join(" · ") || "none yet"}
             </span></div>
@@ -296,7 +304,8 @@ export default function PortfolioPanel() {
                 <div className="stat"><span className="stat-label">Trades</span><span className="stat-value">{job.trade_counts.total} ({job.trade_counts.buys} buys, {job.trade_counts.sells} sells)</span></div>
                 <div className="stat"><span className="stat-label">Win rate</span><span className="stat-value">{job.trade_counts.win_rate_pct === null ? "— (no sells)" : `${job.trade_counts.win_rate_pct}%`}</span></div>
                 <div className="stat"><span className="stat-label">Realized / unrealized</span><span className="stat-value">{signed(job.realized_pnl, 0)} / {signed(job.unrealized_pnl, 0)}</span></div>
-                <div className="stat"><span className="stat-label">Model calls</span><span className="stat-value">{job.ai_calls}{job.failed_calls ? ` (${job.failed_calls} failed)` : ""}</span></div>
+                <div className="stat"><span className="stat-label">Model calls</span><span className="stat-value">{job.ai_calls}{job.failed_calls ? ` (${job.failed_calls} failed)` : ""}{job.reused_calls ? `, ${job.reused_calls} reused` : ""}</span></div>
+                <div className="stat"><span className="stat-label">Estimated AI cost</span><span className="stat-value">{aiCost(job)}</span></div>
               </div>
             </div>
           )}
