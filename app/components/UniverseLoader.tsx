@@ -21,6 +21,7 @@ type Universe = {
   index: string;
   index_label: string;
   list_table: string;
+  last_closed_session?: string;
   items: Constituent[];
   summary: { total: number; ready: number; stale: number; missing: number };
   list_updated_at: string | null;
@@ -232,7 +233,7 @@ export default function UniverseLoader() {
           <span className="stat-value small">{universe ? `${universe.summary.total} constituents` : "—"}</span>
           <span className="tile-note">{universe?.list_source ? `${universe.list_table} · ${universe.list_source} · updated ${when(universe.list_updated_at)}` : universe?.list_table ?? ""}</span>
         </div>
-        <div className="stat"><span className="stat-label">Ready</span><span className="stat-value" style={{ color: "#0ca30c" }}>{universe?.summary.ready ?? "—"}</span><span className="tile-note">prices and technical data current</span></div>
+        <div className="stat"><span className="stat-label">Ready</span><span className="stat-value" style={{ color: "#0ca30c" }}>{universe?.summary.ready ?? "—"}</span><span className="tile-note">{universe?.last_closed_session ? `prices to ${universe.last_closed_session} and technical data current` : "prices and technical data current"}</span></div>
         <div className="stat"><span className="stat-label">Stale</span><span className="stat-value" style={{ color: "#c98500" }}>{universe?.summary.stale ?? "—"}</span><span className="tile-note">prices stored, update needed</span></div>
         <div className="stat"><span className="stat-label">Missing</span><span className="stat-value" style={{ color: "var(--muted)" }}>{universe?.summary.missing ?? "—"}</span><span className="tile-note">nothing stored yet</span></div>
       </div>

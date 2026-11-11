@@ -110,8 +110,31 @@ def normalize_symbol(raw: str) -> str:
     return symbol
 
 
+# Days a catch-up may lag the last closed session before an empty Yahoo response counts as a failure
+# (covers long weekends and exchange holidays, which last_closed_session does not know about).
+CATCHUP_GRACE_DAYS = 4
+
+
+def last_closed_session(now: "datetime | None" = None) -> date:
+    """The most recent US weekday whose regular session has closed (16:30 New York time, a little after the
+    close so Yahoo has the final bar). Exchange holidays are not modelled; CATCHUP_GRACE_DAYS absorbs them."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        ny = now.astimezone(ZoneInfo("America/New_York"))
+    except Exception:  # noqa: BLE001 - no tz database: assume EST
+        ny = now.astimezone(timezone(timedelta(hours=-5)))
+    d = ny.date()
+    if ny.hour * 60 + ny.minute < 16 * 60 + 30:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
 def fetch_history(symbol: str, start: "date | None" = None) -> list[PriceRow]:
-    """Daily bars from Yahoo Finance: the default two-year window, or from `start` onward for delta loads."""
+    """Daily bars from Yahoo Finance: the default two-year window, or from `start` onward for delta loads.
+    A bar for a session that has not closed yet (an intraday price) is dropped, so it is never stored as a close."""
     import yfinance as yf
 
     kwargs = {"start": start.isoformat()} if start else {"period": HISTORY_PERIOD}
@@ -124,10 +147,11 @@ def fetch_history(symbol: str, start: "date | None" = None) -> list[PriceRow]:
     def num(v):
         return None if v is None or v != v else float(v)  # NaN check
 
+    closed = last_closed_session()
     rows: list[PriceRow] = []
     for ts, r in df.iterrows():
         close = num(r.get("Close"))
-        if close is None:
+        if close is None or ts.date() > closed:
             continue
         vol = r.get("Volume")
         rows.append(
@@ -3846,6 +3870,7 @@ def universe_state(cur, index: str = DEFAULT_INDEX) -> list[dict]:
     cur.execute(ENSURE_TECH_SQL)
     cur.execute(ENSURE_TABLE_SQL)
     seed_universe_if_empty(cur, spec["key"])
+    expected = last_closed_session()
     cur.execute(
         f"SELECT u.symbol, u.name, u.sector, u.sub_industry, u.source, u.updated_at, "
         f"p.cnt, p.first_date, p.last_date, t.computed_at, t.last_trade_date, t.price_rows "
@@ -3861,9 +3886,18 @@ def universe_state(cur, index: str = DEFAULT_INDEX) -> list[dict]:
         out.append({"symbol": symbol, "name": name, "sector": sector, "sub_industry": sub,
                     "price_rows": cnt or 0, "price_first": first.isoformat() if first else None, "price_last": last.isoformat() if last else None,
                     "tech_computed_at": computed.isoformat() if computed else None, "tech_last": tech_last.isoformat() if tech_last else None,
-                    "tech_fresh": tech_fresh,
-                    "state": "ready" if (cnt and tech_fresh) else "stale" if cnt else "missing"})
+                    "tech_fresh": tech_fresh, "prices_current": bool(last and last >= expected),
+                    "state": universe_item_state(cnt, last, tech_last, expected)})
     return out
+
+
+def universe_item_state(price_rows, price_last, tech_last, expected: date) -> str:
+    """ready = prices reach the last closed session and TECH covers them; stale = stored but behind; missing = no prices."""
+    if not price_rows:
+        return "missing"
+    if price_last and price_last >= expected and tech_last and tech_last >= price_last:
+        return "ready"
+    return "stale"
 
 
 def update_prices_delta(symbol: str) -> dict:
@@ -3880,20 +3914,31 @@ def update_prices_delta(symbol: str) -> dict:
         rows = fetch_history(symbol)
         save_prices(symbol, rows)
         return {"action": "full", "added": len(rows), "last_date": rows[-1].trade_date.isoformat()}
-    start = last + timedelta(days=1)
-    if start > date.today():
+    expected = last_closed_session()
+    if last >= expected:
         return {"action": "skipped", "added": 0, "last_date": last.isoformat()}
+    behind = (expected - last).days
+    # Start at the last stored day, not the day after: it is re-saved, which replaces an intraday bar stored
+    # by an older load during market hours with the final close.
     try:
-        rows = fetch_history(symbol, start=start)
+        rows = fetch_history(symbol, start=last)
     except HTTPException as e:
-        if e.status_code == 404:  # nothing new yet (weekend / holiday)
-            return {"action": "skipped", "added": 0, "last_date": last.isoformat()}
-        raise
-    rows = [r for r in rows if r.trade_date > last]
-    if not rows:
+        if e.status_code != 404:
+            raise
+        rows = []
+    new = [r for r in rows if r.trade_date > last]
+    if not new:
+        if behind > CATCHUP_GRACE_DAYS:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Yahoo Finance returned no prices for {symbol} after {last.isoformat()} although the last closed session is "
+                       f"{expected.isoformat()} ({behind} days behind). The ticker may be wrong or delisted, or Yahoo is rate limiting; retry the job.",
+            )
+        if rows:
+            save_prices(symbol, rows)  # refresh the last stored bar
         return {"action": "skipped", "added": 0, "last_date": last.isoformat()}
     save_prices(symbol, rows)
-    return {"action": "delta", "added": len(rows), "last_date": rows[-1].trade_date.isoformat()}
+    return {"action": "delta", "added": len(new), "last_date": new[-1].trade_date.isoformat()}
 
 
 def _ujob_counts(cur, job_id: int) -> dict:
@@ -3956,7 +4001,7 @@ def universe_list(index: str = DEFAULT_INDEX):
     summary = {"total": len(items), "ready": sum(i["state"] == "ready" for i in items), "stale": sum(i["state"] == "stale" for i in items),
                "missing": sum(i["state"] == "missing" for i in items)}
     return {"index": spec["key"], "index_label": spec["label"], "list_table": spec["table"],
-            "items": items, "summary": summary, "list_updated_at": upd.isoformat() if upd else None, "list_source": source,
+            "last_closed_session": last_closed_session().isoformat(), "items": items, "summary": summary, "list_updated_at": upd.isoformat() if upd else None, "list_source": source,
             "latest_job": {"job_id": last[0], "status": last[1], "created_at": last[2].isoformat()} if last else None}
 
 
