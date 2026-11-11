@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { ModelSelect } from "./RunOptions";
 import { api, DiagnosticsPanel, LiveLog, type Diagnostics, type LogEntry } from "./RunUi";
 
 type Skill = { id: string; name: string; description: string; version: string; data_source?: string };
@@ -147,6 +148,7 @@ export default function BacktestPanel() {
   });
   const [year, setYear] = useState(2026);
   const [weeks, setWeeks] = useState(10);
+  const [model, setModel] = useState("");
   const [known, setKnown] = useState<string[]>([]);
   const [previous, setPrevious] = useState<Previous[]>([]);
   const [bt, setBt] = useState<Backtest | null>(null);
@@ -391,7 +393,7 @@ export default function BacktestPanel() {
       const created = await api<Backtest>("/api/py/agent/backtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skill: skillId, symbol: s, year, weeks }),
+        body: JSON.stringify({ skill: skillId, symbol: s, year, weeks, model: model || null }),
       });
       setBt(created);
       setCreating(false);
@@ -455,6 +457,7 @@ export default function BacktestPanel() {
             {WEEK_OPTIONS.map((w) => <option key={w} value={w}>{w}</option>)}
           </select>
         </label>
+        <ModelSelect value={model} onChange={setModel} disabled={creating || running} />
         <button type="submit" className="btn" disabled={creating || running || !symbol.trim() || !skillId}>
           {creating ? "Preparing…" : `Run first ${weeks} Monday${weeks === 1 ? "" : "s"} of ${year}`}
         </button>

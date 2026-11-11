@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { ModelSelect } from "./RunOptions";
 
 type Skill = { id: string; name: string; description: string; version: string; path: string };
 type Checklist = { criterion: string; verdict: "pass" | "fail" | "unclear"; evidence: string };
@@ -93,6 +94,7 @@ export default function AgentRunner() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<Result | null>(null);
   const [showData, setShowData] = useState(false);
+  const [model, setModel] = useState("");
 
   useEffect(() => {
     fetch("/api/py/agent/skills")
@@ -126,7 +128,7 @@ export default function AgentRunner() {
       const res = await fetch("/api/py/agent/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skill: skillId, symbol: s }),
+        body: JSON.stringify({ skill: skillId, symbol: s, model: model || null }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `Request failed (${res.status})`);
@@ -172,6 +174,7 @@ export default function AgentRunner() {
             ))}
           </datalist>
         </label>
+        <ModelSelect value={model} onChange={setModel} disabled={loading} />
         <button type="submit" className="btn" disabled={loading || !symbol.trim() || !skillId}>
           {loading ? "Running…" : "Run skill"}
         </button>

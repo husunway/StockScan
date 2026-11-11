@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, DiagnosticsPanel, LiveLog, type Diagnostics, type LogEntry } from "./RunUi";
+import { IndexSelect, indexLabel, type IndexId } from "./RunOptions";
 
 type Constituent = {
   symbol: string;
@@ -17,6 +18,9 @@ type Constituent = {
   state: "ready" | "stale" | "missing";
 };
 type Universe = {
+  index: string;
+  index_label: string;
+  list_table: string;
   items: Constituent[];
   summary: { total: number; ready: number; stale: number; missing: number };
   list_updated_at: string | null;
@@ -46,6 +50,7 @@ const when = (iso: string | null) => (iso ? new Date(iso.endsWith("Z") ? iso : i
 export default function UniverseLoader() {
   const [diag, setDiag] = useState<Diagnostics | null>(null);
   const [diagError, setDiagError] = useState<string | null>(null);
+  const [index, setIndex] = useState<IndexId>("sp500");
   const [universe, setUniverse] = useState<Universe | null>(null);
   const [job, setJob] = useState<Job | null>(null);
   const [running, setRunning] = useState(false);
@@ -67,19 +72,27 @@ export default function UniverseLoader() {
 
   const loadUniverse = useCallback(async () => {
     try {
-      const u = await api<Universe>("/api/py/universe");
+      const u = await api<Universe>(`/api/py/universe?index=${index}`);
       setUniverse(u);
       return u;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load the universe");
       return null;
     }
-  }, []);
+  }, [index]);
 
   useEffect(() => {
     api<Diagnostics>("/api/py/agent/diagnostics").then(setDiag).catch((e: Error) => setDiagError(e.message));
+  }, []);
+
+  // Switching the index shows that index's constituents and its latest load job.
+  useEffect(() => {
+    setUniverse(null);
+    setJob(null);
+    setLog([]);
+    setSelected(null);
     loadUniverse();
-    api<Job | null>("/api/py/universe/load/latest")
+    api<Job | null>(`/api/py/universe/load/latest?index=${index}`)
       .then((j) => {
         if (j) {
           setJob(j);
@@ -87,7 +100,7 @@ export default function UniverseLoader() {
         }
       })
       .catch(() => {});
-  }, [loadUniverse]);
+  }, [loadUniverse, index]);
 
   // Live status while a job is active (also when another tab drives it).
   const active = !!job && job.status === "active" && job.counts.pending + job.counts.running > 0;
@@ -138,10 +151,10 @@ export default function UniverseLoader() {
     setBusy("start");
     setError(null);
     setLog([]);
-    note(`Creating load job: ${onlyStale ? "only symbols with missing or stale data" : "all constituents"}, ${batchSize} per batch ...`);
+    note(`Creating ${indexLabel(index)} load job: ${onlyStale ? "only symbols with missing or stale data" : "all constituents"}, ${batchSize} per batch ...`);
     try {
       const j = await api<Job>("/api/py/universe/load", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ only_stale: onlyStale, batch_size: batchSize }),
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ index, only_stale: onlyStale, batch_size: batchSize }),
       });
       setJob(j);
       setLog((prev) => [...prev, ...j.log]);
@@ -215,9 +228,9 @@ export default function UniverseLoader() {
 
       <div className="filters" style={{ marginBottom: 8 }}>
         <div className="stat">
-          <span className="stat-label">S&amp;P 500 list</span>
+          <span className="stat-label">{indexLabel(index)} list</span>
           <span className="stat-value small">{universe ? `${universe.summary.total} constituents` : "—"}</span>
-          <span className="tile-note">{universe?.list_source ? `dbo.SP500_CONSTITUENTS · ${universe.list_source} · updated ${when(universe.list_updated_at)}` : "dbo.SP500_CONSTITUENTS"}</span>
+          <span className="tile-note">{universe?.list_source ? `${universe.list_table} · ${universe.list_source} · updated ${when(universe.list_updated_at)}` : universe?.list_table ?? ""}</span>
         </div>
         <div className="stat"><span className="stat-label">Ready</span><span className="stat-value" style={{ color: "#0ca30c" }}>{universe?.summary.ready ?? "—"}</span><span className="tile-note">prices and technical data current</span></div>
         <div className="stat"><span className="stat-label">Stale</span><span className="stat-value" style={{ color: "#c98500" }}>{universe?.summary.stale ?? "—"}</span><span className="tile-note">prices stored, update needed</span></div>
@@ -225,6 +238,7 @@ export default function UniverseLoader() {
       </div>
 
       <div className="filters" style={{ marginBottom: 6 }}>
+        <IndexSelect value={index} onChange={setIndex} disabled={running || busy !== null} />
         <label>
           Batch size
           <select value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value))} disabled={running} style={{ minWidth: 80 }}>
@@ -249,7 +263,8 @@ export default function UniverseLoader() {
       <p className="msg hint">
         Per symbol: prices are fetched only for days after the last stored close (two years when nothing is stored), and the
         technical data (TECH_ tables) is recomputed only when it is older than the latest stored close. Each batch is one
-        request; you can stop and resume. The constituents come from dbo.SP500_CONSTITUENTS, which is treated as up to date (seeded from the repository list on first use).
+        request; you can stop and resume. Each index has its own constituents table (dbo.SP500_CONSTITUENTS, dbo.NASDAQ100_CONSTITUENTS), treated as up to date and
+        seeded from the repository list on first use. Stocks in both indexes share their stored prices, so loading one index also updates the overlap.
       </p>
 
       {error && <p className="msg error">{error}</p>}
@@ -311,7 +326,7 @@ export default function UniverseLoader() {
         })}
       </div>
       {universe && universe.summary.total === 0 && (
-        <p className="msg">dbo.SP500_CONSTITUENTS is empty and the seed file was not found; run scripts/seed_sp500_constituents.sql.</p>
+        <p className="msg">{universe.list_table} is empty and the seed file was not found in data/.</p>
       )}
     </div>
   );

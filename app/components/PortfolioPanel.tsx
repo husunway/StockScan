@@ -4,12 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { api, DiagnosticsPanel, LiveLog, type Diagnostics, type LogEntry } from "./RunUi";
 import PortfolioCalendar from "./PortfolioCalendar";
+import { IndexSelect, indexLabel, ModelSelect, type IndexId } from "./RunOptions";
 import { PORTFOLIO_FIELDS } from "@/lib/portfolioFields";
 import { defaultInputs, validateAll, validateField, type FieldSpec } from "@/lib/portfolioValidation";
 
 type Config = {
   stock_count: number; start_date: string; end_date: string | null; starting_capital: number; buy_amount: number; max_buys_per_stock: number;
   take_profit_pct: number; analysis_validity_days: number; rerun_proximity_pct: number; skip_threshold_pct: number; held_reassess_days: number;
+  index?: string; model?: string | null;
 };
 type Position = {
   symbol: string; buys: number; quantity: number; avg_cost: number; cost: number; price: number | null; market_value: number | null;
@@ -92,6 +94,8 @@ export default function PortfolioPanel() {
   // Numeric inputs are kept as typed text and checked against data/portfolio_fields.json (the API applies the same rules).
   const [inputs, setInputs] = useState<Record<string, string>>(() => defaultInputs(PORTFOLIO_FIELDS));
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [index, setIndex] = useState<IndexId>("sp500");
+  const [model, setModel] = useState("");
   const [startDate, setStartDate] = useState("2026-01-01");
   const [endDate, setEndDate] = useState("");
   const stopRef = useRef(false);
@@ -181,8 +185,8 @@ export default function PortfolioPanel() {
     setJob(null);
     stopRef.current = false;
     try {
-      note(`Resolving the first ${cfg.stock_count} S&P 500 constituents in symbol order ...`);
-      const sy = await api<{ symbols: SymbolInfo[] }>(`/api/py/portfolio/symbols?count=${cfg.stock_count}`);
+      note(`Resolving the first ${cfg.stock_count} ${indexLabel(index)} constituents in symbol order ...`);
+      const sy = await api<{ symbols: SymbolInfo[] }>(`/api/py/portfolio/symbols?count=${cfg.stock_count}&index=${index}`);
       note(`Stocks: ${sy.symbols.map((s) => s.symbol).join(", ")}`);
       for (let i = 0; i < sy.symbols.length; i++) {
         if (stopRef.current) throw new Error("Cancelled before the backtest was created");
@@ -193,7 +197,7 @@ export default function PortfolioPanel() {
         note(`${s.symbol}: prices ${r.prices.action} (+${r.prices.added}, latest ${r.prices.last_date}); technical data to ${r.tech_last ?? "?"}; fundamentals bundle ready`);
       }
       setPreparing(null);
-      const body = { ...cfg, start_date: startDate, end_date: endDate || null };
+      const body = { ...cfg, index, model: model || null, start_date: startDate, end_date: endDate || null };
       const s = await api<State>("/api/py/portfolio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       setJob(s);
       if (s.log) setLog((prev) => [...prev, ...s.log!]);
@@ -251,6 +255,8 @@ export default function PortfolioPanel() {
       <DiagnosticsPanel diag={diag} error={diagError} onLog={(entries) => setLog((prev) => [...prev, ...entries])} />
 
       <form className="filters agent-form portfolio-form" noValidate onSubmit={(e) => { e.preventDefault(); start(); }}>
+        <IndexSelect value={index} onChange={setIndex} disabled={busy} />
+        <ModelSelect value={model} onChange={setModel} disabled={busy} />
         {PORTFOLIO_FIELDS.slice(0, 1).map((f) => <NumField key={f.key} spec={f} label={FORM_LABEL[f.key]} value={inputs[f.key]} error={fieldErrors[f.key]} disabled={busy} onChange={setInput} onBlur={checkInput} />)}
         <label className={dateError && !startDate ? "invalid" : ""}>From<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={busy} /></label>
         <label className={dateError && startDate ? "invalid" : ""}>To (blank = latest)<input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} disabled={busy} />
@@ -265,7 +271,7 @@ export default function PortfolioPanel() {
         Each trading day: sells first (lowest agent target or take profit, full position), then buys. A buy needs Warren Buffett → Jamie Dimon →
         John Murphy to each recommend buying at the current price (early exit); Buffett and Dimon are cached for the validity window, rerun when
         the price is within the proximity band of their buy price, skipped (NOT BUY) when it is more than the skip threshold above it; Murphy
-        always runs fresh. Fills at the lowest agent buy price if it lies inside the day&apos;s range. Amounts in USD (native currency of S&amp;P 500 prices).
+        always runs fresh. Fills at the lowest agent buy price if it lies inside the day&apos;s range. Amounts in USD (native currency of S&amp;P 500 and NASDAQ 100 prices).
       </p>
       {error && <p className="msg error">{error}</p>}
 
@@ -274,7 +280,7 @@ export default function PortfolioPanel() {
           <div className="progress-row">
             <div className="progress"><div className="progress-bar" style={{ width: `${progressPct}%` }} /></div>
             <span className="progress-text">
-              Backtest #{job.job_id} · {job.symbols.join(", ")} · day {Math.min(job.days_done + 1, job.days_total)} of {job.days_total}
+              Backtest #{job.job_id} · {indexLabel(job.config.index)}{job.config.model ? ` · ${job.config.model}` : ""} · {job.symbols.join(", ")} · day {Math.min(job.days_done + 1, job.days_total)} of {job.days_total}
               {p.current_date && <> · simulating <strong>{p.current_date}</strong> ({p.phase}{p.symbol ? ` · ${p.symbol}` : ""}{p.phase !== "close" && p.stage !== "check" ? ` · ${p.stage}` : ""})</>}
               {" "}· {job.ai_calls.toLocaleString()} model calls{job.failed_calls > 0 && <span style={{ color: "var(--danger, #c0392b)" }}> ({job.failed_calls} failed)</span>}
               {job.status === "stopped" && <span className="stopped-chip">stopped</span>}

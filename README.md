@@ -43,10 +43,17 @@ Computed in Python (pandas) from the stored daily prices:
 
 The chart is drawn with [lightweight-charts](https://github.com/tradingview/lightweight-charts) (Apache 2.0).
 
-### S&P 500 universe loader (`/prices/sp500`)
+### Index universe loader (`/prices/sp500`)
 
-Loads price history and prepares the technical data for every S&P 500 constituent, with live
-progress. The constituents live in `dbo.SP500_CONSTITUENTS`, which the app treats as up to date (no refresh
+Loads price history and prepares the technical data for every constituent of the chosen index,
+**S&P 500** or **NASDAQ 100**, with live progress. Each index has its own constituents table:
+`dbo.SP500_CONSTITUENTS` and `dbo.NASDAQ100_CONSTITUENTS`. The NASDAQ 100 table is seeded on first use
+from `data/nasdaq100_constituents.csv` (101 tickers, both Alphabet share classes). That list was compiled
+from the December 2025 reconstitution and has no sub-industry column; check it against the current
+index and correct the table directly. Prices and `TECH_` tables are stored per symbol, so stocks in both
+indexes are loaded once. The rest of this section describes the S&P 500 table; the NASDAQ 100 table works
+the same way. Every universe endpoint takes `index=sp500|nasdaq100` (default `sp500`).
+ The constituents live in `dbo.SP500_CONSTITUENTS`, which the app treats as up to date (no refresh
 or import feature). On first use the table is seeded from `data/sp500_constituents.csv` in the
 repository (503 names; tickers in Yahoo form, BRK.B → BRK-B); `scripts/seed_sp500_constituents.sql`
 loads the same list by hand. Maintain the table directly (`active = 1` rows are included in a load). A load job (`dbo.UNIVERSE_LOAD_JOB` / `_ITEM`) processes symbols in batches,
@@ -113,7 +120,8 @@ A run:
 1. Gathers data - fundamentals and three years of annual statements from Yahoo Finance (yfinance),
    plus a price snapshot (52-week range, 200-day average, 1-year return, volatility, drawdown)
    from the stored prices, or from Yahoo if the symbol is not loaded.
-2. Calls Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`) with the skill's
+2. Calls Claude (`claude-opus-5-5` by default; override with `ANTHROPIC_MODEL`; pick another model per run, see
+   *Choosing the AI model* below) with the skill's
    instructions as the system prompt and the data as the user message. The provider is **Microsoft
    Foundry** when `ANTHROPIC_FOUNDRY_API_KEY` and `ANTHROPIC_FOUNDRY_RESOURCE` (or `_BASE_URL`) are set
    (same Anthropic SDK, `AnthropicFoundry` client; structured outputs, effort and prompt caching all
@@ -139,9 +147,9 @@ Each run uses roughly 10-20K input and 3-6K output tokens. `vercel.json` sets th
 think for 60-80 s before writing a 4-6K-token verdict at ~70 tokens/s, so a step can take 150-180 s.
 The default is `ANTHROPIC_EFFORT=medium`, which keeps the thinking phase to seconds; set `high` only if you accept 150 s+ steps.
 
-### S&P 500 scan (`/agent/scan`)
+### Index scan (`/agent/scan`)
 
-Scans every constituent in `dbo.SP500_CONSTITUENTS` on every Monday (or weekday) in a date range through
+Choose the index (S&P 500 or NASDAQ 100) and the AI model on the form. Scans every constituent of that index on every Monday (or weekday) in a date range through
 a three-agent funnel, cheapest first:
 
 1. **Pre-screen (free, no model):** from `TECH_TREND_DAILY` on that date - by default primary trend up and
@@ -160,7 +168,20 @@ The page shows a calendar where each scanned date carries the number of all-3 hi
 each agent's verdict and links to the reports, and the full hit list. Scale note: 503 stocks x 42 Mondays
 is ~21,000 stage-1 calls without the pre-screen; the pre-screen usually removes 60-80%.
 
+### Choosing the AI model
+
+Every page that calls Claude (single run, weekly backtest, index scan, portfolio backtest) has an
+**AI model** picker. Its choices come from the server environment: `ANTHROPIC_MODEL` is the default and
+`ANTHROPIC_MODELS` lists the others (comma separated; on Foundry, deployment names). `GET
+/api/py/agent/models` returns the list with each model's price from `data/ai_pricing.json`. The API
+rejects a model that is not configured. The choice is stored on the run's backtest rows
+(`agent_backtests.model_requested`), so every step, resume and retry of that run uses the same model.
+Runs created before this feature use the default. Stored analyses are reused only when the model matches,
+so switching models gives fresh analyses.
+
 ### Portfolio backtest (`/agent/portfolio`)
+
+Choose the index the first N stocks come from (S&P 500 or NASDAQ 100) and the AI model on the form.
 
 A daily trading simulation over the **first N constituents in ticker-symbol order** (default 10) from
 `BACKTEST_START` (default 2026-01-01) to the latest stored trading day, with a configurable starting
@@ -348,6 +369,7 @@ ANTHROPIC_FOUNDRY_API_KEY=   # Claude via Microsoft Foundry (preferred when set)
 ANTHROPIC_FOUNDRY_RESOURCE=  # ... resource name from https://<resource>.services.ai.azure.com/anthropic/
 ANTHROPIC_API_KEY=           # or the Anthropic Claude API, used only when the Foundry variables are absent
 ANTHROPIC_MODEL=             # optional, default claude-opus-5-5 (on Foundry: the deployed model name)
+ANTHROPIC_MODELS=            # optional, other models the run forms may pick, comma separated
 BLOB_READ_WRITE_TOKEN=  # Vercel Blob store for backtest PDFs (set automatically when the store is connected on Vercel)
 BLOB_ACCESS=private     # or public; must match the store
 ```

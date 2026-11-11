@@ -12,7 +12,7 @@ const items: Item[] = [
     href: "/prices",
     label: "Load Prices",
     icon: "↓",
-    children: [{ href: "/prices/sp500", label: "S&P 500 universe" }],
+    children: [{ href: "/prices/sp500", label: "Index universe" }],
   },
   {
     href: "/analysis",
@@ -28,7 +28,7 @@ const items: Item[] = [
       { href: "/agent/backtest?skill=warren-buffett", label: "Warren Buffett" },
       { href: "/agent/run?skill=jamie-dimon", label: "Jamie Dimon" },
       { href: "/agent/backtest?skill=john-murphy", label: "John Murphy" },
-      { href: "/agent/scan", label: "S&P 500 scan" },
+      { href: "/agent/scan", label: "Index scan" },
       { href: "/agent/portfolio", label: "Portfolio backtest" },
       { href: "/agent", label: "Skill library" },
     ],

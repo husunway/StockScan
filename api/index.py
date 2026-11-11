@@ -6,6 +6,8 @@ from decimal import Decimal
 import base64
 import hashlib
 import hmac
+import contextlib
+import contextvars
 import json
 import re
 import time
@@ -578,6 +580,45 @@ def single_stock_analysis(symbol: str, index: str | None = None, sector: str | N
 # ---------------------------------------------------------------------------
 DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 
+# The model for the current request. Runs pick a model from the environment list (ANTHROPIC_MODEL plus ANTHROPIC_MODELS);
+# the choice is stored with the run, and each step sets it here so every call of that run uses the same model.
+_MODEL_OVERRIDE: "contextvars.ContextVar[str | None]" = contextvars.ContextVar("stockscan_model", default=None)
+
+
+def default_model() -> str:
+    return (os.environ.get("ANTHROPIC_MODEL") or "").strip() or DEFAULT_CLAUDE_MODEL
+
+
+def available_models() -> list[str]:
+    """ANTHROPIC_MODEL (the default) first, then every model in ANTHROPIC_MODELS (comma, semicolon or newline separated)."""
+    out = [default_model()]
+    for m in re.split(r"[,;\n]", os.environ.get("ANTHROPIC_MODELS") or ""):
+        m = m.strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def resolve_model(model: str | None) -> str:
+    """The model a new run will use: the default when none is given; otherwise it must be one of the configured models."""
+    m = (model or "").strip()
+    if not m:
+        return default_model()
+    if m not in available_models():
+        raise HTTPException(status_code=422, detail=f"Model '{m}' is not configured. Choose one of: {', '.join(available_models())} "
+                                                    f"(set ANTHROPIC_MODEL and ANTHROPIC_MODELS in the environment).")
+    return m
+
+
+@contextlib.contextmanager
+def use_model(model: str | None):
+    """Run the block with this model for every Claude call (None keeps the default)."""
+    token = _MODEL_OVERRIDE.set((model or "").strip() or None)
+    try:
+        yield
+    finally:
+        _MODEL_OVERRIDE.reset(token)
+
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
@@ -825,6 +866,7 @@ def load_price_history_any(symbol: str):
 class AgentRunRequest(BaseModel):
     skill: str = Field(..., min_length=1, max_length=60)
     symbol: str = Field(..., min_length=1, max_length=20)
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
 
 
 def validate_verdict(a: dict) -> list[str]:
@@ -937,7 +979,7 @@ def claude_hello(log: "RunLog | None" = None) -> dict:
     import anthropic
 
     provider = require_claude()
-    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    model = requested_model()
     client = make_claude_client(provider)
     if log:
         log.step(f"AI hello: sending a one-line test prompt to {provider} ({client.base_url}, model '{model}') ...")
@@ -981,7 +1023,7 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
     import anthropic
 
     provider = require_claude()
-    model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    model = requested_model()
     effort = claude_effort()
     schema = skill.get("output_schema") or STOCK_VERDICT_SCHEMA  # skill's data-structure.json wins
     client = make_claude_client(provider)
@@ -1126,8 +1168,22 @@ def agent_skill(skill_id: str):
     return get_skill(skill_id)
 
 
+@app.get("/api/py/agent/models")
+def agent_models():
+    """The models a run can use, from the environment: ANTHROPIC_MODEL (default) and ANTHROPIC_MODELS."""
+    pricing = ai_pricing()
+    return {"default": default_model(), "provider": claude_provider(),
+            "models": [{"id": m, "default": m == default_model(), "price": price_for_model(m, pricing)} for m in available_models()],
+            "currency": pricing.get("currency", "USD")}
+
+
 @app.post("/api/py/agent/run")
 def agent_run(req: AgentRunRequest):
+    with use_model(resolve_model(req.model)):
+        return _agent_run(req)
+
+
+def _agent_run(req: AgentRunRequest):
     require_claude()
     skill = get_skill(req.skill.strip().lower())
     symbol = normalize_symbol(req.symbol)
@@ -1230,6 +1286,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UQ_agent_decision
 IF COL_LENGTH('{BACKTESTS_TABLE}', 'status') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD status NVARCHAR(10) NOT NULL CONSTRAINT DF_agent_backtests_status DEFAULT 'active';
 IF COL_LENGTH('{DECISIONS_TABLE}', 'skill_version') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD skill_version NVARCHAR(20) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'model_requested') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD model_requested NVARCHAR(100) NULL;
+IF COL_LENGTH('{BACKTESTS_TABLE}', 'model_requested') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD model_requested NVARCHAR(100) NULL;
 IF COL_LENGTH('{DECISIONS_TABLE}', 'reused_from_id') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD reused_from_id INT NULL;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_reuse')
 CREATE INDEX IX_agent_decisions_reuse ON {DECISIONS_TABLE} (skill_id, symbol, as_of_date, status);
@@ -1292,14 +1349,16 @@ def env_diagnostics() -> dict:
     if provider == "foundry":
         base = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL") or \
             f"https://{os.environ.get('ANTHROPIC_FOUNDRY_RESOURCE')}.services.ai.azure.com/anthropic/"
-        claude = {"provider": "Microsoft Foundry", "endpoint": base, "model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
+        claude = {"provider": "Microsoft Foundry", "endpoint": base, "model": requested_model(),
                   "effort": claude_effort(), "credentials": _set("ANTHROPIC_FOUNDRY_API_KEY"),
                   "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"),
-                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_EFFORT")]}
+                                _set("ANTHROPIC_FOUNDRY_BASE_URL"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_MODELS"), _set("ANTHROPIC_EFFORT")],
+                  "models": available_models()}
     elif provider == "anthropic":
-        claude = {"provider": "Anthropic API", "endpoint": "https://api.anthropic.com/", "model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
+        claude = {"provider": "Anthropic API", "endpoint": "https://api.anthropic.com/", "model": requested_model(),
                   "effort": claude_effort(), "credentials": _set("ANTHROPIC_API_KEY"),
-                  "variables": [_set("ANTHROPIC_API_KEY"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_EFFORT")]}
+                  "variables": [_set("ANTHROPIC_API_KEY"), _set("ANTHROPIC_MODEL"), _set("ANTHROPIC_MODELS"), _set("ANTHROPIC_EFFORT")],
+                  "models": available_models()}
     else:
         claude = {"provider": "not configured", "endpoint": None, "model": None, "credentials": None,
                   "variables": [_set("ANTHROPIC_FOUNDRY_API_KEY"), _set("ANTHROPIC_FOUNDRY_RESOURCE"), _set("ANTHROPIC_API_KEY")]}
@@ -2086,6 +2145,7 @@ class BacktestRequest(BaseModel):
     year: int = Field(2026, ge=2000, le=2100)
     weeks: int = Field(10, ge=1, le=52, description="How many Mondays to run, counting from January 1")
     refresh_data: bool = Field(False, description="Re-download the symbol's data bundle even if a fresh one is stored")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
 
 
 def _decision_dict(row) -> dict:
@@ -2115,7 +2175,7 @@ def _decision_counts(cur, backtest_id: int) -> dict:
 
 def _backtest_meta(cur, backtest_id: int) -> dict:
     cur.execute(
-        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at, log_json, status FROM {BACKTESTS_TABLE} "
+        f"SELECT backtest_id, skill_id, skill_version, symbol, [year], created_at, log_json, status, model_requested FROM {BACKTESTS_TABLE} "
         f"WHERE backtest_id = %s",
         (backtest_id,),
     )
@@ -2124,6 +2184,7 @@ def _backtest_meta(cur, backtest_id: int) -> dict:
         raise HTTPException(status_code=404, detail="Backtest not found")
     return {"backtest_id": row[0], "skill_id": row[1], "skill_version": row[2], "symbol": row[3], "year": row[4],
             "created_at": row[5].isoformat(), "log": json.loads(row[6] or "[]"), "status": row[7] or "active",
+            "model": row[8] or default_model(),
             "counts": _decision_counts(cur, backtest_id)}
 
 
@@ -2263,6 +2324,12 @@ def list_runs(limit: int = 200):
 
 @app.post("/api/py/agent/backtest")
 def create_backtest(req: BacktestRequest):
+    model = resolve_model(req.model)
+    with use_model(model):
+        return _create_backtest(req, model)
+
+
+def _create_backtest(req: BacktestRequest, model: str):
     require_claude()
     log = RunLog(BACKTESTS_TABLE, "backtest_id")
     log.add(f"Claude: {describe_claude()}")
@@ -2301,9 +2368,9 @@ def create_backtest(req: BacktestRequest):
         ensure_backtest_tables(cur)
         cur.execute(ENSURE_SYMBOL_DATA_SQL)
         cur.execute(
-            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, data_pathname) "
-            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, %s)",
-            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), data_pathname),
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, data_pathname, model_requested) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), data_pathname, model),
         )
         backtest_id = cur.fetchone()[0]
         log.row_id = backtest_id
@@ -2455,7 +2522,20 @@ REUSE_COPY_COLUMNS = (
 
 
 def requested_model() -> str:
-    return os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
+    return _MODEL_OVERRIDE.get() or default_model()
+
+
+def backtest_model(backtest_id: int) -> str | None:
+    """The model recorded on a backtest row (weekly backtest, scan or portfolio agent row); None for runs made before
+    model selection existed, which then use the default."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT model_requested FROM {BACKTESTS_TABLE} WHERE backtest_id = %s", (backtest_id,))
+        r = cur.fetchone()
+    finally:
+        conn.close()
+    return (r[0] or None) if r else None
 
 
 def find_reusable_decision(skill: dict, symbol: str, as_of: date, exclude_id: int | None = None) -> dict | None:
@@ -2497,12 +2577,33 @@ def reuse_decision(decision_id: int, source: dict, log: "RunLog") -> dict:
         conn.close()
 
 
+def decision_model(decision_id: int) -> str | None:
+    """The model chosen for the run that owns this decision (via its backtest row)."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT b.model_requested FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
+                    f"WHERE d.decision_id = %s", (decision_id,))
+        r = cur.fetchone()
+    finally:
+        conn.close()
+    return (r[0] or None) if r else None
+
+
 def try_reuse_decision(decision_id: int, skill: dict, symbol: str, as_of: date, log: "RunLog") -> dict | None:
-    source = find_reusable_decision(skill, symbol, as_of, exclude_id=decision_id)
+    """Match on the run's model: the one already set for this request, else the model stored on the decision's backtest."""
+    with use_model(_MODEL_OVERRIDE.get() or decision_model(decision_id)):
+        source = find_reusable_decision(skill, symbol, as_of, exclude_id=decision_id)
     return reuse_decision(decision_id, source, log) if source else None
 
 
 def execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: str, as_of: date, raw: dict, prices_df, log: "RunLog") -> dict:
+    """Runs with the model chosen for the run (stored on the backtest row)."""
+    with use_model(backtest_model(backtest_id)):
+        return _execute_decision(backtest_id, decision_id, skill, symbol, as_of, raw, prices_df, log)
+
+
+def _execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: str, as_of: date, raw: dict, prices_df, log: "RunLog") -> dict:
     """Run one claimed decision end to end: point-in-time data -> model -> validation -> PDF/HTML/Blob -> persist.
     Shared by the weekly backtest, the S&P 500 scan and the portfolio backtest. A stored analysis with the same agent, stock,
     date, skill version and model is reused instead of calling the model again."""
@@ -2530,7 +2631,7 @@ def execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: st
             n_stmt = sum(1 for r in references if r["type"] == "statement")
             log.step(f"Point-in-time data as of {as_of}: price through {payload['price']['as_of']}, {n_stmt} statement "
                      f"periods visible, {len(payload['fundamentals'])} derived fundamentals")
-        log.step(f"Querying Claude ({env_diagnostics()['claude']['provider']}, model '{os.environ.get('ANTHROPIC_MODEL', DEFAULT_CLAUDE_MODEL)}') ...")
+        log.step(f"Querying Claude ({env_diagnostics()['claude']['provider']}, model '{requested_model()}') ...")
         analysis, response = run_skill_with_claude(skill, payload, log)
         warnings = validate_verdict(analysis)
         log.add(f"Verdict {analysis['recommendation']} ({analysis.get('conviction')}): target {analysis.get('target_price')}, "
@@ -3664,17 +3765,39 @@ def decision_report_html(backtest_id: int, decision_id: int):
 # days and recomputes the TECH_ tables only when they are older than the latest stored close.
 # Driven in batches by the page (one request per batch) so it fits a serverless time limit.
 # ---------------------------------------------------------------------------
-UNIVERSE_TABLE = "dbo.SP500_CONSTITUENTS"
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# Each index has its own constituents table, seeded from a repository CSV on first use and then maintained in the database.
+INDEXES = {
+    "sp500": {"label": "S&P 500", "table": "dbo.SP500_CONSTITUENTS", "seed": _DATA_DIR / "sp500_constituents.csv", "tag": "sp500"},
+    "nasdaq100": {"label": "NASDAQ 100", "table": "dbo.NASDAQ100_CONSTITUENTS", "seed": _DATA_DIR / "nasdaq100_constituents.csv", "tag": "ndx100"},
+}
+DEFAULT_INDEX = "sp500"
+UNIVERSE_TABLE = INDEXES["sp500"]["table"]
 UJOB_TABLE = "dbo.UNIVERSE_LOAD_JOB"
 UITEM_TABLE = "dbo.UNIVERSE_LOAD_ITEM"
-SP500_SEED_FILE = Path(__file__).resolve().parent.parent / "data" / "sp500_constituents.csv"
+SP500_SEED_FILE = INDEXES["sp500"]["seed"]
+INDEX_PATTERN = "^(" + "|".join(INDEXES) + ")$"
 
-ENSURE_UNIVERSE_SQL = f"""
-IF OBJECT_ID('{UNIVERSE_TABLE}', 'U') IS NULL
-CREATE TABLE {UNIVERSE_TABLE} (
+
+def index_spec(index: str | None) -> dict:
+    key = (index or DEFAULT_INDEX).strip().lower()
+    if key not in INDEXES:
+        raise HTTPException(status_code=422, detail=f"Unknown index '{index}'. Choose one of: {', '.join(INDEXES)}.")
+    return {"key": key, **INDEXES[key]}
+
+
+def _constituents_ddl(spec: dict) -> str:
+    t, tag = spec["table"], spec["tag"]
+    return f"""
+IF OBJECT_ID('{t}', 'U') IS NULL
+CREATE TABLE {t} (
     symbol NVARCHAR(20) NOT NULL PRIMARY KEY, name NVARCHAR(200) NULL, sector NVARCHAR(100) NULL,
-    sub_industry NVARCHAR(150) NULL, source NVARCHAR(100) NOT NULL, active BIT NOT NULL CONSTRAINT DF_sp500_active DEFAULT 1,
-    updated_at DATETIME2 NOT NULL CONSTRAINT DF_sp500_updated DEFAULT SYSUTCDATETIME());
+    sub_industry NVARCHAR(150) NULL, source NVARCHAR(100) NOT NULL, active BIT NOT NULL CONSTRAINT DF_{tag}_active DEFAULT 1,
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_{tag}_updated DEFAULT SYSUTCDATETIME());
+"""
+
+
+ENSURE_UNIVERSE_SQL = "".join(_constituents_ddl(v) for v in INDEXES.values()) + f"""
 IF OBJECT_ID('{UJOB_TABLE}', 'U') IS NULL
 CREATE TABLE {UJOB_TABLE} (
     job_id INT IDENTITY(1,1) PRIMARY KEY, created_at DATETIME2 NOT NULL CONSTRAINT DF_ujob_created DEFAULT SYSUTCDATETIME(),
@@ -3694,36 +3817,39 @@ def yahoo_symbol(raw: str) -> str:
     return raw.strip().upper().replace(".", "-")
 
 
-def seed_universe_if_empty(cur) -> int:
+def seed_universe_if_empty(cur, index: str = DEFAULT_INDEX) -> int:
     """The constituents table is maintained in the database; when it is empty (first use) it is seeded from
-    data/sp500_constituents.csv in the repository. Returns the number of rows inserted."""
+    the index's CSV in data/ in the repository. Returns the number of rows inserted."""
     import csv
 
-    cur.execute(f"SELECT COUNT(*) FROM {UNIVERSE_TABLE}")
-    if cur.fetchone()[0] > 0 or not SP500_SEED_FILE.is_file():
+    spec = index_spec(index)
+    cur.execute(f"SELECT COUNT(*) FROM {spec['table']}")
+    if cur.fetchone()[0] > 0 or not spec["seed"].is_file():
         return 0
-    with open(SP500_SEED_FILE, newline="", encoding="utf-8") as f:
+    with open(spec["seed"], newline="", encoding="utf-8") as f:
         rows = [r for r in csv.DictReader(f) if r.get("symbol")]
+    source = f"repo:data/{spec['seed'].name}"
     for i in range(0, len(rows), 100):
         part = rows[i:i + 100]
         cur.execute(
-            f"INSERT INTO {UNIVERSE_TABLE} (symbol, name, sector, sub_industry, source, active) VALUES "
-            + ", ".join(["(%s, %s, %s, %s, 'repo:data/sp500_constituents.csv', 1)"] * len(part)),
-            tuple(v for r in part for v in (yahoo_symbol(r["symbol"]), r.get("name"), r.get("sector"), r.get("sub_industry"))),
+            f"INSERT INTO {spec['table']} (symbol, name, sector, sub_industry, source, active) VALUES "
+            + ", ".join(["(%s, %s, %s, %s, %s, 1)"] * len(part)),
+            tuple(v for r in part for v in (yahoo_symbol(r["symbol"]), r.get("name"), r.get("sector"), r.get("sub_industry") or None, source)),
         )
     return len(rows)
 
 
-def universe_state(cur) -> list[dict]:
-    """Constituents joined with what is stored for each: price coverage and TECH freshness."""
+def universe_state(cur, index: str = DEFAULT_INDEX) -> list[dict]:
+    """Constituents of the index joined with what is stored for each: price coverage and TECH freshness."""
+    spec = index_spec(index)
     cur.execute(ENSURE_UNIVERSE_SQL)
     cur.execute(ENSURE_TECH_SQL)
     cur.execute(ENSURE_TABLE_SQL)
-    seed_universe_if_empty(cur)
+    seed_universe_if_empty(cur, spec["key"])
     cur.execute(
         f"SELECT u.symbol, u.name, u.sector, u.sub_industry, u.source, u.updated_at, "
         f"p.cnt, p.first_date, p.last_date, t.computed_at, t.last_trade_date, t.price_rows "
-        f"FROM {UNIVERSE_TABLE} u "
+        f"FROM {spec['table']} u "
         f"LEFT JOIN (SELECT symbol, COUNT(*) AS cnt, MIN(trade_date) AS first_date, MAX(trade_date) AS last_date FROM {TABLE} GROUP BY symbol) p ON p.symbol = u.symbol "
         f"LEFT JOIN dbo.TECH_LOAD t ON t.symbol = u.symbol "
         f"WHERE u.active = 1 ORDER BY u.symbol"
@@ -3799,27 +3925,38 @@ def _ujob(cur, job_id: int) -> dict:
 
 
 class UniverseLoadRequest(BaseModel):
+    index: str = Field(DEFAULT_INDEX, pattern=INDEX_PATTERN, description="Which index's constituents to load")
     only_stale: bool = Field(True, description="Skip symbols whose prices and technical data are already current")
     batch_size: int = Field(5, ge=1, le=20)
     symbols: list[str] | None = Field(None, description="Optional subset; default is every active constituent")
 
 
+@app.get("/api/py/indexes")
+def index_list():
+    return {"default": DEFAULT_INDEX, "indexes": [{"id": k, "label": v["label"], "table": v["table"]} for k, v in INDEXES.items()]}
+
+
+_UJOB_INDEX_SQL = f"COALESCE(JSON_VALUE(options, '$.index'), '{DEFAULT_INDEX}')"
+
+
 @app.get("/api/py/universe")
-def universe_list():
+def universe_list(index: str = DEFAULT_INDEX):
+    spec = index_spec(index)
     conn = db_connect()
     try:
         cur = conn.cursor()
-        items = universe_state(cur)
+        items = universe_state(cur, spec["key"])
         conn.commit()
-        cur.execute(f"SELECT MAX(updated_at), MIN(source) FROM {UNIVERSE_TABLE} WHERE active = 1")
+        cur.execute(f"SELECT MAX(updated_at), MIN(source) FROM {spec['table']} WHERE active = 1")
         upd, source = cur.fetchone()
-        cur.execute(f"SELECT TOP 1 job_id, status, created_at FROM {UJOB_TABLE} ORDER BY job_id DESC")
+        cur.execute(f"SELECT TOP 1 job_id, status, created_at FROM {UJOB_TABLE} WHERE {_UJOB_INDEX_SQL} = %s ORDER BY job_id DESC", (spec["key"],))
         last = cur.fetchone()
     finally:
         conn.close()
     summary = {"total": len(items), "ready": sum(i["state"] == "ready" for i in items), "stale": sum(i["state"] == "stale" for i in items),
                "missing": sum(i["state"] == "missing" for i in items)}
-    return {"items": items, "summary": summary, "list_updated_at": upd.isoformat() if upd else None, "list_source": source,
+    return {"index": spec["key"], "index_label": spec["label"], "list_table": spec["table"],
+            "items": items, "summary": summary, "list_updated_at": upd.isoformat() if upd else None, "list_source": source,
             "latest_job": {"job_id": last[0], "status": last[1], "created_at": last[2].isoformat()} if last else None}
 
 
@@ -3828,16 +3965,17 @@ def universe_load_create(req: UniverseLoadRequest):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        state = universe_state(cur)
+        spec = index_spec(req.index)
+        state = universe_state(cur, spec["key"])
         if req.symbols:
             wanted = {normalize_symbol(s) for s in req.symbols}
             state = [s for s in state if s["symbol"] in wanted]
         if not state:
-            raise HTTPException(status_code=422, detail="No constituents to load. Refresh or import the S&P 500 list first.")
+            raise HTTPException(status_code=422, detail=f"No {spec['label']} constituents to load (is {spec['table']} filled?).")
         todo = [s for s in state if not (req.only_stale and s["state"] == "ready")]
         skipped = [s for s in state if req.only_stale and s["state"] == "ready"]
         log = RunLog(UJOB_TABLE, "job_id")
-        log.add(f"Universe: {len(state)} active constituents; {len(todo)} need work ({sum(s['state'] == 'missing' for s in todo)} missing, "
+        log.add(f"Universe {spec['label']}: {len(state)} active constituents; {len(todo)} need work ({sum(s['state'] == 'missing' for s in todo)} missing, "
                 f"{sum(s['state'] == 'stale' for s in todo)} stale); {len(skipped)} already current")
         log.add(f"Database: {describe_db()} · batch size {req.batch_size} per request · Yahoo Finance for price deltas")
         cur.execute(f"INSERT INTO {UJOB_TABLE} (status, options, log_json) OUTPUT INSERTED.job_id VALUES ('active', %s, %s)",
@@ -3858,13 +3996,14 @@ def universe_load_create(req: UniverseLoadRequest):
 
 
 @app.get("/api/py/universe/load/latest")
-def universe_load_latest():
+def universe_load_latest(index: str = DEFAULT_INDEX):
+    spec = index_spec(index)
     conn = db_connect()
     try:
         cur = conn.cursor()
         cur.execute(ENSURE_UNIVERSE_SQL)
         conn.commit()
-        cur.execute(f"SELECT TOP 1 job_id FROM {UJOB_TABLE} ORDER BY job_id DESC")
+        cur.execute(f"SELECT TOP 1 job_id FROM {UJOB_TABLE} WHERE {_UJOB_INDEX_SQL} = %s ORDER BY job_id DESC", (spec["key"],))
         row = cur.fetchone()
         return _ujob(cur, row[0]) if row else None
     finally:
@@ -4021,6 +4160,8 @@ SCAN_ITEM_COLUMNS = ("as_of_date", "symbol", "stage", "status", "reason", "price
 
 
 class ScanRequest(BaseModel):
+    index: str = Field(DEFAULT_INDEX, pattern=INDEX_PATTERN, description="Which index to scan")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
     start_date: date = Field(date(2026, 1, 1))
     end_date: date | None = Field(None, description="Defaults to today")
     cadence: str = Field("weekly", pattern="^(weekly|daily)$", description="weekly = Mondays; daily = Monday to Friday")
@@ -4047,15 +4188,16 @@ def scan_dates(start: date, end: date, cadence: str) -> list[date]:
     return out
 
 
-def _scan_backtests(cur, job_id: int, year: int) -> dict:
+def _scan_backtests(cur, job_id: int, year: int, model: str | None = None) -> dict:
     """One agent_backtests row per skill for the scan, so each analysis is a normal decision with reports."""
     out = {}
     for skill_id in SCAN_SKILLS:
         skill = get_skill(skill_id)
         cur.execute(
-            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status) "
-            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active')",
-            (skill_id, skill["version"], f"SCAN#{job_id}", year, json.dumps({"scan_job": job_id, "data_source": skill.get("data_source")})),
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status, model_requested) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active', %s)",
+            (skill_id, skill["version"], f"SCAN#{job_id}", year, json.dumps({"scan_job": job_id, "data_source": skill.get("data_source")}),
+             model or requested_model()),
         )
         out[skill_id] = cur.fetchone()[0]
     return out
@@ -4107,6 +4249,12 @@ def _scan_item_dict(row) -> dict:
 
 @app.post("/api/py/scan")
 def scan_create(req: ScanRequest):
+    req = req.model_copy(update={"model": resolve_model(req.model), "index": index_spec(req.index)["key"]})
+    with use_model(req.model):
+        return _scan_create(req)
+
+
+def _scan_create(req: ScanRequest):
     require_claude()
     end = req.end_date or date.today()
     if end < req.start_date:
@@ -4121,7 +4269,8 @@ def scan_create(req: ScanRequest):
         cur = conn.cursor()
         cur.execute(ENSURE_SCAN_SQL)
         ensure_backtest_tables(cur)
-        universe = universe_state(cur)
+        spec = index_spec(req.index)
+        universe = universe_state(cur, spec["key"])
         if req.sectors:
             wanted = {s.lower() for s in req.sectors}
             universe = [u for u in universe if (u["sector"] or "").lower() in wanted]
@@ -4131,11 +4280,11 @@ def scan_create(req: ScanRequest):
         if req.max_symbols:
             universe = universe[: req.max_symbols]
         if not universe:
-            raise HTTPException(status_code=422, detail="No constituents match the filter (is dbo.SP500_CONSTITUENTS filled?).")
+            raise HTTPException(status_code=422, detail=f"No {spec['label']} constituents match the filter (is {spec['table']} filled?).")
         sector_of = {u["symbol"]: u["sector"] for u in universe}
         symbols = [u["symbol"] for u in universe]
         no_tech = [u["symbol"] for u in universe if not u["tech_last"]]
-        log.add(f"Universe: {len(symbols)} constituents ({len(no_tech)} without technical data - they will be rejected at pre-screen); "
+        log.add(f"Universe {spec['label']}: {len(symbols)} constituents ({len(no_tech)} without technical data - they will be rejected at pre-screen); "
                 f"{len(dates)} {req.cadence} dates {dates[0]} to {dates[-1]}")
         log.add("Pre-screen (free, from TECH_TREND_DAILY): " + ", ".join(
             [f"primary trend up" if req.require_primary_up else "any primary trend",
@@ -4145,7 +4294,7 @@ def scan_create(req: ScanRequest):
         cur.execute(f"INSERT INTO {SCAN_JOB_TABLE} (status, start_date, end_date, cadence, options) OUTPUT INSERTED.job_id VALUES ('active', %s, %s, %s, %s)",
                     (req.start_date, end, req.cadence, json.dumps(req.model_dump(mode="json"))))
         job_id = cur.fetchone()[0]
-        backtests = _scan_backtests(cur, job_id, req.start_date.year)
+        backtests = _scan_backtests(cur, job_id, req.start_date.year, req.model)
         cur.execute(f"UPDATE {SCAN_JOB_TABLE} SET backtests = %s WHERE job_id = %s", (json.dumps(backtests), job_id))
 
         items = []
@@ -4164,7 +4313,7 @@ def scan_create(req: ScanRequest):
             for sym in symbols:
                 base = {"as_of_date": d, "symbol": sym, "sector": sector_of.get(sym), "updated_at": datetime.now(timezone.utc)}
                 if sym not in seen or (d - seen[sym][0]).days > 7:
-                    items.append({**base, "stage": "prescreen", "status": "rejected", "reason": "no technical data for this date (run the S&P 500 loader)"})
+                    items.append({**base, "stage": "prescreen", "status": "rejected", "reason": f"no technical data for this date (run the {spec['label']} loader)"})
                     continue
                 td, prim, inter, adx, close = seen[sym]
                 reasons = []
@@ -4422,7 +4571,7 @@ def diagnosis():
     return {
         "variables": variables,
         "claude_provider": claude_provider() or "not configured",
-        "claude_model": os.environ.get("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL),
+        "claude_model": requested_model(),
         "env_local_present": os.path.isfile(".env.local"),
         "working_directory": os.getcwd(),
         "python_version": sys.version.split()[0],
@@ -4600,6 +4749,8 @@ def validate_portfolio_config(raw: dict) -> tuple[dict, dict]:
 class PortfolioRequest(BaseModel):
     """Numeric fields accept numbers or strings; they are checked by validate_portfolio_config so the API returns
     the same specific messages as the form instead of generic type errors."""
+    index: str = Field(DEFAULT_INDEX, pattern=INDEX_PATTERN, description="Which index the first N stocks come from")
+    model: str | None = Field(None, max_length=100, description="One of the configured models; default ANTHROPIC_MODEL")
     stock_count: int | float | str | None = Field(_PF_DEFAULT["stock_count"], description="First N constituents in ticker-symbol order")
     start_date: date = Field(date(2026, 1, 1))
     end_date: date | None = Field(None, description="Defaults to the latest stored trading day")
@@ -4627,9 +4778,9 @@ def _fnum(v, nd=4):
     return None if v is None else round(float(v), nd)
 
 
-def _portfolio_symbols(cur, count: int) -> list[dict]:
-    """First `count` active constituents in symbol order, with what is stored for each."""
-    universe = universe_state(cur)[:count]
+def _portfolio_symbols(cur, count: int, index: str = DEFAULT_INDEX) -> list[dict]:
+    """First `count` active constituents of the index in symbol order, with what is stored for each."""
+    universe = universe_state(cur, index)[:count]
     cur.execute(ENSURE_SYMBOL_DATA_SQL)
     cur.execute(f"SELECT symbol, fetched_at FROM {SYMBOL_DATA_TABLE}")
     bundles = {r[0]: r[1] for r in cur.fetchall()}
@@ -4642,13 +4793,14 @@ def _portfolio_symbols(cur, count: int) -> list[dict]:
 
 
 @app.get("/api/py/portfolio/symbols")
-def portfolio_symbols(count: int = 10):
+def portfolio_symbols(count: int = 10, index: str = DEFAULT_INDEX):
+    spec = index_spec(index)
     conn = db_connect()
     try:
         cur = conn.cursor()
-        rows = _portfolio_symbols(cur, max(1, min(count, 100)))
+        rows = _portfolio_symbols(cur, max(1, min(count, 600)), spec["key"])
         conn.commit()
-        return {"count": count, "symbols": rows}
+        return {"count": count, "index": spec["key"], "index_label": spec["label"], "symbols": rows}
     finally:
         conn.close()
 
@@ -4667,15 +4819,15 @@ def portfolio_prepare(req: PortfolioPrepareRequest):
             "bundle_fetched_at": bundle.get("fetched_at"), "annual_periods": s.get("annual_periods"), "log": log.entries}
 
 
-def _portfolio_backtests(cur, job_id: int, year: int) -> dict:
+def _portfolio_backtests(cur, job_id: int, year: int, model: str | None = None) -> dict:
     out = {}
     for skill_id in PORTFOLIO_SKILLS:
         skill = get_skill(skill_id)
         cur.execute(
-            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status) "
-            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active')",
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status, model_requested) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active', %s)",
             (skill_id, skill["version"], f"PORTFOLIO#{job_id}", year,
-             json.dumps({"portfolio_job": job_id, "data_source": skill.get("data_source")})),
+             json.dumps({"portfolio_job": job_id, "data_source": skill.get("data_source")}), model or requested_model()),
         )
         out[skill_id] = cur.fetchone()[0]
     return out
@@ -5247,8 +5399,14 @@ def portfolio_create(req: PortfolioRequest):
         raise HTTPException(status_code=422, detail=" ".join(errors.values()))
     if req.end_date and req.end_date < req.start_date:
         raise HTTPException(status_code=422, detail="The end date is before the start date.")
-    req = req.model_copy(update=values)
+    req = req.model_copy(update={**values, "model": resolve_model(req.model), "index": index_spec(req.index)["key"]})
+    with use_model(req.model):
+        return _portfolio_create(req)
+
+
+def _portfolio_create(req: PortfolioRequest):
     require_claude()
+    spec = index_spec(req.index)
     log = RunLog(PJOB_TABLE, "job_id")
     log.add(f"Claude: {describe_claude()}")
     conn = db_connect()
@@ -5258,11 +5416,11 @@ def portfolio_create(req: PortfolioRequest):
         ensure_backtest_tables(cur)
         if req.symbols:
             wanted = {normalize_symbol(s) for s in req.symbols}
-            rows = [u for u in _portfolio_symbols(cur, 600) if u["symbol"] in wanted]
+            rows = [u for u in _portfolio_symbols(cur, 600, spec["key"]) if u["symbol"] in wanted]
         else:
-            rows = _portfolio_symbols(cur, req.stock_count)
+            rows = _portfolio_symbols(cur, req.stock_count, spec["key"])
         if not rows:
-            raise HTTPException(status_code=422, detail="No constituents found (is dbo.SP500_CONSTITUENTS filled?).")
+            raise HTTPException(status_code=422, detail=f"No {spec['label']} constituents found (is {spec['table']} filled?).")
         symbols = [u["symbol"] for u in rows]
         not_ready = [u["symbol"] for u in rows if not u["ready"]]
         if not_ready:
@@ -5291,9 +5449,9 @@ def portfolio_create(req: PortfolioRequest):
                     f"OUTPUT INSERTED.job_id VALUES ('active', %s, %s, %s, %s, %s, %s, %s)",
                     (req.start_date, end, json.dumps(cfg), json.dumps(symbols), json.dumps(days), json.dumps(cursor), round(req.starting_capital, 2)))
         job_id = cur.fetchone()[0]
-        backtests = _portfolio_backtests(cur, job_id, req.start_date.year)
+        backtests = _portfolio_backtests(cur, job_id, req.start_date.year, req.model)
         log.row_id = job_id
-        log.add(f"Portfolio backtest #{job_id}: {len(symbols)} stocks ({', '.join(symbols)}), {len(days)} trading days {days[0]} to {days[-1]}, "
+        log.add(f"Portfolio backtest #{job_id}: {spec['label']}, model {req.model}, {len(symbols)} stocks ({', '.join(symbols)}), {len(days)} trading days {days[0]} to {days[-1]}, "
                 f"capital {req.starting_capital:,.0f}, {req.buy_amount:,.0f} per buy, max {req.max_buys_per_stock} buys/stock, take profit {req.take_profit_pct:g}%")
         log.add(f"Agent rules: Buffett -> Dimon -> Murphy with early exit; Buffett/Dimon cached {req.analysis_validity_days} days, rerun within "
                 f"{req.rerun_proximity_pct:g}% of the buy price, skipped when more than {req.skip_threshold_pct:g}% above it; held stocks reassessed every "

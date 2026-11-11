@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { api, DiagnosticsPanel, LiveLog, type Diagnostics, type LogEntry } from "./RunUi";
+import { IndexSelect, indexLabel, ModelSelect, type IndexId } from "./RunOptions";
 
 type Day = { as_of_date: string; total: number; open: number; prescreen_rejected: number; murphy_buy: number; in_range: number; buffett_buy: number; all3: number; failed: number };
 type Counts = { total: number; pending: number; running: number; failed: number; cancelled: number; prescreen_rejected: number; murphy_buy: number; in_range: number; buffett_buy: number; all3: number; ai_calls: number };
@@ -44,6 +45,8 @@ export default function ScanPanel() {
   const [running, setRunning] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [index, setIndex] = useState<IndexId>("sp500");
+  const [model, setModel] = useState("");
   const [startDate, setStartDate] = useState("2026-01-01");
   const [endDate, setEndDate] = useState(today());
   const [cadence, setCadence] = useState<"weekly" | "daily">("weekly");
@@ -133,11 +136,11 @@ export default function ScanPanel() {
     setLog([]);
     setSelectedDay(null);
     setHits([]);
-    note(`Creating scan: ${cadence} dates ${startDate} → ${endDate}; pre-screening every constituent from the TECH_ tables ...`);
+    note(`Creating ${indexLabel(index)} scan${model ? ` with ${model}` : ""}: ${cadence} dates ${startDate} → ${endDate}; pre-screening every constituent from the TECH_ tables ...`);
     try {
       const j = await api<Job>("/api/py/scan", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ start_date: startDate, end_date: endDate, cadence, require_primary_up: primaryUp, reject_intermediate_down: rejectInterDown,
+        body: JSON.stringify({ index, model: model || null, start_date: startDate, end_date: endDate, cadence, require_primary_up: primaryUp, reject_intermediate_down: rejectInterDown,
           min_adx: minAdx ? Number(minAdx) : null, max_symbols: maxSymbols ? Number(maxSymbols) : null }),
       });
       setJob(j);
@@ -210,6 +213,8 @@ export default function ScanPanel() {
       <DiagnosticsPanel diag={diag} error={diagError} onLog={(entries) => setLog((prev) => [...prev, ...entries])} />
 
       <form className="filters agent-form" onSubmit={(e) => { e.preventDefault(); create(); }}>
+        <IndexSelect value={index} onChange={setIndex} disabled={running || creating} />
+        <ModelSelect value={model} onChange={setModel} disabled={running || creating} />
         <label>From<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={running} /></label>
         <label>To<input type="date" value={endDate} max={today()} onChange={(e) => setEndDate(e.target.value)} disabled={running} /></label>
         <label>Dates
@@ -242,7 +247,7 @@ export default function ScanPanel() {
           <div className="progress-row">
             <div className="progress"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
             <span className="progress-text">
-              Scan #{job.job_id} · {processed.toLocaleString()} of {c.total.toLocaleString()} pairs settled · {c.ai_calls.toLocaleString()} model calls so far
+              Scan #{job.job_id} · {indexLabel(job.options.index as string)}{job.options.model ? ` · ${job.options.model}` : ""} · {processed.toLocaleString()} of {c.total.toLocaleString()} pairs settled · {c.ai_calls.toLocaleString()} model calls so far
               {c.pending + c.running > 0 && <> · {(c.pending + c.running).toLocaleString()} open</>}
               {job.status === "stopped" && <span className="stopped-chip">stopped</span>}
               {job.status === "done" && <span className="stopped-chip" style={{ background: "#0ca30c" }}>complete</span>}
