@@ -188,16 +188,28 @@ export default function PortfolioPanel() {
       note(`Resolving the first ${cfg.stock_count} ${indexLabel(index)} constituents in symbol order ...`);
       const sy = await api<{ symbols: SymbolInfo[] }>(`/api/py/portfolio/symbols?count=${cfg.stock_count}&index=${index}`);
       note(`Stocks: ${sy.symbols.map((s) => s.symbol).join(", ")}`);
+      // A stock that cannot be prepared (delisted, wrong ticker, Yahoo refusing) is left out with a warning;
+      // the backtest runs on the stocks that were prepared.
+      const prepared: string[] = [];
+      const skipped: string[] = [];
       for (let i = 0; i < sy.symbols.length; i++) {
         if (stopRef.current) throw new Error("Cancelled before the backtest was created");
         const s = sy.symbols[i];
         setPreparing(`${s.symbol} (${i + 1}/${sy.symbols.length})`);
-        const r = await api<{ prices: { action: string; added: number; last_date: string }; tech_last: string | null; log: LogEntry[] }>(
-          "/api/py/portfolio/prepare", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol: s.symbol }) });
-        note(`${s.symbol}: prices ${r.prices.action} (+${r.prices.added}, latest ${r.prices.last_date}); technical data to ${r.tech_last ?? "?"}; fundamentals bundle ready`);
+        try {
+          const r = await api<{ prices: { action: string; added: number; last_date: string }; tech_last: string | null; log: LogEntry[] }>(
+            "/api/py/portfolio/prepare", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol: s.symbol }) });
+          note(`${s.symbol}: prices ${r.prices.action} (+${r.prices.added}, latest ${r.prices.last_date}); technical data to ${r.tech_last ?? "?"}; fundamentals bundle ready`);
+          prepared.push(s.symbol);
+        } catch (e) {
+          skipped.push(s.symbol);
+          note(`${s.symbol}: SKIPPED, left out of the backtest - ${e instanceof Error ? e.message : "could not prepare the data"}`, "warn");
+        }
       }
       setPreparing(null);
-      const body = { ...cfg, index, model: model || null, start_date: startDate, end_date: endDate || null };
+      if (!prepared.length) throw new Error("No stock could be prepared; the backtest was not created.");
+      if (skipped.length) note(`Backtest runs on ${prepared.length} of ${sy.symbols.length} stocks; left out: ${skipped.join(", ")}`, "warn");
+      const body = { ...cfg, index, model: model || null, start_date: startDate, end_date: endDate || null, ...(skipped.length ? { symbols: prepared } : {}) };
       const s = await api<State>("/api/py/portfolio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       setJob(s);
       if (s.log) setLog((prev) => [...prev, ...s.log!]);
