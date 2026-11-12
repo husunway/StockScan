@@ -513,3 +513,5 @@ strong.neg { color: var(--down); }
 .pcal-activity-row .sug { color: var(--text); font-weight: 600; }
 .pcal-activity-row .c2 { color: var(--accent); font-weight: 600; }
 .pcal-activity-row .c3 { color: var(--ok); font-weight: 700; }
+
+.pcal-act-filters { margin: 8px 0; gap: 12px; align-items: flex-end; }

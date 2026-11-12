@@ -103,6 +103,9 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
   const months = useMemo(() => monthsBetween(job.start_date, job.end_date), [job.start_date, job.end_date]);
   const tradingDays = useMemo(() => new Set(job.days), [job.days]);
   const [filter, setFilter] = useState<string | null>(null);
+  // Agent activity filters; default: BUY recommendations from fresh runs only.
+  const [recFilter, setRecFilter] = useState<"all" | "BUY" | "HOLD" | "SELL">("BUY");
+  const [freshOnly, setFreshOnly] = useState(true);
   const [monthIdx, setMonthIdx] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<DayDetail | null>(null);
@@ -193,7 +196,11 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
   const inRange = (d: string) => d >= job.start_date && d <= job.end_date;
   const decisionHref = (skill: string, id: number | null | undefined) => (id ? `/agent/backtest/decision?bt=${job.backtests[skill]}&id=${id}` : null);
   const rowsShown = (detail?.trades ?? []).filter((t) => !filter || t.symbol === filter);
-  const runsShown = (detail?.assessments ?? []).filter((r) => !filter || r.symbol === filter);
+  const runsForStock = (detail?.assessments ?? []).filter((r) => !filter || r.symbol === filter);
+  // Fresh = a new model run that day (run, rerun or held-stock reassessment), not cached, skipped or reused.
+  const isFresh = (r: DayRun) => ["run", "rerun", "reassess"].includes(r.mode) && !r.reused_from_id;
+  const runsShown = runsForStock.filter((r) =>
+    (recFilter === "all" || (r.recommendation ?? "").trim().toUpperCase() === recFilter) && (!freshOnly || isFresh(r)));
 
   return (
     <div className="pcal-layout">
@@ -328,8 +335,25 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
               )}
 
               <details className="pcal-activity">
-                <summary>Agent activity on this day ({runsShown.length})</summary>
-                {runsShown.length === 0 ? <p className="msg">No agent runs.</p> : (
+                <summary>Agent activity on this day ({runsShown.length === runsForStock.length ? runsShown.length : `${runsShown.length} of ${runsForStock.length}`})</summary>
+                <div className="filters pcal-act-filters">
+                  <label>
+                    Recommendation
+                    <select value={recFilter} onChange={(e) => setRecFilter(e.target.value as typeof recFilter)}>
+                      <option value="all">all</option><option value="BUY">BUY</option><option value="HOLD">HOLD</option><option value="SELL">SELL</option>
+                    </select>
+                  </label>
+                  <label>
+                    Runs
+                    <select value={freshOnly ? "fresh" : "all"} onChange={(e) => setFreshOnly(e.target.value === "fresh")}>
+                      <option value="fresh">fresh runs only</option><option value="all">all (incl. cached, skipped, reused)</option>
+                    </select>
+                  </label>
+                  {(recFilter !== "all" || freshOnly) && (
+                    <button type="button" className="linklike" onClick={() => { setRecFilter("all"); setFreshOnly(false); }}>show all</button>
+                  )}
+                </div>
+                {runsShown.length === 0 ? <p className="msg">{runsForStock.length ? "No agent runs match the filters." : "No agent runs."}</p> : (
                   <div className="table-wrap">
                     <table className="table compact">
                       <thead><tr><th>Ticker</th><th>Agent</th><th className="num" title="Previous close: the price the agent decided on">Decision price</th><th className="num" title="This day's closing price">Close</th><th className="num">Buy price</th><th className="num">Target</th><th>Decision</th><th>Status</th><th className="num">Est. cost</th></tr></thead>
