@@ -56,7 +56,9 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .nav-group { display: flex; flex-direction: column; gap: 2px; }
 .side-nav a.sub { padding: 6px 10px 6px 38px; font-size: 0.88rem; }
 
-.signout { margin-top: auto; }
+.app-version { margin-top: auto; padding: 0 8px; font-size: 0.75rem; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+.app-version span { font-size: 0.7rem; }
+.signout { margin-top: 0; }
 .signout button {
   width: 100%; padding: 8px 10px; font-size: 0.9rem; text-align: left; cursor: pointer;
   border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--muted);
@@ -508,5 +510,6 @@ strong.neg { color: var(--down); }
 .pcal-cost { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 10px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
 .pcal-activity-row { display: flex; flex-wrap: wrap; gap: 2px 6px; font-size: 0.66rem; line-height: 1.2; color: var(--muted); font-variant-numeric: tabular-nums; }
 .pcal-activity-row .zero { opacity: 0.45; }
+.pcal-activity-row .sug { color: var(--text); font-weight: 600; }
 .pcal-activity-row .c2 { color: var(--accent); font-weight: 600; }
 .pcal-activity-row .c3 { color: var(--ok); font-weight: 700; }

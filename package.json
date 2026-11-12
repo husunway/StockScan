@@ -1,6 +1,6 @@
 {
   "name": "stockscan",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
     "fastapi-dev": "python -m uvicorn api.index:app --reload --port 8000",

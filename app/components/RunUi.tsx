@@ -15,6 +15,7 @@ export type Diagnostics = {
   skills: string[];
   vercel: boolean;
   python: string;
+  build?: { commit: string | null; env: string; deployment: string | null };
 };
 
 export async function api<T>(url: string, init?: RequestInit): Promise<T> {
@@ -105,6 +106,9 @@ export function DiagnosticsPanel({ diag, error, onLog, showAi = true }: { diag: 
             <strong>{diag.vercel ? "Vercel function" : "local"} · Python {diag.python}</strong>
             <span>skills: {diag.skills.join(", ") || "none found"}</span>
             <span className="tile-note">{diag.skills_dir}</span>
+            <span className="tile-note" title="Commit of the deployed API; compare with the version in the sidebar (web page)">
+              API build: {diag.build?.commit ?? "local"} · {diag.build?.env ?? "?"} · web page {process.env.NEXT_PUBLIC_GIT_SHA || "?"} (v{process.env.NEXT_PUBLIC_APP_VERSION})
+            </span>
           </div>
         </div>
       )}

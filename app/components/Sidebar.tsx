@@ -6,6 +6,11 @@ import { Suspense } from "react";
 
 type Item = { href: string; label: string; icon?: string; children?: Item[] };
 
+const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION ?? "?";
+const GIT_SHA = process.env.NEXT_PUBLIC_GIT_SHA ?? "";
+const BUILD_TIME = process.env.NEXT_PUBLIC_BUILD_TIME ?? "";
+const DEPLOY_ENV = process.env.NEXT_PUBLIC_DEPLOY_ENV ?? "";
+
 const items: Item[] = [
   { href: "/", label: "Dashboard", icon: "▦" },
   {
@@ -89,6 +94,10 @@ function SidebarNav() {
           <span className="icon">{"{}"}</span>API Docs
         </a>
       </nav>
+      <div className="app-version" title={`Version ${APP_VERSION}${GIT_SHA ? `, commit ${GIT_SHA}` : ""}${DEPLOY_ENV ? `, ${DEPLOY_ENV}` : ""}${BUILD_TIME ? `, built ${BUILD_TIME.slice(0, 16).replace("T", " ")} UTC` : ""}`}>
+        v{APP_VERSION}{GIT_SHA ? ` · ${GIT_SHA}` : ""}
+        {BUILD_TIME && <span>built {BUILD_TIME.slice(0, 16).replace("T", " ")} UTC</span>}
+      </div>
       <form action="/api/auth/logout" method="post" className="signout">
         <button type="submit">Sign out</button>
       </form>

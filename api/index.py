@@ -254,7 +254,7 @@ def save_prices(symbol: str, rows: list[PriceRow]) -> None:
 # ---------------------------------------------------------------------------
 @app.get("/api/py/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "build": api_build()}
 
 
 # ---------------------------------------------------------------------------
@@ -1399,6 +1399,7 @@ def env_diagnostics() -> dict:
         "skills_dir": str(SKILLS_DIR),
         "vercel": bool(os.environ.get("VERCEL")),
         "python": platform.python_version(),
+        "build": api_build(),
     }
 
 
@@ -1436,6 +1437,13 @@ class RunLog:
     def step(self, message: str, level: str = "info", cur=None) -> None:
         self.add(message, level)
         self.save(cur)
+
+
+def api_build() -> dict:
+    """Which deployment this API process is: Vercel's commit and environment (empty locally)."""
+    sha = os.environ.get("VERCEL_GIT_COMMIT_SHA") or ""
+    return {"commit": sha[:7] or None, "env": os.environ.get("VERCEL_ENV") or "local",
+            "deployment": os.environ.get("VERCEL_URL") or None}
 
 
 def describe_db() -> str:
@@ -5412,7 +5420,7 @@ def _portfolio_state(cur, job_id: int, trades_limit: int = 100, assessments_limi
     for sim_date, sym, skipped, fresh, b, dm, mu in cur.fetchall():
         c2 = 1 if (b and dm) else 0
         day_activity.append({"trade_date": sim_date.isoformat(), "symbol": sym, "skipped": skipped or 0, "fresh": fresh or 0,
-                             "consensus2": c2, "consensus3": 1 if (c2 and mu) else 0})
+                             "suggested": 1 if (b or dm or mu) else 0, "consensus2": c2, "consensus3": 1 if (c2 and mu) else 0})
     total = job["cash"] + mv
     cap = job["config"]["starting_capital"]
     c = job["cursor"]

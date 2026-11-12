@@ -10,7 +10,7 @@ export type CalendarJob = {
   job_id: number; status: string; start_date: string; end_date: string; days: string[]; backtests: Record<string, number>;
   config: { starting_capital: number }; snapshots: Snapshot[]; trade_days: TradeDay[];
   ai_costs?: { trade_date: string; cost: number; calls: number }[]; ai_cost_currency?: string;
-  day_activity?: { trade_date: string; symbol: string; skipped: number; fresh: number; consensus2: number; consensus3: number }[];
+  day_activity?: { trade_date: string; symbol: string; skipped: number; fresh: number; suggested?: number; consensus2: number; consensus3: number }[];
 };
 type AgentInfo = {
   buy_price: number | null; target_price: number | null; stop_price: number | null; recommendation: string | null;
@@ -132,11 +132,11 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
   }, [job.trade_days, filter]);
   const tickers = useMemo(() => [...new Set(job.trade_days.map((t) => t.symbol))].sort(), [job.trade_days]);
   const activity = useMemo(() => {
-    const map = new Map<string, { skipped: number; fresh: number; c2: number; c3: number }>();
+    const map = new Map<string, { skipped: number; fresh: number; sug: number; c2: number; c3: number }>();
     for (const a of job.day_activity ?? []) {
       if (filter && a.symbol !== filter) continue;
-      const e = map.get(a.trade_date) ?? { skipped: 0, fresh: 0, c2: 0, c3: 0 };
-      e.skipped += a.skipped; e.fresh += a.fresh; e.c2 += a.consensus2; e.c3 += a.consensus3;
+      const e = map.get(a.trade_date) ?? { skipped: 0, fresh: 0, sug: 0, c2: 0, c3: 0 };
+      e.skipped += a.skipped; e.fresh += a.fresh; e.sug += a.suggested ?? 0; e.c2 += a.consensus2; e.c3 += a.consensus3;
       map.set(a.trade_date, e);
     }
     return map;
@@ -223,13 +223,13 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
             const st = dayStats.get(date);
             const c = counts.get(date);
             const ai = costByDay.get(date);
-            const act = activity.get(date) ?? { skipped: 0, fresh: 0, c2: 0, c3: 0 };
+            const act = activity.get(date) ?? { skipped: 0, fresh: 0, sug: 0, c2: 0, c3: 0 };
             const cls = !inRange(date) ? "out" : !trading ? "closed" : !st ? "pending" : heat(st.pct);
             return (
               <button type="button" key={date} className={`pcal-cell ${cls} ${selected === date ? "sel" : ""}`} onClick={() => setSelected(date)}
                 title={!inRange(date) ? `${date}: outside the backtest range` : !trading ? `${date}: market closed` : !st ? `${date}: not simulated yet`
                   : `${date}: ${signed(st.change)} (${pct(st.pct)}), total ${money(st.total, 0)}${c ? ` · ${c.buys} buy(s), ${c.sells} sell(s)` : ""}`
-                    + ` · ${act.skipped} skipped, ${act.fresh} fresh run(s), ${act.c2} stock(s) at 2-agent consensus, ${act.c3} at 3-agent consensus`
+                    + ` · ${act.sug} suggested buy(s), ${act.skipped} skipped, ${act.fresh} fresh run(s), ${act.c2} stock(s) at 2-agent consensus, ${act.c3} at 3-agent consensus`
                     + ` · est. AI cost ${usd(ai?.cost ?? 0, currency)} (${ai?.calls ?? 0} model call${ai?.calls === 1 ? "" : "s"})`}>
                 <span className="pcal-day">{day}</span>
                 {c && (c.buys > 0 || c.sells > 0) && (
@@ -242,6 +242,7 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
                   <span className="pcal-activity-row">
                     <span className={act.skipped ? "" : "zero"} title="Agent assessments skipped (price far above the buy price, NOT BUY without a model call)">S{act.skipped}</span>
                     <span className={act.fresh ? "" : "zero"} title="Fresh model runs (reused analyses not counted)">F{act.fresh}</span>
+                    <span className={act.sug ? "sug" : "zero"} title="Suggested buys: stocks where at least one agent recommended buying">B{act.sug}</span>
                     <span className={act.c2 ? "c2" : "zero"} title="Stocks where Buffett and Dimon both recommended buying">2✓{act.c2}</span>
                     <span className={act.c3 ? "c3" : "zero"} title="Stocks where all three agents recommended buying">3✓{act.c3}</span>
                   </span>
@@ -265,7 +266,7 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
             {HEAT_STEPS.map((s, i) => <i key={`u${s}`} className={`pcal-key heat-up-${i + 1}`} title={`gain ≥ ${s}%`} />)}
             <span className="tile-note">−{HEAT_STEPS[HEAT_STEPS.length - 1]}% … +{HEAT_STEPS[HEAT_STEPS.length - 1]}% and beyond</span>
           </span>
-          <span className="pcal-activity-legend">S skipped · F fresh model runs · 2✓ Buffett + Dimon agreed · 3✓ all three agreed</span>
+          <span className="pcal-activity-legend">S skipped · F fresh model runs · B suggested buys (stocks with at least one agent BUY) · 2✓ Buffett + Dimon agreed · 3✓ all three agreed</span>
           <span><i className="pcal-key closed" /> market closed</span><span><i className="pcal-key pending" /> not simulated yet</span>
         </div>
       </div>
