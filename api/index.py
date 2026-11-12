@@ -5466,10 +5466,13 @@ def _portfolio_create(req: PortfolioRequest):
             rows = _portfolio_symbols(cur, req.stock_count, spec["key"])
         if not rows:
             raise HTTPException(status_code=422, detail=f"No {spec['label']} constituents found (is {spec['table']} filled?).")
-        symbols = [u["symbol"] for u in rows]
+        # Stocks that cannot take part are left out with a warning; the backtest stops only when none is left.
         not_ready = [u["symbol"] for u in rows if not u["ready"]]
         if not_ready:
-            raise HTTPException(status_code=422, detail=f"Not ready (prices, TECH_ tables or data bundle missing): {', '.join(not_ready)}. "
+            log.add(f"Left out, data not ready (prices, TECH_ tables or data bundle missing): {', '.join(not_ready)}", "warn")
+        symbols = [u["symbol"] for u in rows if u["ready"]]
+        if not symbols:
+            raise HTTPException(status_code=422, detail=f"No stock is ready (prices, TECH_ tables or data bundle missing): {', '.join(not_ready)}. "
                                                         f"Use 'Prepare data' first.")
         placeholders = ", ".join("%s" for _ in symbols)
         cur.execute(f"SELECT MAX(trade_date) FROM {TABLE} WHERE symbol IN ({placeholders})", tuple(symbols))
@@ -5486,7 +5489,10 @@ def _portfolio_create(req: PortfolioRequest):
         history = {r[0]: r[1] for r in cur.fetchall()}
         thin = [s for s in symbols if history.get(s, 0) < 30]
         if thin:
-            raise HTTPException(status_code=422, detail=f"Fewer than 30 price rows before {req.start_date} for: {', '.join(thin)}.")
+            log.add(f"Left out, fewer than 30 price rows before {req.start_date}: {', '.join(thin)}", "warn")
+            symbols = [s for s in symbols if s not in thin]
+            if not symbols:
+                raise HTTPException(status_code=422, detail=f"Fewer than 30 price rows before {req.start_date} for every stock: {', '.join(thin)}.")
         cfg = req.model_dump(mode="json")
         cfg["end_date"] = end.isoformat()
         cursor = {"idx": 0, "phase": "sell", "sym": 0, "stage": "buffett"}
