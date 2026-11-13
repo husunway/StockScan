@@ -161,7 +161,7 @@ export default function DecisionView() {
             <>
               <p className="msg hint" style={{ marginTop: 0 }}>
                 <a href={htmlUrl} target="_blank" rel="noreferrer">Open in a new tab</a> ·{" "}
-                {d.report_html_stored ? "stored in Vercel Blob" : "generated on demand"} · chart and evidence use only data dated on or before {d.as_of_date}
+                {d.report_html_stored ? "stored in file storage" : "generated on demand"} · chart and evidence use only data dated on or before {d.as_of_date}
               </p>
               <iframe className="pdf-frame report-frame" src={htmlUrl} title={`Interactive report ${d.symbol} ${d.as_of_date}`} />
             </>
@@ -170,7 +170,7 @@ export default function DecisionView() {
               <p className="msg hint" style={{ marginTop: 0 }}>
                 <a href={reportUrl} target="_blank" rel="noreferrer">Open in a new tab</a> ·{" "}
                 <a href={reportUrl} download>Download</a> ·{" "}
-                {d.report_stored ? "stored in Vercel Blob" : "generated on demand (no Blob store configured when this run completed)"} ·{" "}
+                {d.report_stored ? "stored in file storage" : "generated on demand (no file storage configured when this run completed)"} ·{" "}
                 {d.model} · {d.input_tokens?.toLocaleString()} in / {d.output_tokens?.toLocaleString()} out tokens
               </p>
               <iframe className="pdf-frame" src={reportUrl} title={`Report ${d.symbol} ${d.as_of_date}`} />

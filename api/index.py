@@ -1396,8 +1396,9 @@ def env_diagnostics() -> dict:
             "user": os.environ.get("AZURE_SQL_USER") or None,
             "variables": [_set("AZURE_SQL_SERVER"), _set("AZURE_SQL_DATABASE"), _set("AZURE_SQL_USER"), _set("AZURE_SQL_PASSWORD")],
         },
-        "blob": {"configured": blob_configured(), "access": blob_access(),
-                 "variables": [_set("BLOB_READ_WRITE_TOKEN"), _set("BLOB_ACCESS")]},
+        "blob": {"configured": blob_configured(), "access": blob_access(), "backend": storage_backend(), "label": storage_label(),
+                 "variables": [_set("AZURE_STORAGE_CONNECTION_STRING"), _set("AZURE_STORAGE_CONTAINER"),
+                               _set("BLOB_READ_WRITE_TOKEN"), _set("BLOB_ACCESS")]},
         "skills_dir": str(SKILLS_DIR),
         "vercel": bool(os.environ.get("VERCEL")),
         "python": platform.python_version(),
@@ -1713,7 +1714,7 @@ def point_in_time_bundle(raw: dict, prices_df, as_of: date, skill: dict) -> tupl
 
 
 # ---------------------------------------------------------------------------
-# Decision report PDF (fpdf2, core Helvetica -> Latin-1 text) and Vercel Blob storage
+# Decision report PDF (fpdf2, core Helvetica -> Latin-1 text) and file storage (Azure Blob Storage or Vercel Blob)
 # ---------------------------------------------------------------------------
 _LATIN1_MAP = {
     "–": "-", "—": "-", "−": "-", "‘": "'", "’": "'", "“": '"', "”": '"',
@@ -1883,25 +1884,87 @@ def build_decision_pdf(skill: dict, symbol: str, as_of: str, analysis: dict, ref
     return bytes(pdf.output())
 
 
+# File storage for reports, data bundles and run archives. Azure Blob Storage is used when
+# AZURE_STORAGE_CONNECTION_STRING is set (container AZURE_STORAGE_CONTAINER, default "stockscan", created private if
+# missing); otherwise Vercel Blob (BLOB_READ_WRITE_TOKEN). Pathnames are the same in both, e.g. reports/<skill>/<symbol>/...
+def storage_backend() -> str | None:
+    if (os.environ.get("AZURE_STORAGE_CONNECTION_STRING") or "").strip():
+        return "azure"
+    if os.environ.get("BLOB_READ_WRITE_TOKEN") or os.environ.get("VERCEL_BLOB_READ_WRITE_TOKEN"):
+        return "vercel"
+    return None
+
+
+def storage_label() -> str:
+    return {"azure": "Azure Blob Storage", "vercel": "Vercel Blob"}.get(storage_backend() or "", "file storage")
+
+
+def azure_container_name() -> str:
+    return (os.environ.get("AZURE_STORAGE_CONTAINER") or "stockscan").strip().lower() or "stockscan"
+
+
 def blob_access() -> str:
+    if storage_backend() == "azure":
+        return f"private, container {azure_container_name()}"
     return os.environ.get("BLOB_ACCESS", "private").strip().lower() or "private"
 
 
 def blob_configured() -> bool:
-    return bool(os.environ.get("BLOB_READ_WRITE_TOKEN") or os.environ.get("VERCEL_BLOB_READ_WRITE_TOKEN"))
+    return storage_backend() is not None
 
 
-def upload_report(pathname: str, pdf_bytes: bytes) -> dict:
+_AZURE_CONTAINER = None
+_AZURE_LOCK = threading.Lock()
+
+
+def _azure_container():
+    """One thread-safe container client per process; the container is created (private) on first use if missing."""
+    global _AZURE_CONTAINER
+    with _AZURE_LOCK:
+        if _AZURE_CONTAINER is None:
+            from azure.core.exceptions import HttpResponseError, ResourceExistsError
+            from azure.storage.blob import BlobServiceClient
+
+            svc = BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"].strip())
+            container = svc.get_container_client(azure_container_name())
+            try:
+                container.create_container()
+            except ResourceExistsError:
+                pass
+            except HttpResponseError as e:  # a SAS without create rights: assume the container exists
+                if getattr(e, "status_code", None) not in (403, 409):
+                    raise
+            _AZURE_CONTAINER = container
+    return _AZURE_CONTAINER
+
+
+def blob_put(pathname: str, body: bytes, content_type: str) -> dict:
+    """Store (overwrite) one file; returns its pathname and URL (an Azure URL needs credentials to open)."""
+    if storage_backend() == "azure":
+        from azure.storage.blob import ContentSettings
+
+        client = _azure_container().upload_blob(pathname, body, overwrite=True, content_settings=ContentSettings(content_type=content_type))
+        return {"pathname": pathname, "url": client.url}
     from vercel.blob.sync import put_blob
 
-    r = put_blob(pathname, pdf_bytes, access=blob_access(), content_type="application/pdf", allow_overwrite=True)
+    r = put_blob(pathname, body, access=blob_access(), content_type=content_type, allow_overwrite=True)
     return {"pathname": r.pathname, "url": r.url}
 
 
-def download_report(pathname: str) -> bytes:
+def blob_get(pathname: str) -> bytes:
+    if storage_backend() == "azure":
+        return _azure_container().download_blob(pathname).readall()
     from vercel.blob.sync import get_blob
 
     return get_blob(pathname, access=blob_access()).body
+
+
+def upload_report(pathname: str, pdf_bytes: bytes) -> dict:
+    return blob_put(pathname, pdf_bytes, "application/pdf")
+
+
+def download_report(pathname: str) -> bytes:
+    return blob_get(pathname)
 
 
 def report_pathname(skill_id: str, symbol: str, as_of: str, decision_id: int) -> str:
@@ -1910,7 +1973,7 @@ def report_pathname(skill_id: str, symbol: str, as_of: str, decision_id: int) ->
 
 
 # ---------------------------------------------------------------------------
-# Symbol data bundle: everything the skills need, downloaded once per symbol and stored in Vercel Blob
+# Symbol data bundle: everything the skills need, downloaded once per symbol and stored in file storage
 # (data/<SYMBOL>/latest.json + a dated copy) and in dbo.symbol_data. AI runs read the bundle, never Yahoo.
 # ---------------------------------------------------------------------------
 SYMBOL_DATA_TABLE = "dbo.symbol_data"
@@ -2036,11 +2099,9 @@ def store_symbol_bundle(bundle: dict, log: "RunLog | None" = None) -> dict:
     symbol = bundle["symbol"]
     stamp = bundle["fetched_at"][:19].replace(":", "-")
     if blob_configured():
-        from vercel.blob.sync import put_blob
-
         def put(name: str, obj) -> int:
             body = json.dumps(obj, indent=1).encode()
-            r = put_blob(name, body, access=blob_access(), content_type="application/json", allow_overwrite=True)
+            blob_put(name, body, "application/json")
             return len(body)
 
         base = f"data/{symbol}"
@@ -2061,15 +2122,14 @@ def store_symbol_bundle(bundle: dict, log: "RunLog | None" = None) -> dict:
         # ... plus the complete bundle the runs read, a dated snapshot, and a manifest.
         full = json.dumps(bundle).encode()
         for name in (f"{base}/{stamp}.json", f"{base}/latest.json"):
-            r = put_blob(name, full, access=blob_access(), content_type="application/json", allow_overwrite=True)
-            bundle["data_pathname"] = r.pathname
+            bundle["data_pathname"] = blob_put(name, full, "application/json")["pathname"]
         files.append({"path": f"{base}/latest.json", "bytes": len(full)})
         files.append({"path": f"{base}/{stamp}.json", "bytes": len(full)})
         manifest = {"symbol": symbol, "fetched_at": bundle["fetched_at"], "source": bundle.get("source"), "files": files}
         put(f"{base}/index.json", manifest)
         bundle["data_files"] = [f["path"] for f in files] + [f"{base}/index.json"]
         if log:
-            log.step(f"Data stored in Vercel Blob under {base}/: {len(bundle['data_files'])} files - profile, quote summary, "
+            log.step(f"Data stored in {storage_label()} under {base}/: {len(bundle['data_files'])} files - profile, quote summary, "
                      f"earnings dates, prices, 3 annual + 3 quarterly statements, latest.json ({len(full) / 1024:.0f} KB), "
                      f"snapshot {stamp}.json, index.json")
     elif log:
@@ -2128,16 +2188,14 @@ def archive_run_json(prefix: str, payload: dict | None, output: dict | None, log
     if not blob_configured():
         return
     try:
-        from vercel.blob.sync import put_blob
-
         for name, obj in ((f"{prefix}-input.json", payload), (f"{prefix}-output.json", output)):
             if obj is not None:
-                put_blob(name, json.dumps(obj).encode(), access=blob_access(), content_type="application/json", allow_overwrite=True)
+                blob_put(name, json.dumps(obj).encode(), "application/json")
         if log:
-            log.add(f"Run input/output archived in Vercel Blob: {prefix}-input.json, {prefix}-output.json")
+            log.add(f"Run input/output archived in {storage_label()}: {prefix}-input.json, {prefix}-output.json")
     except Exception as e:  # noqa: BLE001
         if log:
-            log.add(f"Could not archive run JSON in Blob: {type(e).__name__}: {str(e)[:150]}", "warn")
+            log.add(f"Could not archive run JSON in {storage_label()}: {type(e).__name__}: {str(e)[:150]}", "warn")
 
 
 class PrepareRequest(BaseModel):
@@ -2369,7 +2427,7 @@ def _create_backtest(req: BacktestRequest, model: str):
     log.add(f"Claude: {describe_claude()}")
     claude_hello(log)  # first AI call of the run: prove the model answers before any data work
     log.add(f"Database: {describe_db()} ({_set('AZURE_SQL_PASSWORD')})")
-    log.add(f"Blob storage: {'configured, access=' + blob_access() if blob_configured() else 'not configured - PDFs will be generated on demand'}")
+    log.add(f"File storage: {storage_label() + ', access=' + blob_access() if blob_configured() else 'not configured - PDFs will be generated on demand'}")
     skill = get_skill(req.skill.strip().lower())
     log.add(f"Skill loaded: {skill['path']} v{skill.get('version') or '-'} ({len(skill['instructions'])} chars)")
     symbol = normalize_symbol(req.symbol)
@@ -2491,7 +2549,7 @@ def resume_backtest(backtest_id: int):
 
 @app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}/report.pdf")
 def decision_report(backtest_id: int, decision_id: int):
-    """The stored PDF from Vercel Blob; regenerated from the stored output if the blob is missing."""
+    """The stored PDF from file storage; regenerated from the stored output if the file is missing or unreachable."""
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -2672,7 +2730,7 @@ def _execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: s
                 f"stop {analysis.get('stop_price')}; {len(warnings)} warning(s)")
         result = {"analysis": analysis, "warnings": warnings, "model": response.model,
                   "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
-        # Build the PDF now and store it in Vercel Blob; a storage failure is a warning, not a failed decision.
+        # Build the PDF now and store it in file storage; a storage failure is a warning, not a failed decision.
         log.step("Generating PDF report ...")
         generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         pdf_bytes = build_decision_pdf(skill, symbol, as_of.isoformat(), analysis, references,
@@ -2685,18 +2743,18 @@ def _execute_decision(backtest_id: int, decision_id: int, skill: dict, symbol: s
         log.add(f"HTML report generated: {len(html_text) / 1024:.0f} KB, chart from {chart.get('source')} with {len(chart.get('bars', []))} bars")
         if blob_configured():
             pathname = report_pathname(skill_id, symbol, as_of.isoformat(), decision_id)
-            log.step(f"Uploading PDF and HTML reports to Vercel Blob ({blob_access()}): {pathname[:-4]}.{{pdf,html}}")
+            log.step(f"Uploading PDF and HTML reports to {storage_label()} ({blob_access()}): {pathname[:-4]}.{{pdf,html}}")
             try:
                 t0 = time.monotonic()
                 report = upload_report(pathname, pdf_bytes)
                 html_report = upload_html_report(pathname[:-4] + ".html", html_text)
-                log.add(f"Stored in Vercel Blob in {time.monotonic() - t0:.1f} s")
+                log.add(f"Stored in {storage_label()} in {time.monotonic() - t0:.1f} s")
                 archive_run_json(pathname[:-4], payload, analysis, log)
             except Exception as e:  # noqa: BLE001
-                warnings.append(f"Report PDF could not be stored in Vercel Blob ({type(e).__name__}: {str(e)[:200]}); it will be generated on demand.")
-                log.add(f"Blob upload failed: {type(e).__name__}: {str(e)[:200]}", "warn")
+                warnings.append(f"Report PDF could not be stored in {storage_label()} ({type(e).__name__}: {str(e)[:200]}); it will be generated on demand.")
+                log.add(f"{storage_label()} upload failed: {type(e).__name__}: {str(e)[:200]}", "warn")
         else:
-            warnings.append("BLOB_READ_WRITE_TOKEN is not configured; the report PDF is generated on demand instead of stored.")
+            warnings.append("No file storage is configured (AZURE_STORAGE_CONNECTION_STRING); the report PDF is generated on demand instead of stored.")
             log.add("Blob storage not configured; PDF will be generated on demand", "warn")
     except HTTPException as e:
         error = str(e.detail)[:1000]
@@ -3737,10 +3795,7 @@ def build_decision_html(skill: dict, symbol: str, as_of: str, analysis: dict, re
 
 
 def upload_html_report(pathname: str, html_text: str) -> dict:
-    from vercel.blob.sync import put_blob
-
-    r = put_blob(pathname, html_text.encode("utf-8"), access=blob_access(), content_type="text/html; charset=utf-8", allow_overwrite=True)
-    return {"pathname": r.pathname, "url": r.url}
+    return blob_put(pathname, html_text.encode("utf-8"), "text/html; charset=utf-8")
 
 
 @app.get("/api/py/tech/{symbol}/chart.html")
@@ -3759,7 +3814,7 @@ def tech_chart_html(symbol: str, as_of: date | None = None):
 
 @app.get("/api/py/agent/backtest/{backtest_id}/decision/{decision_id}/report.html")
 def decision_report_html(backtest_id: int, decision_id: int):
-    """The stored HTML report from Vercel Blob; regenerated from the stored output (and point-in-time chart data) if missing."""
+    """The stored HTML report from file storage; regenerated from the stored output (and point-in-time chart data) if missing."""
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -4598,13 +4653,13 @@ def scan_step(job_id: int):
 
 
 SECRET_VARS = {"AZURE_SQL_PASSWORD", "AUTH_PASSWORD", "AUTH_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY",
-               "BLOB_READ_WRITE_TOKEN"}
+               "BLOB_READ_WRITE_TOKEN", "AZURE_STORAGE_CONNECTION_STRING"}
 CONFIG_VARS = (
     "AZURE_SQL_SERVER", "AZURE_SQL_DATABASE", "AZURE_SQL_USER", "AZURE_SQL_PASSWORD",
     "AUTH_USERNAME", "AUTH_PASSWORD", "AUTH_SECRET",
     "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL",
     "ANTHROPIC_API_KEY", "DEFAULT_AI_MODEL",
-    "BLOB_READ_WRITE_TOKEN", "BLOB_ACCESS",
+    "AZURE_STORAGE_CONNECTION_STRING", "AZURE_STORAGE_CONTAINER", "BLOB_READ_WRITE_TOKEN", "BLOB_ACCESS",
 )
 
 

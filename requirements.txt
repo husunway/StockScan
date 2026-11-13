@@ -8,3 +8,4 @@ pymssql>=2.3.4
 anthropic>=1.0
 fpdf2>=2.8
 vercel-blob>=0.5
+azure-storage-blob>=12.19

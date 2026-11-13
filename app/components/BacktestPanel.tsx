@@ -222,7 +222,7 @@ export default function BacktestPanel() {
         body: JSON.stringify({ symbol: s, refresh }),
       });
       for (const e of r.log ?? []) setClientLog((prev) => [...prev, e]);
-      note(`Data bundle ready${r.data_pathname ? ` - stored in Blob at ${r.data_pathname}` : ""}`);
+      note(`Data bundle ready${r.data_pathname ? ` - stored in file storage at ${r.data_pathname}` : ""}`);
       await loadDataStatus(s);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Data download failed";

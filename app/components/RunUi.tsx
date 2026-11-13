@@ -10,7 +10,7 @@ export type Diagnostics = {
     server: string | null; database: string | null; user: string | null; variables: string[];
     connected?: boolean; latency_ms?: number; version?: string; symbols_loaded?: number; price_rows?: number; error?: string;
   };
-  blob: { configured: boolean; access: string; variables: string[] };
+  blob: { configured: boolean; access: string; backend?: string | null; label?: string; variables: string[] };
   skills_dir: string;
   skills: string[];
   vercel: boolean;
@@ -96,7 +96,7 @@ export function DiagnosticsPanel({ diag, error, onLog, showAi = true }: { diag: 
             <span className="tile-note">{db.variables.join(" · ")}</span>
           </div>
           <div className="diag-item">
-            <span className="stat-label">{dot(diag.blob.configured)} Vercel Blob</span>
+            <span className="stat-label">{dot(diag.blob.configured)} {diag.blob.configured ? diag.blob.label ?? "File storage" : "File storage"}</span>
             <strong>{diag.blob.configured ? `configured (${diag.blob.access})` : "not configured"}</strong>
             <span>{diag.blob.configured ? "PDF reports will be stored" : "PDFs generated on demand"}</span>
             <span className="tile-note">{diag.blob.variables.join(" · ")}</span>
