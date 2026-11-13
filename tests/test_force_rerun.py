@@ -59,7 +59,7 @@ def test_forced_run_never_reuses_and_logs_once():
 def test_forced_portfolio_ignores_decisions_from_earlier_runs():
     saved = api._passess_latest, api._history_latest
     api._passess_latest = lambda cur, job_id, symbol, skill_id: None
-    api._history_latest = lambda cur, job, day, symbol, skill_id: {"sim_date": date(2026, 3, 9), "history": True}
+    api._history_latest = lambda cur, job, day, symbol, skill_id, log=None: {"sim_date": date(2026, 3, 9), "history": True}
     try:
         job = {"job_id": 1, "config": {"force_rerun": True}}
         assert api._latest_known(None, job, DAY, "AAPL", "warren-buffett") is None

@@ -989,6 +989,28 @@ def make_claude_client(provider: str):
 
 
 CLAUDE_TIMEOUT_S = 240.0
+# Rate limits (429) and overload (529): wait and retry inside the request, within a bounded budget so the whole
+# call still fits the 300 s function limit. A call still limited after that fails with RATE_LIMIT_DETAIL.
+RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_MAX_WAIT_S = 60.0
+RATE_LIMIT_DETAIL = "Anthropic API rate limit reached; try again shortly."
+OVERLOADED_DETAIL = "Anthropic API is overloaded (529); try again shortly."
+
+
+def is_transient_model_error(error: str | None) -> bool:
+    """A failure caused by the model service being busy (rate limit / overload), not by the stock or the data."""
+    return bool(error) and (error.startswith(RATE_LIMIT_DETAIL) or error.startswith(OVERLOADED_DETAIL))
+
+
+def _retry_wait(e, attempt: int) -> float:
+    """Seconds to wait before the next try: the service's retry-after header when given (capped), else 5, 10, 20, 30 s."""
+    try:
+        ra = float(e.response.headers.get("retry-after"))
+        if ra > 0:
+            return min(ra, 30.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return min(5.0 * 2 ** (attempt - 1), 30.0)
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -1086,16 +1108,36 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
     events = 0
     grammar_fallback = False
 
-    def open_stream(req):
+    def _open(req):
         if provider == "foundry":
             # Foundry has no server-side refusal fallback; plain Messages API.
             return client.messages.stream(**req)
         return client.beta.messages.stream(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **req)
 
+    busy_errors = tuple(c for c in (anthropic.RateLimitError, getattr(anthropic, "OverloadedError", None)) if c)
+
+    def open_stream(req):
+        """Open the stream; when the service is rate limited or overloaded, wait and try again (bounded)."""
+        waited = 0.0
+        attempt = 0
+        while True:
+            m = _open(req)
+            try:
+                # Entering the manager sends the request; return the opened stream so `with` does not send a second one.
+                return m.__enter__()
+            except busy_errors as e:
+                attempt += 1
+                wait = _retry_wait(e, attempt)
+                if attempt > RATE_LIMIT_RETRIES or waited + wait > RATE_LIMIT_MAX_WAIT_S:
+                    raise
+                kind = "rate limited (429)" if isinstance(e, anthropic.RateLimitError) else "overloaded (529)"
+                say(f"Model service {kind}; waiting {wait:.0f} s before retry {attempt} of {RATE_LIMIT_RETRIES}", "warn")
+                time.sleep(wait)
+                waited += wait
+
     try:
         try:
             manager = open_stream(request)
-            manager.__enter__()
         except anthropic.BadRequestError as e:
             if "grammar" not in str(e.message).lower():
                 raise
@@ -1108,7 +1150,6 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
             fallback_request["messages"] = [{"role": "user", "content": user_text + "\n\nReturn ONLY a single JSON object (no prose, "
                                              "no code fences) that conforms exactly to this JSON Schema:\n" + json.dumps(schema)}]
             manager = open_stream(fallback_request)
-            manager.__enter__()
         with manager as stream:
             for event in stream:
                 events += 1
@@ -1141,8 +1182,10 @@ def run_skill_with_claude(skill: dict, data: dict, log: "RunLog | None" = None):
     except anthropic.AuthenticationError as e:
         raise HTTPException(status_code=502, detail="Anthropic API key was rejected.") from e
     except anthropic.RateLimitError as e:
-        raise HTTPException(status_code=503, detail="Anthropic API rate limit reached; try again shortly.") from e
+        raise HTTPException(status_code=503, detail=RATE_LIMIT_DETAIL) from e
     except anthropic.APIStatusError as e:
+        if e.status_code == 529:
+            raise HTTPException(status_code=503, detail=OVERLOADED_DETAIL) from e
         raise HTTPException(status_code=502, detail=f"Anthropic API error {e.status_code}: {e.message}") from e
     except anthropic.APITimeoutError as e:
         raise HTTPException(
@@ -1960,6 +2003,55 @@ def blob_get(pathname: str) -> bytes:
     return get_blob(pathname, access=blob_access()).body
 
 
+_FILES_PRESENT: set[str] = set()  # pathnames confirmed present (files are never deleted by the app)
+
+
+def stored_file_exists(pathname: str | None) -> bool | None:
+    """True / False when the active file storage can tell; None when it cannot be reached (or none is configured)."""
+    if not pathname:
+        return False
+    if pathname in _FILES_PRESENT:
+        return True
+    backend = storage_backend()
+    try:
+        if backend == "azure":
+            ok = bool(_azure_container().get_blob_client(pathname).exists())
+        elif backend == "vercel":
+            from vercel.blob.sync import BlobNotFoundError, head_blob
+
+            try:
+                head_blob(pathname)
+                ok = True
+            except BlobNotFoundError:
+                ok = False
+        else:
+            return None
+    except Exception:  # noqa: BLE001 - storage unreachable: cannot tell
+        return None
+    if ok:
+        _FILES_PRESENT.add(pathname)
+    return ok
+
+
+def report_files_present(pdf_pathname: str | None, html_pathname: str | None) -> tuple[bool, str]:
+    """Whether a stored decision's report files are really in file storage. A decision whose report is missing is not
+    reused: the agent runs again. When no storage is configured, or it cannot be reached, the decision counts as present
+    (so an outage does not trigger a wave of paid reruns)."""
+    if storage_backend() is None:
+        return True, "no file storage configured"
+    if not pdf_pathname:
+        return False, "no report file was stored for it"
+    for p in (pdf_pathname, html_pathname):
+        if not p:
+            continue
+        found = stored_file_exists(p)
+        if found is False:
+            return False, f"report file {p} is missing from {storage_label()}"
+        if found is None:
+            return True, f"{storage_label()} could not be checked; assumed present"
+    return True, ""
+
+
 def upload_report(pathname: str, pdf_bytes: bytes) -> dict:
     return blob_put(pathname, pdf_bytes, "application/pdf")
 
@@ -2714,22 +2806,29 @@ def backtest_model(backtest_id: int) -> str | None:
     return (r[0] or None) if r else None
 
 
-def find_reusable_decision(skill: dict, symbol: str, as_of: date, exclude_id: int | None = None) -> dict | None:
+def find_reusable_decision(skill: dict, symbol: str, as_of: date, exclude_id: int | None = None, log: "RunLog | None" = None) -> dict | None:
     """A completed analysis by the same agent, of the same stock, as of the same date, from the same skill version and model,
-    in any earlier run. Copies are never sources; failed runs never match."""
+    in any earlier run, whose report files are in file storage. Copies are never sources; failed runs never match."""
     conn = db_connect()
     try:
         cur = conn.cursor()
         cur.execute(
-            f"SELECT TOP 1 d.decision_id, d.backtest_id, d.finished_at FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
+            f"SELECT TOP 5 d.decision_id, d.backtest_id, d.finished_at, d.report_pathname, d.report_html_pathname "
+            f"FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
             f"WHERE d.skill_id = %s AND d.symbol = %s AND d.as_of_date = %s AND d.status = 'done' AND d.reused_from_id IS NULL "
             f"AND d.decision_id <> %s AND COALESCE(d.skill_version, b.skill_version, '') = %s AND COALESCE(d.model_requested, d.model, '') = %s "
             f"ORDER BY d.decision_id DESC",
             (skill["id"], symbol, as_of, exclude_id or 0, skill.get("version") or "", requested_model()))
-        r = cur.fetchone()
+        rows = cur.fetchall()
     finally:
         conn.close()
-    return None if not r else {"decision_id": r[0], "backtest_id": r[1], "finished_at": r[2].isoformat() if r[2] else None}
+    for r in rows:
+        present, why = report_files_present(r[3], r[4])
+        if present:
+            return {"decision_id": r[0], "backtest_id": r[1], "finished_at": r[2].isoformat() if r[2] else None}
+        if log:
+            log.add(f"Stored analysis #{r[0]} (backtest #{r[1]}) not reused: {why}; the agent will run again", "warn")
+    return None
 
 
 def reuse_decision(decision_id: int, source: dict, log: "RunLog") -> dict:
@@ -2787,7 +2886,7 @@ def try_reuse_decision(decision_id: int, skill: dict, symbol: str, as_of: date, 
             log.add("Forced rerun: a stored analysis of the same agent, stock and date is not reused; calling the model")
         return None
     with use_model(_MODEL_OVERRIDE.get() or decision_model(decision_id)):
-        source = find_reusable_decision(skill, symbol, as_of, exclude_id=decision_id)
+        source = find_reusable_decision(skill, symbol, as_of, exclude_id=decision_id, log=log)
     return reuse_decision(decision_id, source, log) if source else None
 
 
@@ -5144,12 +5243,27 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
     try:
         cur = conn.cursor()
         ensure_backtest_tables_once(cur)
-        cur.execute(f"SELECT decision_id, status FROM {DECISIONS_TABLE} WHERE backtest_id = %s AND symbol = %s AND as_of_date = %s", (bt_id, symbol, day))
+        cur.execute(f"SELECT decision_id, status, error FROM {DECISIONS_TABLE} WHERE backtest_id = %s AND symbol = %s AND as_of_date = %s", (bt_id, symbol, day))
         existing = cur.fetchone()
-        if existing and existing[1] == "done":
+        if existing and existing[1] == "failed" and is_transient_model_error(existing[2]):
+            decision_id = existing[0]
+            cur.execute(f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, started_at = SYSUTCDATETIME() WHERE decision_id = %s", (decision_id,))
+            conn.commit()
+            prices_df = load_prices_df(cur, symbol)
+            log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} decision #{decision_id} was blocked by the model service earlier; running it again")
+        elif existing and existing[1] == "done":
             cur.execute(f"SELECT {', '.join(DECISION_COLUMNS)} FROM {DECISIONS_TABLE} WHERE decision_id = %s", (existing[0],))
             decision = _decision_dict(cur.fetchone())
-            log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} decision #{existing[0]} already exists for this day; reusing it")
+            present, why = report_files_present(decision.get("report_pathname"), decision.get("report_html_pathname"))
+            if present:
+                log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} decision #{existing[0]} already exists for this day; reusing it")
+            else:
+                decision, decision_id = None, existing[0]
+                cur.execute(f"UPDATE {DECISIONS_TABLE} SET status = 'running', error = NULL, reused_from_id = NULL, "
+                            f"started_at = SYSUTCDATETIME() WHERE decision_id = %s", (decision_id,))
+                conn.commit()
+                prices_df = load_prices_df(cur, symbol)
+                log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} decision #{decision_id} exists but {why}; running the agent again", "warn")
         elif existing:
             cur.execute(f"UPDATE {DECISIONS_TABLE} SET status = 'failed', error = COALESCE(error, 'interrupted before completion') WHERE decision_id = %s", (existing[0],))
             conn.commit()
@@ -5180,6 +5294,10 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
 
     rec, bp, sp, tp = decision.get("recommendation"), decision.get("buy_below_price"), decision.get("stop_price"), decision.get("target_price")
     failed = decision["status"] != "done"
+    if failed and is_transient_model_error(decision.get("error")):
+        log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} blocked by the model service ({decision['error'][:60]}); not counted as a verdict, "
+                f"it will run again. Lower 'Parallel agent calls' if this repeats.", "warn")
+        raise HTTPException(status_code=503, detail=f"{day} {symbol}: {PSKILL_SHORT[skill_id]} - {decision['error']} The step will be retried.")
     is_buy = False if failed else _agent_is_buy(rec, bp, price)
     note = (decision.get("error") or "failed")[:300] if failed else (decision.get("headline") or "")[:300]
     conn = db_connect()
@@ -5218,41 +5336,60 @@ def _job_model(job: dict, skill_id: str) -> str:
     return models[skill_id]
 
 
-def _history_latest(cur, job: dict, day: date, symbol: str, skill_id: str) -> dict | None:
+def _history_latest(cur, job: dict, day: date, symbol: str, skill_id: str, log: "RunLog | None" = None) -> dict | None:
     """The newest stored decision of this agent for this stock from ANY run (other portfolio backtests, scans, weekly
     backtests), read from the decision columns in SQL - no report is opened. Point in time: dated on or before the simulated
     day and inside the validity window; same skill version and model only; copies are never sources."""
     skill = get_skill(skill_id)
     oldest = day - timedelta(days=int(job["config"]["analysis_validity_days"]))
     cur.execute(
-        f"SELECT TOP 1 d.decision_id, d.backtest_id, d.as_of_date, d.recommendation, d.current_price, d.buy_below_price, d.stop_price, d.target_price "
+        f"SELECT TOP 5 d.decision_id, d.backtest_id, d.as_of_date, d.recommendation, d.current_price, d.buy_below_price, d.stop_price, d.target_price, "
+        f"d.report_pathname, d.report_html_pathname "
         f"FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
         f"WHERE d.skill_id = %s AND d.symbol = %s AND d.status = 'done' AND d.reused_from_id IS NULL AND d.as_of_date <= %s AND d.as_of_date >= %s "
         f"AND COALESCE(d.skill_version, b.skill_version, '') = %s AND COALESCE(d.model_requested, d.model, '') = %s "
         f"ORDER BY d.as_of_date DESC, d.decision_id DESC",
         (skill_id, symbol, day, oldest, skill.get("version") or "", _job_model(job, skill_id)))
+    for r in cur.fetchall():
+        present, why = report_files_present(r[8], r[9])
+        if not present:
+            if log:
+                log.add(f"{day} {symbol}: {PSKILL_SHORT.get(skill_id, skill_id)} stored decision #{r[0]} ({r[2]}) not reused: {why}", "warn")
+            continue
+        return {"assessment_id": None, "decision_id": r[0], "backtest_id": r[1], "sim_date": r[2], "recommendation": norm_rec(r[3]),
+                "current_price": _fnum(r[4]), "buy_price": _fnum(r[5]), "stop_price": _fnum(r[6]), "target_price": _fnum(r[7]),
+                "mode": "history", "history": True}
+    return None
+
+
+def _decision_report_paths(cur, decision_id: int) -> tuple[str | None, str | None]:
+    cur.execute(f"SELECT report_pathname, report_html_pathname FROM {DECISIONS_TABLE} WHERE decision_id = %s", (decision_id,))
     r = cur.fetchone()
-    if not r:
-        return None
-    return {"assessment_id": None, "decision_id": r[0], "backtest_id": r[1], "sim_date": r[2], "recommendation": norm_rec(r[3]),
-            "current_price": _fnum(r[4]), "buy_price": _fnum(r[5]), "stop_price": _fnum(r[6]), "target_price": _fnum(r[7]),
-            "mode": "history", "history": True}
+    return (r[0], r[1]) if r else (None, None)
 
 
-def _latest_known(cur, job: dict, day: date, symbol: str, skill_id: str) -> dict | None:
-    """This job's latest real assessment, or a newer stored decision from another run."""
+def _latest_known(cur, job: dict, day: date, symbol: str, skill_id: str, log: "RunLog | None" = None) -> dict | None:
+    """This job's latest real assessment, or a newer stored decision from another run. An own assessment whose report
+    file is missing from storage is marked report_missing, which makes the agent run again."""
     own = _passess_latest(cur, job["job_id"], symbol, skill_id)
-    hist = None if job["config"].get("force_rerun") else _history_latest(cur, job, day, symbol, skill_id)
+    hist = None if job["config"].get("force_rerun") else _history_latest(cur, job, day, symbol, skill_id, log)
     if hist and (not own or hist["sim_date"] > own["sim_date"]):
         return hist
+    if own and own.get("decision_id") and storage_backend() is not None:
+        present, why = report_files_present(*_decision_report_paths(cur, own["decision_id"]))
+        if not present:
+            own["report_missing"] = why
     return own
 
 
-def _freshness(cur, job: dict, day: date, symbol: str, skill_id: str, price: float) -> tuple[str, dict | None, int | None, float | None]:
+def _freshness(cur, job: dict, day: date, symbol: str, skill_id: str, price: float,
+               log: "RunLog | None" = None) -> tuple[str, dict | None, int | None, float | None]:
     """Buffett/Dimon buy-phase rules (section 3.4), without writing anything: (kind, latest, age_days, gap_pct).
-    kind: today | run | no_buy_price | skip | rerun | cached."""
+    kind: today | run | no_buy_price | skip | rerun | cached. A latest assessment whose report file is missing -> run."""
     cfg = job["config"]
-    latest = _latest_known(cur, job, day, symbol, skill_id)
+    latest = _latest_known(cur, job, day, symbol, skill_id, log)
+    if latest and latest.get("report_missing"):
+        return "run", latest, (day - latest["sim_date"]).days, None
     if latest and latest["sim_date"] == day:
         return "today", latest, 0, None
     age = (day - latest["sim_date"]).days if latest else None
@@ -5284,7 +5421,7 @@ def _cached_or_run(cur, job: dict, day: date, symbol: str, skill_id: str, price:
     """Buffett/Dimon buy-phase rules (section 3.4). Returns (assessment or None, model_call_needed, mode)."""
     cfg = job["config"]
     short = PSKILL_SHORT[skill_id]
-    kind, latest, age, gap_pct = _freshness(cur, job, day, symbol, skill_id, price)
+    kind, latest, age, gap_pct = _freshness(cur, job, day, symbol, skill_id, price, log)
     if kind == "today":
         is_buy = _agent_is_buy(latest["recommendation"], latest["buy_price"], price)
         why = "assessed earlier today (held-stock reassessment)" if not latest.get("history") else f"assessed for this day in {_from_where(latest)}"
@@ -5293,7 +5430,9 @@ def _cached_or_run(cur, job: dict, day: date, symbol: str, skill_id: str, price:
         log.add(f"{day} {symbol}: {short} {why} -> {'BUY' if is_buy else 'NOT BUY'} at {price:.2f} (buy at/below {latest['buy_price']})")
         return a, False, "cached"
     if kind == "run":
-        why = "no assessment yet" if not latest else f"last assessment {age} days old (> {cfg['analysis_validity_days']})"
+        why = ("no assessment yet" if not latest
+               else f"assessment from {latest['sim_date']} has no report in storage ({latest['report_missing']})" if latest.get("report_missing")
+               else f"last assessment {age} days old (> {cfg['analysis_validity_days']})")
         log.add(f"{day} {symbol}: {short} - {why}; running the agent")
         return None, True, "run"
     bp = latest["buy_price"]
@@ -5557,6 +5696,7 @@ def _portfolio_advance(job: dict, log: RunLog) -> dict:
                 price = bars[sym]["prev_close"]
                 if due and price and cur_["stage"] in ("buffett", "dimon"):
                     skill_id = PSTAGE_SKILL[cur_["stage"]]
+                    stage_before = cur_["stage"]
                     latest = _passess_latest(db.cur, job["job_id"], sym, skill_id)
                     cur_["stage"] = "dimon" if cur_["stage"] == "buffett" else "check"
                     if latest and latest["sim_date"] == day:
@@ -5564,7 +5704,13 @@ def _portfolio_advance(job: dict, log: RunLog) -> dict:
                     save()
                     db.close()
                     log.add(f"{day} {sym}: held {pos['quantity']} shares ({pos['buys']} buys), last reassessed {idx - pos['last_reassess_idx']} trading days ago; reassessing")
-                    _run_portfolio_agent(job, day, sym, skill_id, "sell", "reassess", price, log)
+                    try:
+                        _run_portfolio_agent(job, day, sym, skill_id, "sell", "reassess", price, log)
+                    except HTTPException:
+                        cur_["stage"] = stage_before
+                        db.reopen()
+                        save()
+                        raise
                     return {"done": False, "model_call": True}
                 if due:
                     db.cur.execute(f"UPDATE {PPOS_TABLE} SET last_reassess_idx = %s WHERE job_id = %s AND symbol = %s", (idx, job["job_id"], sym))

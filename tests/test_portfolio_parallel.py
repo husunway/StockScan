@@ -29,7 +29,7 @@ def _row(sim_date, bp, rec="BUY", history=False):
 def _with(own, hist, fn):
     saved = api._passess_latest, api._history_latest
     api._passess_latest = lambda cur, job_id, symbol, skill_id: own
-    api._history_latest = lambda cur, job, day, symbol, skill_id: hist
+    api._history_latest = lambda cur, job, day, symbol, skill_id, log=None: hist
     try:
         return fn()
     finally:
@@ -71,6 +71,9 @@ def test_history_query_is_point_in_time_and_matches_skill_version_and_model():
 
         def fetchone(self):
             return None
+
+        def fetchall(self):
+            return []
 
     saved = api.get_skill, api.backtest_model
     api.get_skill = lambda skill_id: {"id": skill_id, "version": "2.1"}
@@ -120,7 +123,7 @@ def test_stage_batch_picks_later_stocks_that_need_the_same_agent():
     today = {("DDD", "warren-buffett"): {"is_buy": True}}
     saved = api._todays_buy_row, api._freshness
     api._todays_buy_row = lambda cur, job_id, day, s, sk: today.get((s, sk))
-    api._freshness = lambda cur, job, day, s, sk, price: ("run", None, None, None)
+    api._freshness = lambda cur, job, day, s, sk, price, log=None: ("run", None, None, None)
     try:
         assert api._stage_batch(None, _job(), DAY, 0, "buffett", bars, {}, 4) == [("BBB", "run", 10.0)]
         assert api._stage_batch(None, _job(), DAY, 0, "dimon", bars, {}, 4) == [("DDD", "run", 10.0)]
