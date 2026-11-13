@@ -1316,6 +1316,7 @@ IF COL_LENGTH('{BACKTESTS_TABLE}', 'model_requested') IS NULL ALTER TABLE {BACKT
 IF COL_LENGTH('{DECISIONS_TABLE}', 'reused_from_id') IS NULL ALTER TABLE {DECISIONS_TABLE} ADD reused_from_id INT NULL;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_agent_decisions_reuse')
 CREATE INDEX IX_agent_decisions_reuse ON {DECISIONS_TABLE} (skill_id, symbol, as_of_date, status);
+IF COL_LENGTH('{BACKTESTS_TABLE}', 'force_rerun') IS NULL ALTER TABLE {BACKTESTS_TABLE} ADD force_rerun BIT NOT NULL CONSTRAINT DF_agent_backtests_force DEFAULT 0;
 """
 DECISION_STATUSES = ("pending", "running", "done", "failed", "cancelled")
 
@@ -2319,6 +2320,7 @@ class BacktestRequest(BaseModel):
     weeks: int = Field(10, ge=1, le=52, description="How many Mondays to run, counting from January 1")
     refresh_data: bool = Field(False, description="Re-download the symbol's data bundle even if a fresh one is stored")
     model: str | None = Field(None, max_length=100, description="One of the configured models; default DEFAULT_AI_MODEL")
+    force_rerun: bool = Field(False, description="Always call the model; never reuse a stored analysis of the same agent, stock and date")
 
 
 def _decision_dict(row) -> dict:
@@ -2541,13 +2543,14 @@ def _create_backtest(req: BacktestRequest, model: str):
         ensure_backtest_tables(cur)
         cur.execute(ENSURE_SYMBOL_DATA_SQL)
         cur.execute(
-            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, data_pathname, model_requested) "
-            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), data_pathname, model),
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, data_pathname, model_requested, force_rerun) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (skill["id"], skill["version"], symbol, req.year, json.dumps(raw), data_pathname, model, 1 if req.force_rerun else 0),
         )
         backtest_id = cur.fetchone()[0]
         log.row_id = backtest_id
-        log.add(f"Backtest #{backtest_id} created with {len(dates)} pending decisions")
+        log.add(f"Backtest #{backtest_id} created with {len(dates)} pending decisions"
+                + ("; forced rerun: every report is generated fresh, stored analyses are not reused" if req.force_rerun else ""))
         log.save(cur)
         cur.executemany(
             f"INSERT INTO {DECISIONS_TABLE} (backtest_id, skill_id, symbol, as_of_date, status) VALUES (%s, %s, %s, %s, 'pending')",
@@ -2763,8 +2766,26 @@ def decision_model(decision_id: int) -> str | None:
     return (r[0] or None) if r else None
 
 
+def decision_force_rerun(decision_id: int) -> bool:
+    """True when the run that owns this decision was started with "Force rerun" (never reuse a stored analysis)."""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT b.force_rerun FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
+                    f"WHERE d.decision_id = %s", (decision_id,))
+        r = cur.fetchone()
+    finally:
+        conn.close()
+    return bool(r and r[0])
+
+
 def try_reuse_decision(decision_id: int, skill: dict, symbol: str, as_of: date, log: "RunLog") -> dict | None:
-    """Match on the run's model: the one already set for this request, else the model stored on the decision's backtest."""
+    """Match on the run's model: the one already set for this request, else the model stored on the decision's backtest.
+    A run started with "Force rerun" never reuses: the model is called and a new report is generated."""
+    if decision_force_rerun(decision_id):
+        if not any("Forced rerun" in e["message"] for e in log.entries):
+            log.add("Forced rerun: a stored analysis of the same agent, stock and date is not reused; calling the model")
+        return None
     with use_model(_MODEL_OVERRIDE.get() or decision_model(decision_id)):
         source = find_reusable_decision(skill, symbol, as_of, exclude_id=decision_id)
     return reuse_decision(decision_id, source, log) if source else None
@@ -4957,6 +4978,7 @@ class PortfolioRequest(BaseModel):
     held_reassess_days: int | float | str | None = Field(_PF_DEFAULT["held_reassess_days"])
     parallel_calls: int | float | str | None = Field(_PF_DEFAULT["parallel_calls"], description="Agent model calls run at the same time")
     symbols: list[str] | None = Field(None, description="Optional explicit list; overrides stock_count")
+    force_rerun: bool = Field(False, description="Never reuse stored analyses from earlier runs; every agent run calls the model")
 
 
 @app.get("/api/py/portfolio/fields")
@@ -5013,15 +5035,16 @@ def portfolio_prepare(req: PortfolioPrepareRequest):
             "bundle_fetched_at": bundle.get("fetched_at"), "annual_periods": s.get("annual_periods"), "log": log.entries}
 
 
-def _portfolio_backtests(cur, job_id: int, year: int, model: str | None = None) -> dict:
+def _portfolio_backtests(cur, job_id: int, year: int, model: str | None = None, force_rerun: bool = False) -> dict:
     out = {}
     for skill_id in PORTFOLIO_SKILLS:
         skill = get_skill(skill_id)
         cur.execute(
-            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status, model_requested) "
-            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active', %s)",
+            f"INSERT INTO {BACKTESTS_TABLE} (skill_id, skill_version, symbol, [year], raw_data, status, model_requested, force_rerun) "
+            f"OUTPUT INSERTED.backtest_id VALUES (%s, %s, %s, %s, %s, 'active', %s, %s)",
             (skill_id, skill["version"], f"PORTFOLIO#{job_id}", year,
-             json.dumps({"portfolio_job": job_id, "data_source": skill.get("data_source")}), model or requested_model()),
+             json.dumps({"portfolio_job": job_id, "data_source": skill.get("data_source")}), model or requested_model(),
+             1 if force_rerun else 0),
         )
         out[skill_id] = cur.fetchone()[0]
     return out
@@ -5219,7 +5242,7 @@ def _history_latest(cur, job: dict, day: date, symbol: str, skill_id: str) -> di
 def _latest_known(cur, job: dict, day: date, symbol: str, skill_id: str) -> dict | None:
     """This job's latest real assessment, or a newer stored decision from another run."""
     own = _passess_latest(cur, job["job_id"], symbol, skill_id)
-    hist = _history_latest(cur, job, day, symbol, skill_id)
+    hist = None if job["config"].get("force_rerun") else _history_latest(cur, job, day, symbol, skill_id)
     if hist and (not own or hist["sim_date"] > own["sim_date"]):
         return hist
     return own
@@ -5792,7 +5815,7 @@ def _portfolio_create(req: PortfolioRequest):
                     f"OUTPUT INSERTED.job_id VALUES ('active', %s, %s, %s, %s, %s, %s, %s)",
                     (req.start_date, end, json.dumps(cfg), json.dumps(symbols), json.dumps(days), json.dumps(cursor), round(req.starting_capital, 2)))
         job_id = cur.fetchone()[0]
-        backtests = _portfolio_backtests(cur, job_id, req.start_date.year, req.model)
+        backtests = _portfolio_backtests(cur, job_id, req.start_date.year, req.model, req.force_rerun)
         log.row_id = job_id
         log.add(f"Portfolio backtest #{job_id}: {spec['label']}, model {req.model}, {len(symbols)} stocks ({', '.join(symbols)}), {len(days)} trading days {days[0]} to {days[-1]}, "
                 f"capital {req.starting_capital:,.0f}, {req.buy_amount:,.0f} per buy, max {req.max_buys_per_stock} buys/stock, take profit {req.take_profit_pct:g}%")
@@ -5801,6 +5824,9 @@ def _portfolio_create(req: PortfolioRequest):
                 f"{req.held_reassess_days} trading day(s); Murphy never cached; up to {req.parallel_calls} agent calls in parallel; "
                 f"stored decisions from earlier runs (same agent, skill version and model, dated on or before the day) count as cached")
         log.add("Current price on a simulated day = last close before that day; agents see nothing from that day on; orders fill inside the day's range")
+        if req.force_rerun:
+            log.add("Forced rerun: stored analyses from earlier runs are not reused; every agent run calls the model and generates a new report "
+                    "(this backtest's own validity, skip and rerun rules still apply)", "warn")
         cur.execute(f"UPDATE {PJOB_TABLE} SET backtests = %s, log_json = %s WHERE job_id = %s", (json.dumps(backtests), json.dumps(log.entries), job_id))
         conn.commit()
         return {**_portfolio_state(cur, job_id), "log": log.entries}

@@ -97,6 +97,7 @@ export default function PortfolioPanel() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [index, setIndex] = useState<IndexId>("sp500");
   const [model, setModel] = useState("");
+  const [forceRerun, setForceRerun] = useState(false);
   const [startDate, setStartDate] = useState("2026-01-01");
   const [endDate, setEndDate] = useState("");
   const stopRef = useRef(false);
@@ -210,7 +211,7 @@ export default function PortfolioPanel() {
       setPreparing(null);
       if (!prepared.length) throw new Error("No stock could be prepared; the backtest was not created.");
       if (skipped.length) note(`Backtest runs on ${prepared.length} of ${sy.symbols.length} stocks; left out: ${skipped.join(", ")}`, "warn");
-      const body = { ...cfg, index, model: model || null, start_date: startDate, end_date: endDate || null, ...(skipped.length ? { symbols: prepared } : {}) };
+      const body = { ...cfg, index, model: model || null, force_rerun: forceRerun, start_date: startDate, end_date: endDate || null, ...(skipped.length ? { symbols: prepared } : {}) };
       const s = await api<State>("/api/py/portfolio", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       setJob(s);
       if (s.log) setLog((prev) => [...prev, ...s.log!]);
@@ -270,6 +271,10 @@ export default function PortfolioPanel() {
       <form className="filters agent-form portfolio-form" noValidate onSubmit={(e) => { e.preventDefault(); start(); }}>
         <IndexSelect value={index} onChange={setIndex} disabled={busy} />
         <ModelSelect value={model} onChange={setModel} disabled={busy} />
+        <label className="check" title="Never reuse a stored analysis from an earlier run: every agent run calls the model and generates a new report">
+          <input type="checkbox" checked={forceRerun} onChange={(e) => setForceRerun(e.target.checked)} disabled={busy} />
+          Force rerun of AI reports
+        </label>
         {PORTFOLIO_FIELDS.slice(0, 1).map((f) => <NumField key={f.key} spec={f} label={FORM_LABEL[f.key]} value={inputs[f.key]} error={fieldErrors[f.key]} disabled={busy} onChange={setInput} onBlur={checkInput} />)}
         <label className={dateError && !startDate ? "invalid" : ""}>From<input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={busy} /></label>
         <label className={dateError && startDate ? "invalid" : ""}>To (blank = latest)<input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} disabled={busy} />

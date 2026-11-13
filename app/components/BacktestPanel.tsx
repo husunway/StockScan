@@ -149,6 +149,7 @@ export default function BacktestPanel() {
   const [year, setYear] = useState(2026);
   const [weeks, setWeeks] = useState(10);
   const [model, setModel] = useState("");
+  const [forceRerun, setForceRerun] = useState(false);
   const [known, setKnown] = useState<string[]>([]);
   const [previous, setPrevious] = useState<Previous[]>([]);
   const [bt, setBt] = useState<Backtest | null>(null);
@@ -393,7 +394,7 @@ export default function BacktestPanel() {
       const created = await api<Backtest>("/api/py/agent/backtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skill: skillId, symbol: s, year, weeks, model: model || null }),
+        body: JSON.stringify({ skill: skillId, symbol: s, year, weeks, model: model || null, force_rerun: forceRerun }),
       });
       setBt(created);
       setCreating(false);
@@ -458,6 +459,10 @@ export default function BacktestPanel() {
           </select>
         </label>
         <ModelSelect value={model} onChange={setModel} disabled={creating || running} />
+        <label className="check" title="Call the AI agent and generate a new report for every date, even when the database already has an analysis of the same agent, stock, date and model">
+          <input type="checkbox" checked={forceRerun} onChange={(e) => setForceRerun(e.target.checked)} disabled={creating || running} />
+          Force rerun of AI reports
+        </label>
         <button type="submit" className="btn" disabled={creating || running || !symbol.trim() || !skillId}>
           {creating ? "Preparing…" : `Run first ${weeks} Monday${weeks === 1 ? "" : "s"} of ${year}`}
         </button>

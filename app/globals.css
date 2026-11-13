@@ -515,3 +515,6 @@ strong.neg { color: var(--down); }
 .pcal-activity-row .c3 { color: var(--ok); font-weight: 700; }
 
 .pcal-act-filters { margin: 8px 0; gap: 12px; align-items: flex-end; }
+
+/* Checkbox option inside a .filters form row (e.g. "Force rerun of AI reports") */
+.filters label.check { flex-direction: row; align-items: center; gap: 6px; padding-bottom: 8px; white-space: nowrap; }
