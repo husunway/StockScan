@@ -1967,6 +1967,87 @@ def download_report(pathname: str) -> bytes:
     return blob_get(pathname)
 
 
+# ---------------------------------------------------------------------------
+# Storage migration: copy every file from Vercel Blob to Azure Blob Storage under the same pathname, so the folder
+# structure (reports/<skill>/<symbol>/<year>/..., data/<symbol>/..., runs/...) is kept. The page lists once, then copies
+# in small batches (one request each) so every request fits the serverless time limit and Stop works between batches.
+# Re-running copies only what is missing or has a different size in Azure.
+# ---------------------------------------------------------------------------
+MIGRATE_BATCH_MAX = 50
+MIGRATE_THREADS = 8
+
+
+def vercel_blob_access() -> str:
+    return os.environ.get("BLOB_ACCESS", "private").strip().lower() or "private"
+
+
+def _migration_ready() -> None:
+    missing = []
+    if not (os.environ.get("BLOB_READ_WRITE_TOKEN") or os.environ.get("VERCEL_BLOB_READ_WRITE_TOKEN")):
+        missing.append("BLOB_READ_WRITE_TOKEN (the Vercel Blob store to copy from)")
+    if storage_backend() != "azure":
+        missing.append("AZURE_STORAGE_CONNECTION_STRING (the Azure storage account to copy to)")
+    if missing:
+        raise HTTPException(status_code=422, detail="Storage migration needs " + " and ".join(missing) + " in the environment variables.")
+
+
+def _safe_pathname(p: str) -> bool:
+    return bool(p) and not p.startswith("/") and ".." not in p.split("/") and len(p) <= 1024
+
+
+@app.get("/api/py/storage/migrate/plan")
+def storage_migrate_plan():
+    """Every file in Vercel Blob, marked present when Azure already has the same pathname with the same size."""
+    _migration_ready()
+    from vercel.blob.sync import query_blobs
+
+    t0 = time.monotonic()
+    try:
+        source = [{"pathname": b.pathname, "size": int(b.size or 0)} for b in query_blobs(page_size=1000)]
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not list the Vercel Blob store: {type(e).__name__}: {str(e)[:300]}")
+    try:
+        target = {b.name: int(b.size or 0) for b in _azure_container().list_blobs()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not list Azure container '{azure_container_name()}': {type(e).__name__}: {str(e)[:300]}")
+    items = [{**s, "present": target.get(s["pathname"]) == s["size"]} for s in source]
+    folders = {s["pathname"].rsplit("/", 1)[0] for s in source if "/" in s["pathname"]}
+    return {"source": "Vercel Blob", "target": f"Azure Blob Storage, container {azure_container_name()}",
+            "total": len(items), "bytes": sum(s["size"] for s in items), "present": sum(1 for s in items if s["present"]),
+            "folders": len(folders), "target_files": len(target), "list_seconds": round(time.monotonic() - t0, 1), "items": items}
+
+
+class StorageCopyRequest(BaseModel):
+    pathnames: list[str] = Field(..., min_length=1, max_length=MIGRATE_BATCH_MAX)
+
+
+@app.post("/api/py/storage/migrate/copy")
+def storage_migrate_copy(req: StorageCopyRequest):
+    """Copy one batch: download each file from Vercel Blob and upload it to Azure under the same pathname and content type."""
+    _migration_ready()
+    from azure.storage.blob import ContentSettings
+    from vercel.blob.sync import get_blob
+
+    container = _azure_container()
+    access = vercel_blob_access()
+
+    def one(pathname: str) -> dict:
+        if not _safe_pathname(pathname):
+            return {"pathname": pathname, "ok": False, "error": "invalid pathname"}
+        t0 = time.monotonic()
+        try:
+            r = get_blob(pathname, access=access)
+            ctype = getattr(r.metadata, "content_type", None) or "application/octet-stream"
+            container.upload_blob(pathname, r.body, overwrite=True, content_settings=ContentSettings(content_type=ctype))
+            return {"pathname": pathname, "ok": True, "bytes": len(r.body), "content_type": ctype, "seconds": round(time.monotonic() - t0, 2)}
+        except Exception as e:  # noqa: BLE001 - one bad file must not stop the batch
+            return {"pathname": pathname, "ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}"}
+
+    with ThreadPoolExecutor(max_workers=min(MIGRATE_THREADS, len(req.pathnames)), thread_name_prefix="migrate") as ex:
+        results = list(ex.map(one, req.pathnames))
+    return {"results": results, "copied": sum(1 for r in results if r["ok"]), "failed": sum(1 for r in results if not r["ok"])}
+
+
 def report_pathname(skill_id: str, symbol: str, as_of: str, decision_id: int) -> str:
     safe_symbol = re.sub(r"[^A-Za-z0-9.-]", "_", symbol)
     return f"reports/{skill_id}/{safe_symbol}/{as_of[:4]}/{as_of}-{decision_id}.pdf"

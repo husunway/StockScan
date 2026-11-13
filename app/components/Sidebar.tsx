@@ -42,7 +42,10 @@ const items: Item[] = [
     href: "/diagnosis",
     label: "Diagnosis",
     icon: "⚙",
-    children: [{ href: "/diagnosis/runs", label: "Run history" }],
+    children: [
+      { href: "/diagnosis/runs", label: "Run history" },
+      { href: "/diagnosis/storage", label: "Storage migration" },
+    ],
   },
 ];
 
