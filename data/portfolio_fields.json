@@ -9,6 +9,7 @@
     { "key": "analysis_validity_days", "label": "Assessment validity", "kind": "integer", "min": 1, "max": 365, "default": 30, "unit": "days" },
     { "key": "rerun_proximity_pct", "label": "Rerun proximity %", "kind": "decimal", "min": 0, "max": 100, "default": 5, "unit": "pct" },
     { "key": "skip_threshold_pct", "label": "Skip threshold %", "kind": "decimal", "min": 0, "max": 1000, "default": 20, "unit": "pct" },
-    { "key": "held_reassess_days", "label": "Held reassess", "kind": "integer", "min": 1, "max": 60, "default": 3, "unit": "trading days" }
+    { "key": "held_reassess_days", "label": "Held reassess", "kind": "integer", "min": 1, "max": 60, "default": 3, "unit": "trading days" },
+    { "key": "parallel_calls", "label": "Parallel agent calls", "kind": "integer", "min": 1, "max": 10, "default": 5, "unit": "count" }
   ]
 }

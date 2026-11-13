@@ -14,7 +14,7 @@ export type CalendarJob = {
 };
 type AgentInfo = {
   buy_price: number | null; target_price: number | null; stop_price: number | null; recommendation: string | null;
-  run_date: string | null; mode: string | null; fresh: boolean; decision_id: number | null;
+  run_date: string | null; mode: string | null; fresh: boolean; decision_id: number | null; backtest_id?: number | null;
 } | null;
 type DayTrade = {
   trade_id: number; symbol: string; side: "BUY" | "SELL"; quantity: number; price: number; amount: number; reason: string | null;
@@ -26,7 +26,7 @@ type DayRun = {
   current_price: number | null; buy_price: number | null; stop_price: number | null; target_price: number | null; is_buy: boolean;
   note: string | null; run_date: string;
   close: number | null; model: string | null; input_tokens: number | null; output_tokens: number | null;
-  reused_from_id: number | null; model_call: boolean; est_cost: number | null;
+  reused_from_id: number | null; model_call: boolean; est_cost: number | null; backtest_id?: number | null;
 };
 type AiCost = {
   total: number; calls: number; reused: number; currency: string; prices_as_of: string | null; unpriced: boolean;
@@ -194,7 +194,9 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
   if (!months.length) return null;
   const { y, m } = months[monthIdx] ?? months[0];
   const inRange = (d: string) => d >= job.start_date && d <= job.end_date;
-  const decisionHref = (skill: string, id: number | null | undefined) => (id ? `/agent/backtest/decision?bt=${job.backtests[skill]}&id=${id}` : null);
+  // A cached verdict may come from a stored decision of an earlier run, which lives under that run's backtest.
+  const decisionHref = (skill: string, id: number | null | undefined, bt?: number | null) =>
+    (id ? `/agent/backtest/decision?bt=${bt ?? job.backtests[skill]}&id=${id}` : null);
   const rowsShown = (detail?.trades ?? []).filter((t) => !filter || t.symbol === filter);
   const runsForStock = (detail?.assessments ?? []).filter((r) => !filter || r.symbol === filter);
   // Fresh = a new model run that day (run, rerun or held-stock reassessment), not cached, skipped or reused.
@@ -325,7 +327,7 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
                           <td><span className={`rec-pill ${t.side === "BUY" ? "rec-buy" : "rec-sell"}`}>{t.side === "BUY" ? "Buy" : "Sell"}</span></td>
                           <td className="num">{t.quantity.toLocaleString()}</td><td className="num">{money(t.price)}</td><td className="num">{money(t.amount)}</td>
                           <td>{TRIGGER[t.trigger] ?? t.trigger}</td>
-                          {AGENTS.map(([k]) => <td key={k}><AgentCell a={t.agents?.[k]} day={selected} href={decisionHref(k, t.agents?.[k]?.decision_id)} /></td>)}
+                          {AGENTS.map(([k]) => <td key={k}><AgentCell a={t.agents?.[k]} day={selected} href={decisionHref(k, t.agents?.[k]?.decision_id, t.agents?.[k]?.backtest_id)} /></td>)}
                           <td className={`num ${tone(t.realized_pnl)}`}>{t.side === "SELL" ? <>{signed(t.realized_pnl)}<br /><span className="tile-note">{pct(t.realized_pct)}</span></> : ""}</td>
                         </tr>
                       ))}
@@ -360,7 +362,7 @@ export default function PortfolioCalendar({ job }: { job: CalendarJob }) {
                       <tbody>
                         {runsShown.map((r) => {
                           const name = AGENTS.find(([k]) => k === r.skill_id)?.[1] ?? r.skill_id;
-                          const href = decisionHref(r.skill_id, r.decision_id);
+                          const href = decisionHref(r.skill_id, r.decision_id, r.backtest_id);
                           return (
                             <tr key={r.assessment_id} className={r.mode === "failed" ? "row-failed" : ""} title={r.note ?? ""}>
                               <td><strong>{r.symbol}</strong></td>

@@ -10,7 +10,9 @@ import contextlib
 import contextvars
 import json
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 
@@ -4707,6 +4709,8 @@ IF COL_LENGTH('{PTRADE_TABLE}', 'trigger_type') IS NULL ALTER TABLE {PTRADE_TABL
 IF COL_LENGTH('{PTRADE_TABLE}', 'agents_json') IS NULL ALTER TABLE {PTRADE_TABLE} ADD agents_json NVARCHAR(MAX) NULL;
 IF COL_LENGTH('{PTRADE_TABLE}', 'cost_basis') IS NULL ALTER TABLE {PTRADE_TABLE} ADD cost_basis DECIMAL(18,2) NULL;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PTRADE_job_date') CREATE INDEX IX_PTRADE_job_date ON {PTRADE_TABLE} (job_id, trade_date);
+IF COL_LENGTH('{PASSESS_TABLE}', 'source_decision_id') IS NULL ALTER TABLE {PASSESS_TABLE} ADD source_decision_id INT NULL;
+IF COL_LENGTH('{PASSESS_TABLE}', 'source_date') IS NULL ALTER TABLE {PASSESS_TABLE} ADD source_date DATE NULL;
 """
 
 
@@ -4815,6 +4819,7 @@ class PortfolioRequest(BaseModel):
     rerun_proximity_pct: int | float | str | None = Field(_PF_DEFAULT["rerun_proximity_pct"])
     skip_threshold_pct: int | float | str | None = Field(_PF_DEFAULT["skip_threshold_pct"])
     held_reassess_days: int | float | str | None = Field(_PF_DEFAULT["held_reassess_days"])
+    parallel_calls: int | float | str | None = Field(_PF_DEFAULT["parallel_calls"], description="Agent model calls run at the same time")
     symbols: list[str] | None = Field(None, description="Optional explicit list; overrides stock_count")
 
 
@@ -4954,13 +4959,14 @@ def _agent_is_buy(rec: str | None, buy_price: float | None, price: float) -> boo
 
 def _record_assessment(cur, job: dict, day: date, symbol: str, skill_id: str, phase: str, mode: str, price: float | None,
                        rec, buy_price, stop_price, target_price, is_buy: bool, note: str | None,
-                       decision_id: int | None = None, source_id: int | None = None) -> dict:
+                       decision_id: int | None = None, source_id: int | None = None,
+                       source_decision_id: int | None = None, source_date: date | None = None) -> dict:
     cur.execute(
         f"INSERT INTO {PASSESS_TABLE} (job_id, sim_date, symbol, skill_id, phase, mode, decision_id, source_assessment_id, recommendation, "
-        f"current_price, buy_price, stop_price, target_price, is_buy, note) OUTPUT INSERTED.assessment_id "
-        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        f"current_price, buy_price, stop_price, target_price, is_buy, note, source_decision_id, source_date) OUTPUT INSERTED.assessment_id "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (job["job_id"], day, symbol, skill_id, phase, mode, decision_id, source_id, rec, price, buy_price, stop_price, target_price,
-         1 if is_buy else 0, (note or "")[:400] or None))
+         1 if is_buy else 0, (note or "")[:400] or None, source_decision_id, source_date))
     aid = cur.fetchone()[0]
     return {"assessment_id": aid, "sim_date": day, "symbol": symbol, "skill_id": skill_id, "phase": phase, "mode": mode,
             "decision_id": decision_id, "recommendation": rec, "current_price": price, "buy_price": buy_price,
@@ -5029,7 +5035,8 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
         conn.commit()
     finally:
         conn.close()
-    job["ai_calls"] += 0 if reused else 1
+    with _JOB_LOCK:
+        job["ai_calls"] += 0 if reused else 1
     if reused:
         log.add(f"{day} {symbol}: {PSKILL_SHORT[skill_id]} reused stored decision #{decision['reused_from_id']} (same agent, stock, date, "
                 f"skill version and model; no model call)")
@@ -5041,44 +5048,181 @@ def _run_portfolio_agent(job: dict, day: date, symbol: str, skill_id: str, phase
     return a
 
 
+_JOB_LOCK = threading.Lock()
+
+
+def _job_model(job: dict, skill_id: str) -> str:
+    """The model this job runs the agent with (stored on its backtest row; older rows use the default)."""
+    models = job.setdefault("_models", {})
+    if skill_id not in models:
+        models[skill_id] = backtest_model(job["backtests"][skill_id]) or default_model()
+    return models[skill_id]
+
+
+def _history_latest(cur, job: dict, day: date, symbol: str, skill_id: str) -> dict | None:
+    """The newest stored decision of this agent for this stock from ANY run (other portfolio backtests, scans, weekly
+    backtests), read from the decision columns in SQL - no report is opened. Point in time: dated on or before the simulated
+    day and inside the validity window; same skill version and model only; copies are never sources."""
+    skill = get_skill(skill_id)
+    oldest = day - timedelta(days=int(job["config"]["analysis_validity_days"]))
+    cur.execute(
+        f"SELECT TOP 1 d.decision_id, d.backtest_id, d.as_of_date, d.recommendation, d.current_price, d.buy_below_price, d.stop_price, d.target_price "
+        f"FROM {DECISIONS_TABLE} d JOIN {BACKTESTS_TABLE} b ON b.backtest_id = d.backtest_id "
+        f"WHERE d.skill_id = %s AND d.symbol = %s AND d.status = 'done' AND d.reused_from_id IS NULL AND d.as_of_date <= %s AND d.as_of_date >= %s "
+        f"AND COALESCE(d.skill_version, b.skill_version, '') = %s AND COALESCE(d.model_requested, d.model, '') = %s "
+        f"ORDER BY d.as_of_date DESC, d.decision_id DESC",
+        (skill_id, symbol, day, oldest, skill.get("version") or "", _job_model(job, skill_id)))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"assessment_id": None, "decision_id": r[0], "backtest_id": r[1], "sim_date": r[2], "recommendation": norm_rec(r[3]),
+            "current_price": _fnum(r[4]), "buy_price": _fnum(r[5]), "stop_price": _fnum(r[6]), "target_price": _fnum(r[7]),
+            "mode": "history", "history": True}
+
+
+def _latest_known(cur, job: dict, day: date, symbol: str, skill_id: str) -> dict | None:
+    """This job's latest real assessment, or a newer stored decision from another run."""
+    own = _passess_latest(cur, job["job_id"], symbol, skill_id)
+    hist = _history_latest(cur, job, day, symbol, skill_id)
+    if hist and (not own or hist["sim_date"] > own["sim_date"]):
+        return hist
+    return own
+
+
+def _freshness(cur, job: dict, day: date, symbol: str, skill_id: str, price: float) -> tuple[str, dict | None, int | None, float | None]:
+    """Buffett/Dimon buy-phase rules (section 3.4), without writing anything: (kind, latest, age_days, gap_pct).
+    kind: today | run | no_buy_price | skip | rerun | cached."""
+    cfg = job["config"]
+    latest = _latest_known(cur, job, day, symbol, skill_id)
+    if latest and latest["sim_date"] == day:
+        return "today", latest, 0, None
+    age = (day - latest["sim_date"]).days if latest else None
+    if not latest or age > cfg["analysis_validity_days"]:
+        return "run", latest, age, None
+    bp = latest["buy_price"]
+    if bp is None or bp <= 0:
+        return "no_buy_price", latest, age, None
+    gap_pct = (price - bp) / bp * 100
+    if gap_pct > cfg["skip_threshold_pct"]:
+        return "skip", latest, age, gap_pct
+    if abs(gap_pct) <= cfg["rerun_proximity_pct"]:
+        return "rerun", latest, age, gap_pct
+    return "cached", latest, age, gap_pct
+
+
+def _src(latest: dict) -> dict:
+    """Where a cached row's verdict came from: an assessment of this job, or a stored decision of another run."""
+    if latest.get("history"):
+        return {"source_decision_id": latest["decision_id"], "source_date": latest["sim_date"]}
+    return {"source_id": latest["assessment_id"]}
+
+
+def _from_where(latest: dict) -> str:
+    return f"stored decision #{latest['decision_id']} of an earlier run" if latest.get("history") else "this backtest"
+
+
 def _cached_or_run(cur, job: dict, day: date, symbol: str, skill_id: str, price: float, log: RunLog) -> tuple[dict | None, bool, str]:
     """Buffett/Dimon buy-phase rules (section 3.4). Returns (assessment or None, model_call_needed, mode)."""
     cfg = job["config"]
-    latest = _passess_latest(cur, job["job_id"], symbol, skill_id)
     short = PSKILL_SHORT[skill_id]
-    if latest and latest["sim_date"] == day:
+    kind, latest, age, gap_pct = _freshness(cur, job, day, symbol, skill_id, price)
+    if kind == "today":
         is_buy = _agent_is_buy(latest["recommendation"], latest["buy_price"], price)
+        why = "assessed earlier today (held-stock reassessment)" if not latest.get("history") else f"assessed for this day in {_from_where(latest)}"
         a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "cached", price, latest["recommendation"], latest["buy_price"],
-                               latest["stop_price"], latest["target_price"], is_buy, "assessed earlier today (held-stock reassessment)",
-                               decision_id=None, source_id=latest["assessment_id"])
-        log.add(f"{day} {symbol}: {short} assessed earlier today -> {'BUY' if is_buy else 'NOT BUY'} at {price:.2f} (buy at/below {latest['buy_price']})")
+                               latest["stop_price"], latest["target_price"], is_buy, why, **_src(latest))
+        log.add(f"{day} {symbol}: {short} {why} -> {'BUY' if is_buy else 'NOT BUY'} at {price:.2f} (buy at/below {latest['buy_price']})")
         return a, False, "cached"
-    age = (day - latest["sim_date"]).days if latest else None
-    if not latest or age > cfg["analysis_validity_days"]:
+    if kind == "run":
         why = "no assessment yet" if not latest else f"last assessment {age} days old (> {cfg['analysis_validity_days']})"
         log.add(f"{day} {symbol}: {short} - {why}; running the agent")
         return None, True, "run"
     bp = latest["buy_price"]
-    if bp is None or bp <= 0:
+    if kind == "no_buy_price":
         a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "cached", price, latest["recommendation"], bp, latest["stop_price"],
-                               latest["target_price"], False, f"cached assessment from {latest['sim_date']} has no buy price", source_id=latest["assessment_id"])
-        log.add(f"{day} {symbol}: {short} cached ({latest['sim_date']}) has no buy price -> NOT BUY")
+                               latest["target_price"], False, f"cached assessment from {latest['sim_date']} ({_from_where(latest)}) has no buy price",
+                               **_src(latest))
+        log.add(f"{day} {symbol}: {short} cached ({latest['sim_date']}, {_from_where(latest)}) has no buy price -> NOT BUY")
         return a, False, "cached"
-    gap_pct = (price - bp) / bp * 100
-    if gap_pct > cfg["skip_threshold_pct"]:
+    if kind == "skip":
         a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "skipped", price, latest["recommendation"], bp, latest["stop_price"],
                                latest["target_price"], False, f"price {gap_pct:.1f}% above the suggested buy price {bp} (> {cfg['skip_threshold_pct']}%); not rerun",
-                               source_id=latest["assessment_id"])
-        log.add(f"{day} {symbol}: {short} skipped - price {price:.2f} is {gap_pct:.1f}% above buy price {bp} -> NOT BUY")
+                               **_src(latest))
+        log.add(f"{day} {symbol}: {short} skipped - price {price:.2f} is {gap_pct:.1f}% above buy price {bp} ({_from_where(latest)}) -> NOT BUY")
         return a, False, "skipped"
-    if abs(gap_pct) <= cfg["rerun_proximity_pct"]:
+    if kind == "rerun":
         log.add(f"{day} {symbol}: {short} - price {price:.2f} within {cfg['rerun_proximity_pct']}% of buy price {bp} ({gap_pct:+.1f}%); rerunning")
         return None, True, "rerun"
     is_buy = _agent_is_buy(latest["recommendation"], bp, price)
     a = _record_assessment(cur, job, day, symbol, skill_id, "buy", "cached", price, latest["recommendation"], bp, latest["stop_price"],
-                           latest["target_price"], is_buy, f"cached assessment from {latest['sim_date']} ({age} days old)", source_id=latest["assessment_id"])
-    log.add(f"{day} {symbol}: {short} cached ({latest['sim_date']}, {latest['recommendation']}, buy at/below {bp}) -> {'BUY' if is_buy else 'NOT BUY'} at {price:.2f}")
+                           latest["target_price"], is_buy, f"cached assessment from {latest['sim_date']} ({age} days old, {_from_where(latest)})",
+                           **_src(latest))
+    log.add(f"{day} {symbol}: {short} cached ({latest['sim_date']}, {_from_where(latest)}, {latest['recommendation']}, buy at/below {bp}) -> "
+            f"{'BUY' if is_buy else 'NOT BUY'} at {price:.2f}")
     return a, False, "cached"
+
+
+def _todays_buy_row(cur, job_id: int, day: date, symbol: str, skill_id: str) -> dict | None:
+    """The buy-phase assessment already recorded today for this agent and stock (e.g. by a parallel batch), if any."""
+    cur.execute(f"SELECT TOP 1 assessment_id, is_buy, mode, recommendation FROM {PASSESS_TABLE} WHERE job_id = %s AND sim_date = %s AND symbol = %s "
+                f"AND skill_id = %s AND phase = 'buy' ORDER BY assessment_id DESC", (job_id, day, symbol, skill_id))
+    r = cur.fetchone()
+    return None if not r else {"assessment_id": r[0], "is_buy": bool(r[1]), "mode": r[2], "recommendation": norm_rec(r[3])}
+
+
+def _stage_batch(cur, job: dict, day: date, start: int, stage: str, bars: dict, positions: dict, limit: int) -> list[tuple[str, str, float]]:
+    """Later stocks that will need the same agent's model call today, so they can run in parallel with the current one.
+    Only stocks whose earlier agents already said BUY today qualify; the order-dependent cash check stays sequential."""
+    if limit <= 0:
+        return []
+    cfg, symbols = job["config"], job["symbols"]
+    skill_id = PSTAGE_SKILL[stage]
+    out: list[tuple[str, str, float]] = []
+    for s in symbols[start + 1:]:
+        if len(out) >= limit:
+            break
+        b = bars[s]
+        price = b["prev_close"]
+        if not b["bar"] or not price or _todays_buy_row(cur, job["job_id"], day, s, skill_id):
+            continue
+        if stage == "buffett":
+            pos = positions.get(s)
+            if pos and pos["buys"] >= cfg["max_buys_per_stock"]:
+                continue
+            if job["cash"] < cfg["buy_amount"]:
+                break
+        else:
+            earlier = ("warren-buffett",) if stage == "dimon" else ("warren-buffett", "jamie-dimon")
+            rows = [_todays_buy_row(cur, job["job_id"], day, s, sk) for sk in earlier]
+            if not all(r and r["is_buy"] for r in rows):
+                continue
+        if stage == "murphy":
+            out.append((s, "run", price))
+            continue
+        kind = _freshness(cur, job, day, s, skill_id, price)[0]
+        if kind in ("run", "rerun"):
+            out.append((s, kind, price))
+    return out
+
+
+def _run_agents_parallel(job: dict, day: date, skill_id: str, items: list[tuple[str, str, float]], log: RunLog) -> dict:
+    """Run one agent for several stocks at the same time (one thread per model call, each with its own DB connections).
+    items[0] is the stock the cursor is on; its assessment is returned. A failed extra stock is logged and retried in order."""
+    if len(items) == 1:
+        s, mode, price = items[0]
+        return _run_portfolio_agent(job, day, s, skill_id, "buy", mode, price, log)
+    short = PSKILL_SHORT[skill_id]
+    log.add(f"{day}: running {short} for {len(items)} stocks in parallel: {', '.join(s for s, _, _ in items)}")
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=len(items), thread_name_prefix="agent") as ex:
+        futures = [ex.submit(contextvars.copy_context().run, _run_portfolio_agent, job, day, s, skill_id, "buy", mode, price, log)
+                   for s, mode, price in items]
+    for (s, _, _), f in list(zip(items, futures))[1:]:
+        e = f.exception()
+        if e is not None:
+            log.add(f"{day} {s}: parallel {short} run failed ({type(e).__name__}: {str(getattr(e, 'detail', e))[:200]}); it will run again in order", "warn")
+    log.add(f"{day}: parallel {short} batch of {len(items)} finished in {time.monotonic() - t0:.1f} s")
+    return futures[0].result()
 
 
 def _agent_snapshot(a: dict | None, day: date) -> dict | None:
@@ -5091,7 +5235,7 @@ def _agent_snapshot(a: dict | None, day: date) -> dict | None:
     fresh = mode in ("run", "rerun", "reassess") and run_iso == day.isoformat()
     return {"buy_price": a.get("buy_price"), "target_price": a.get("target_price"), "stop_price": a.get("stop_price"),
             "recommendation": a.get("recommendation"), "run_date": run_iso, "mode": mode, "fresh": fresh,
-            "decision_id": a.get("decision_id")}
+            "decision_id": a.get("decision_id"), "backtest_id": a.get("backtest_id")}
 
 
 def _record_trade(cur, job: dict, day: date, symbol: str, side: str, qty: int, price: float, reason: str, pnl: float | None,
@@ -5191,14 +5335,15 @@ def _snapshot(cur, job: dict, day: date, bars: dict, positions: dict) -> dict:
 def _todays_buy_assessments(cur, job_id: int, day: date, symbol: str) -> dict:
     """Today's buy-phase verdict per agent; a cached row reports the run date and decision of the assessment it reused."""
     cur.execute(f"SELECT a.skill_id, a.buy_price, a.recommendation, a.is_buy, a.target_price, a.stop_price, a.mode, "
-                f"COALESCE(a.decision_id, s.decision_id), COALESCE(s.sim_date, a.sim_date) FROM {PASSESS_TABLE} a "
-                f"LEFT JOIN {PASSESS_TABLE} s ON s.assessment_id = a.source_assessment_id "
+                f"COALESCE(a.decision_id, s.decision_id, a.source_decision_id), COALESCE(s.sim_date, a.source_date, a.sim_date), dd.backtest_id "
+                f"FROM {PASSESS_TABLE} a LEFT JOIN {PASSESS_TABLE} s ON s.assessment_id = a.source_assessment_id "
+                f"LEFT JOIN {DECISIONS_TABLE} dd ON dd.decision_id = COALESCE(a.decision_id, s.decision_id, a.source_decision_id) "
                 f"WHERE a.job_id = %s AND a.sim_date = %s AND a.symbol = %s AND a.phase = 'buy' AND a.mode <> 'failed' ORDER BY a.assessment_id",
                 (job_id, day, symbol))
     out = {}
-    for sk, bp, rec, is_buy, tp, sp, mode, did, run_date in cur.fetchall():
+    for sk, bp, rec, is_buy, tp, sp, mode, did, run_date, bt_id in cur.fetchall():
         out[sk] = {"buy_price": _fnum(bp), "recommendation": norm_rec(rec), "is_buy": bool(is_buy), "target_price": _fnum(tp), "stop_price": _fnum(sp),
-                   "mode": mode, "decision_id": did, "run_date": run_date}
+                   "mode": mode, "decision_id": did, "run_date": run_date, "backtest_id": bt_id}
     return out
 
 
@@ -5302,16 +5447,32 @@ def _portfolio_advance(job: dict, log: RunLog) -> dict:
                         log.add(f"{day} {sym}: cash {job['cash']:,.2f} below the buy amount {cfg['buy_amount']:,.0f}; skipped", "warn")
                         next_symbol()
                         continue
-                if stage in ("buffett", "dimon"):
+                if stage in ("buffett", "dimon", "murphy"):
                     skill_id = PSTAGE_SKILL[stage]
-                    a, need_call, mode = _cached_or_run(db.cur, job, day, sym, skill_id, price, log)
+                    need_call, mode = False, None
+                    a = _todays_buy_row(db.cur, job["job_id"], day, sym, skill_id)
+                    if a is not None:
+                        log.add(f"{day} {sym}: {PSKILL_SHORT[skill_id]} already assessed today ({a['mode']}, {a['recommendation'] or '-'}) -> "
+                                f"{'BUY' if a['is_buy'] else 'NOT BUY'}")
+                    elif stage == "murphy":
+                        need_call, mode = True, "run"
+                    else:
+                        a, need_call, mode = _cached_or_run(db.cur, job, day, sym, skill_id, price, log)
                     if need_call:
+                        extra = _stage_batch(db.cur, job, day, cur_["sym"], stage, bars, positions,
+                                             int(cfg.get("parallel_calls") or _PF_DEFAULT["parallel_calls"]) - 1)
+                        ensure_backtest_tables_once(db.cur)
                         db.commit()
                         db.close()
-                        a = _run_portfolio_agent(job, day, sym, skill_id, "buy", mode, price, log)
+                        a = _run_agents_parallel(job, day, skill_id, [(sym, mode, price)] + extra, log)
                         db.reopen()
                     if not a["is_buy"]:
-                        log.add(f"{day} {sym}: {PSKILL_SHORT[skill_id]} NOT BUY; remaining agents not run today")
+                        log.add(f"{day} {sym}: {PSKILL_SHORT[skill_id]} NOT BUY; " + ("no order" if stage == "murphy" else "remaining agents not run today"))
+                        next_symbol()
+                    elif stage == "murphy":
+                        todays = _todays_buy_assessments(db.cur, job["job_id"], day, sym)
+                        _execute_buy(db.cur, job, day, idx, sym, b["bar"], todays, pos, log)
+                        positions = _ppositions(db.cur, job["job_id"])
                         next_symbol()
                     else:
                         cur_["stage"] = "dimon" if stage == "buffett" else "murphy"
@@ -5319,19 +5480,6 @@ def _portfolio_advance(job: dict, log: RunLog) -> dict:
                     if need_call:
                         return {"done": False, "model_call": True}
                     continue
-                if stage == "murphy":
-                    db.commit()
-                    db.close()
-                    a = _run_portfolio_agent(job, day, sym, "john-murphy", "buy", "run", price, log)
-                    db.reopen()
-                    if a["is_buy"]:
-                        todays = _todays_buy_assessments(db.cur, job["job_id"], day, sym)
-                        _execute_buy(db.cur, job, day, idx, sym, b["bar"], todays, pos, log)
-                        positions = _ppositions(db.cur, job["job_id"])
-                    else:
-                        log.add(f"{day} {sym}: Murphy NOT BUY; no order")
-                    next_symbol()
-                    return {"done": False, "model_call": True}
 
             if phase == "close":
                 snap = _snapshot(db.cur, job, day, bars, positions)
@@ -5514,7 +5662,8 @@ def _portfolio_create(req: PortfolioRequest):
                 f"capital {req.starting_capital:,.0f}, {req.buy_amount:,.0f} per buy, max {req.max_buys_per_stock} buys/stock, take profit {req.take_profit_pct:g}%")
         log.add(f"Agent rules: Buffett -> Dimon -> Murphy with early exit; Buffett/Dimon cached {req.analysis_validity_days} days, rerun within "
                 f"{req.rerun_proximity_pct:g}% of the buy price, skipped when more than {req.skip_threshold_pct:g}% above it; held stocks reassessed every "
-                f"{req.held_reassess_days} trading day(s); Murphy never cached")
+                f"{req.held_reassess_days} trading day(s); Murphy never cached; up to {req.parallel_calls} agent calls in parallel; "
+                f"stored decisions from earlier runs (same agent, skill version and model, dated on or before the day) count as cached")
         log.add("Current price on a simulated day = last close before that day; agents see nothing from that day on; orders fill inside the day's range")
         cur.execute(f"UPDATE {PJOB_TABLE} SET backtests = %s, log_json = %s WHERE job_id = %s", (json.dumps(backtests), json.dumps(log.entries), job_id))
         conn.commit()
@@ -5638,11 +5787,12 @@ def portfolio_day(job_id: int, day: date):
             trades.append({"trade_id": r[0], "symbol": r[1], "side": side, "quantity": r[3], "price": _fnum(r[4]), "amount": _fnum(r[5], 2),
                            "reason": r[6], "realized_pnl": pnl, "realized_pct": round(pnl / cost * 100, 2) if pnl is not None and cost else None,
                            "cash_after": _fnum(r[8], 2), "trigger": r[9] or _trigger_from_reason(side, r[6]), "agents": agents})
-        cur.execute(f"SELECT a.assessment_id, a.symbol, a.skill_id, a.phase, a.mode, COALESCE(a.decision_id, s.decision_id), a.recommendation, "
-                    f"a.current_price, a.buy_price, a.stop_price, a.target_price, a.is_buy, a.note, COALESCE(s.sim_date, a.sim_date), "
-                    f"d.model, d.input_tokens, d.output_tokens, d.reused_from_id, p.[close] "
+        cur.execute(f"SELECT a.assessment_id, a.symbol, a.skill_id, a.phase, a.mode, COALESCE(a.decision_id, s.decision_id, a.source_decision_id), a.recommendation, "
+                    f"a.current_price, a.buy_price, a.stop_price, a.target_price, a.is_buy, a.note, COALESCE(s.sim_date, a.source_date, a.sim_date), "
+                    f"d.model, d.input_tokens, d.output_tokens, d.reused_from_id, p.[close], dd.backtest_id "
                     f"FROM {PASSESS_TABLE} a LEFT JOIN {PASSESS_TABLE} s ON s.assessment_id = a.source_assessment_id "
                     f"LEFT JOIN {DECISIONS_TABLE} d ON d.decision_id = a.decision_id "
+                    f"LEFT JOIN {DECISIONS_TABLE} dd ON dd.decision_id = COALESCE(a.decision_id, s.decision_id, a.source_decision_id) "
                     f"LEFT JOIN {TABLE} p ON p.symbol = a.symbol AND p.trade_date = a.sim_date "
                     f"WHERE a.job_id = %s AND a.sim_date = %s ORDER BY a.assessment_id", (job_id, day))
         pricing = ai_pricing()
@@ -5653,7 +5803,7 @@ def portfolio_day(job_id: int, day: date):
                          "recommendation": norm_rec(r[6]), "current_price": _fnum(r[7]), "buy_price": _fnum(r[8]), "stop_price": _fnum(r[9]),
                          "target_price": _fnum(r[10]), "is_buy": bool(r[11]), "note": r[12], "run_date": r[13].isoformat(),
                          "model": r[14], "input_tokens": r[15], "output_tokens": r[16], "reused_from_id": r[17], "close": _fnum(r[18]),
-                         "model_call": model_call,
+                         "model_call": model_call, "backtest_id": r[19],
                          "est_cost": estimate_cost(r[14], r[15], r[16], pricing) if model_call else 0.0})
         by_agent = {}
         for run in runs:

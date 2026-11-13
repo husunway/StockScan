@@ -53,6 +53,7 @@ const FORM_LABEL: Record<string, string> = {
   stock_count: "Stocks (first N by symbol)", starting_capital: "Starting capital (USD)", buy_amount: "Buy amount (USD)",
   max_buys_per_stock: "Max buys / stock", take_profit_pct: "Take profit %", analysis_validity_days: "Assessment valid (days)",
   rerun_proximity_pct: "Rerun within %", skip_threshold_pct: "Skip above %", held_reassess_days: "Held reassess (trading days)",
+  parallel_calls: "Parallel agent calls",
 };
 
 /** A text input (not type=number) so the browser's step rules cannot reject valid values; checked by validateField. */
